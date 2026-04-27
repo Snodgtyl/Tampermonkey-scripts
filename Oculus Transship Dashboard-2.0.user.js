@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         Oculus Transship Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      5.3
+// @version      5.4
 // @description  Adds a formatted summary dashboard to Oculus transship pages with AFT pending cases, items, and case density
 // @author       You
-// @updateURL    https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/OculusTransshipDashboard.user.js
-// @downloadURL  https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/OculusTransshipDashboard.user.js
+// @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
+// @downloadURL  https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
 // @match        https://oculus.qubit.amazon.dev/transship/*
 // @match        https://afttransshipmenthub-na.aka.amazon.com/*/view-transfers/inbound*
 // @match        https://afttransshipmenthub-eu.aka.amazon.com/*/view-transfers/inbound*
@@ -1212,12 +1212,28 @@
         const rows = labels.map(l => `<tr><td>${l}</td><td>${data[l]||'N/A'}</td></tr>`).join('');
         return `<div class="summary-card"><div class="card-header ${cls}">${title}</div><table class="card-table">${rows}</table></div>`;
     }
+    let trailerSortDesc = false;
     function buildTrailerTable(trailers) {
         if (!trailers.length) return '<div class="no-trailers">No trailer data found — try refreshing.</div>';
         const order = { 'CHECKED_IN':0,'ARRIVED':1,'ARRIVAL_SCHEDULED':2,'DEPARTED':3 };
-        const sorted = [...trailers].sort((a,b) => (order[a.apptStatus]??9) - (order[b.apptStatus]??9));
+        let sorted;
+        if (trailerSortDesc) {
+            sorted = [...trailers].sort((a,b) => {
+                const av = parseInt((a.totalCartons||'0').replace(/,/g,''),10)||0;
+                const bv = parseInt((b.totalCartons||'0').replace(/,/g,''),10)||0;
+                return bv - av;
+            });
+        } else {
+            sorted = [...trailers].sort((a,b) => (order[a.apptStatus]??9) - (order[b.apptStatus]??9));
+        }
         const hdrs = ['VRID','ISA','Appt Status','Trailer Location','Load Config','FL Type','Priority','SCAC','Source','Arrival Time','SA Pallets','Mixed Pallets','FL Cases','Total Cartons'];
-        const head = hdrs.map(h => `<th>${h}</th>`).join('');
+        const head = hdrs.map(h => {
+            if (h === 'Total Cartons') {
+                const arrow = trailerSortDesc ? ' ▼' : ' ⇅';
+                return `<th style="cursor:pointer;user-select:none;" id="oc-sort-cartons">${h}${arrow}</th>`;
+            }
+            return `<th>${h}</th>`;
+        }).join('');
         const body = sorted.map(t => `<tr>
             <td>${t.trailerNum}</td><td>${t.isa}</td>
             <td class="${statusClass(t.apptStatus)}">${t.apptStatus}</td>
@@ -1332,6 +1348,20 @@
         };
         document.getElementById('oc-refresh').onclick = () => location.reload();
 
+        // Sort Total Cartons column on click
+        const sortBtn = document.getElementById('oc-sort-cartons');
+        if (sortBtn) {
+            sortBtn.onclick = (e) => {
+                e.stopPropagation();
+                trailerSortDesc = !trailerSortDesc;
+                const body = document.getElementById('oc-trailer-body');
+                if (body) body.innerHTML = buildTrailerTable(trailers);
+                // Re-attach sort handler after re-render
+                const newBtn = document.getElementById('oc-sort-cartons');
+                if (newBtn) newBtn.onclick = sortBtn.onclick;
+            };
+        }
+
         // ─── Async: Update IN YARD card with AFT data ───────────────────────
         try {
             const aft = await fetchAFTData();
@@ -1397,7 +1427,21 @@
                 const palletCases = (palletResult && palletResult.totalCases) || 0;
                 const grandTotal = caseTransferIn + palletCases;
                 if (grandTotal > 0) {
-                    stowsEl.innerHTML = `<a href="${result ? result.url : '#'}" target="_blank" style="color:#89dceb;text-decoration:underline dotted;">Total Cases: ${grandTotal.toLocaleString()}</a>`;
+                    const caseUrl = result ? result.url : '#';
+                    const palletUrl = palletResult ? palletResult.url : '#';
+                    stowsEl.innerHTML = `<span style="position:relative;display:inline-block;cursor:pointer;" id="oc-cases-hover">
+                        <span style="color:#89dceb;text-decoration:underline dotted;">Total Cases: ${grandTotal.toLocaleString()}</span>
+                        <div id="oc-cases-dropdown" style="display:none;position:absolute;top:100%;left:0;background:#313244;border:1px solid #89dceb;border-radius:6px;padding:6px 0;z-index:100;white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,0.4);margin-top:4px;">
+                            <a href="${caseUrl}" target="_blank" style="display:block;padding:6px 14px;color:#a6e3a1;text-decoration:none;font-size:16px;">📦 Case Transfer In: ${caseTransferIn.toLocaleString()}</a>
+                            <a href="${palletUrl}" target="_blank" style="display:block;padding:6px 14px;color:#89dceb;text-decoration:none;font-size:16px;">🔲 Pallet Transfer In: ${palletCases.toLocaleString()}</a>
+                        </div>
+                    </span>`;
+                    const hoverEl = document.getElementById('oc-cases-hover');
+                    const dropdown = document.getElementById('oc-cases-dropdown');
+                    if (hoverEl && dropdown) {
+                        hoverEl.onmouseenter = () => dropdown.style.display = 'block';
+                        hoverEl.onmouseleave = () => dropdown.style.display = 'none';
+                    }
                 } else {
                     stowsEl.textContent = 'Total Cases: —';
                     stowsEl.style.color = '#a6adc8';
