@@ -137,19 +137,28 @@
         const dayStart   = shift.dayStartH * 60 + shift.dayStartM;
         const nightStart = shift.nightStartH * 60 + shift.nightStartM;
         const nightEnd   = shift.nightEndH * 60 + shift.nightEndM;
+        const dayEnd     = shift.dayEndH * 60 + shift.dayEndM;
+        const grace = 30; // 30-minute grace period after shift ends
 
         if (timeVal >= dayStart && timeVal < nightStart) {
             // Day shift
             shiftStart = new Date(now); shiftStart.setHours(shift.dayStartH, shift.dayStartM, 0, 0);
             shiftEnd   = new Date(now); shiftEnd.setHours(shift.dayEndH, shift.dayEndM, 0, 0);
+        } else if (timeVal < nightEnd) {
+            // After midnight, still on last night's shift
+            shiftStart = new Date(now); shiftStart.setDate(shiftStart.getDate() - 1); shiftStart.setHours(shift.nightStartH, shift.nightStartM, 0, 0);
+            shiftEnd = new Date(shiftStart); shiftEnd.setDate(shiftEnd.getDate() + 1); shiftEnd.setHours(shift.nightEndH, shift.nightEndM, 0, 0);
+        } else if (timeVal >= nightEnd && timeVal < nightEnd + grace && timeVal < dayStart) {
+            // Grace period after night shift ends — still report last night's shift
+            shiftStart = new Date(now); shiftStart.setDate(shiftStart.getDate() - 1); shiftStart.setHours(shift.nightStartH, shift.nightStartM, 0, 0);
+            shiftEnd = new Date(shiftStart); shiftEnd.setDate(shiftEnd.getDate() + 1); shiftEnd.setHours(shift.nightEndH, shift.nightEndM, 0, 0);
+        } else if (timeVal >= dayEnd && timeVal < dayEnd + grace && timeVal < nightStart) {
+            // Grace period after day shift ends — still report today's day shift
+            shiftStart = new Date(now); shiftStart.setHours(shift.dayStartH, shift.dayStartM, 0, 0);
+            shiftEnd   = new Date(now); shiftEnd.setHours(shift.dayEndH, shift.dayEndM, 0, 0);
         } else {
-            // Night shift
-            if (timeVal < nightEnd) {
-                // After midnight, still on last night's shift
-                shiftStart = new Date(now); shiftStart.setDate(shiftStart.getDate() - 1); shiftStart.setHours(shift.nightStartH, shift.nightStartM, 0, 0);
-            } else {
-                shiftStart = new Date(now); shiftStart.setHours(shift.nightStartH, shift.nightStartM, 0, 0);
-            }
+            // Night shift (before midnight)
+            shiftStart = new Date(now); shiftStart.setHours(shift.nightStartH, shift.nightStartM, 0, 0);
             shiftEnd = new Date(shiftStart); shiftEnd.setDate(shiftEnd.getDate() + 1); shiftEnd.setHours(shift.nightEndH, shift.nightEndM, 0, 0);
         }
         // Next shift
@@ -1156,7 +1165,7 @@
 
         // Fetch active pickers in parallel
         const pickerPromise = fetchActivePickers(fc).then(data => { pickerData = data; });
-        // Fetch pick rate JPH in parallel (only during shift + 20 min after)
+        // Fetch pick rate JPH in parallel (only during shift + 30 min after)
         const pickRatePromise = withinPickRateWindow
             ? fetchPickRate(fc, shiftStart, shiftEnd).then(data => { pickRateJPH = data.jph; totalPicks = data.totalPicks; })
             : Promise.resolve();
