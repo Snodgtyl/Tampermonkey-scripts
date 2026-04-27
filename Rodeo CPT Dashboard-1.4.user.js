@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         Rodeo CPT Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      1.4
+// @version      1.5
 // @description  Overlays a CPT breakdown dashboard on Rodeo ExSD pages — current shift & next shift
 // @author       You
-// @updateURL    https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/RodeoCPTDashboard.user.js
-// @downloadURL  https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/RodeoCPTDashboard.user.js
+// @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/Rodeo%20CPT%20Dashboard-1.4.user.js
+// @downloadURL  https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/Rodeo%20CPT%20Dashboard-1.4.user.js
 // @match        https://rodeo-iad.amazon.com/*
 // @match        https://rodeo-pdx.amazon.com/*
 // @match        https://rodeo-dub.amazon.com/*
@@ -1067,8 +1067,8 @@
         const hasCPTs = Object.keys(cptLinks).length > 0 || Object.keys(cptCounts).length > 0;
 
         let pickerData = {};
-        // Only show pick rate during shift + 20 min grace period after shift ends
-        const pickRateGrace = 20 * 60 * 1000; // 20 minutes in ms
+        // Only show pick rate during shift + 30 min grace period after shift ends
+        const pickRateGrace = 30 * 60 * 1000; // 30 minutes in ms
         const withinPickRateWindow = now >= shiftStart && now <= new Date(shiftEnd.getTime() + pickRateGrace);
         let pickRateJPH = withinPickRateWindow ? 'loading...' : '';
         let totalPicks = 0;
