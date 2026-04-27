@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Oculus Transship Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      5.4
+// @version      5.5
 // @description  Adds a formatted summary dashboard to Oculus transship pages with AFT pending cases, items, and case density
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
@@ -128,29 +128,35 @@
                     console.log('[OculusDash-AFT] Found', arr.length, 'transfers');
                     if (arr[0]) console.log('[OculusDash-AFT] First item keys:', Object.keys(arr[0]));
 
-                    // Check if API has inline cases/items data
+                    // Check if API has inline PENDING cases/items data
+                    // IMPORTANT: Only use pending-specific keys to avoid counting total shipment quantities
                     let totalCases = 0, totalItems = 0, count = 0;
                     const detailUrls = [];
-                    const caseKeys = ['totalPendingCases','pendingCases','cases','totalCases','caseQuantity','caseCount'];
-                    const itemKeys = ['totalPendingItems','pendingItems','items','totalItems','itemQuantity','itemCount'];
+                    const pendingCaseKeys = ['totalPendingCases','pendingCases'];
+                    const pendingItemKeys = ['totalPendingItems','pendingItems'];
 
                     for (const t of arr) {
                         let c = 0, it = 0;
-                        for (const k of caseKeys) { if (t[k] !== undefined && t[k] !== null) { c = parseInt(t[k],10)||0; break; } }
-                        for (const k of itemKeys) { if (t[k] !== undefined && t[k] !== null) { it = parseInt(t[k],10)||0; break; } }
+                        for (const k of pendingCaseKeys) { if (t[k] !== undefined && t[k] !== null) { c = parseInt(t[k],10)||0; break; } }
+                        for (const k of pendingItemKeys) { if (t[k] !== undefined && t[k] !== null) { it = parseInt(t[k],10)||0; break; } }
+                        // Also check nested totalPending object
+                        if (c === 0 && it === 0 && t.totalPending) {
+                            c = parseInt(t.totalPending.cases,10)||0;
+                            it = parseInt(t.totalPending.items,10)||0;
+                        }
 
                         if (c > 0 || it > 0) {
                             totalCases += c; totalItems += it; count++;
-                        } else {
-                            const ref = t.shipmentReferenceId || t.shipment_reference_id || t.referenceId || t.id || t.amazonShipmentReferenceId;
-                            if (ref) detailUrls.push(`/${fc}/view-transfers/inbound/${ref}`);
                         }
+                        // Always collect detail URLs as fallback — we'll use them if inline pending data is missing
+                        const ref = t.shipmentReferenceId || t.shipment_reference_id || t.referenceId || t.id || t.amazonShipmentReferenceId;
+                        if (ref) detailUrls.push(`/${fc}/view-transfers/inbound/${ref}`);
                     }
 
                     if (count > 0) {
                         const result = { totalCases, totalItems, count, trailerCount: count, timestamp: Date.now(), fc };
                         GM_setValue('aftData_' + fc, JSON.stringify(result));
-                        console.log('[OculusDash-AFT] ✓ Stored from API:', result);
+                        console.log('[OculusDash-AFT] ✓ Stored from API (pending only):', result);
                         apiSuccess = true;
                     } else if (detailUrls.length > 0) {
                         console.log(`[OculusDash-AFT] Fetching ${detailUrls.length} detail pages...`);
@@ -262,13 +268,21 @@
                         } catch(e) { /* not JSON */ }
                     }
 
-                    // Fallback: fetch the detail page HTML and look for span IDs
+                    // Fallback: fetch the detail page HTML and extract Total Pending
                     const htmlResp = await fetch(urls[i]);
                     if (htmlResp.ok) {
                         const html = await htmlResp.text();
                         const doc = new DOMParser().parseFromString(html, 'text/html');
 
-                        // Look for specific span IDs
+                        // First priority: Look for Total Pending row in tables (most accurate)
+                        const p = extractPendingFromDoc(doc);
+                        if (p) {
+                            totalCases += p.cases; totalItems += p.items; ok++;
+                            console.log(`[OculusDash-AFT] ✓ Detail ${ok} (table Total Pending): cases=${p.cases}, items=${p.items}`);
+                            continue;
+                        }
+
+                        // Fallback: Look for specific span IDs (may be total pending on some AFT versions)
                         const casesSpan = doc.getElementById('caseQuantityTotal');
                         const itemsSpan = doc.getElementById('quantityItemsTotal');
                         if (casesSpan || itemsSpan) {
@@ -279,14 +293,6 @@
                                 console.log(`[OculusDash-AFT] ✓ Detail ${ok} (span IDs): cases=${c}, items=${it}`);
                                 continue;
                             }
-                        }
-
-                        // Look for Total Pending row in tables
-                        const p = extractPendingFromDoc(doc);
-                        if (p) {
-                            totalCases += p.cases; totalItems += p.items; ok++;
-                            console.log(`[OculusDash-AFT] ✓ Detail ${ok} (table): cases=${p.cases}, items=${p.items}`);
-                            continue;
                         }
                     }
 
@@ -304,9 +310,9 @@
         function findPendingInJson(data) {
             if (!data || typeof data !== 'object') return null;
 
-            // The API returns an object with direct fields like caseQuantity, itemQuantity
-            const caseKeys = ['caseQuantity', 'caseQuantityTotal', 'totalPendingCases', 'pendingCases', 'totalCases', 'cases'];
-            const itemKeys = ['itemQuantity', 'quantityItemsTotal', 'totalPendingItems', 'pendingItems', 'totalItems', 'items'];
+            // Only use pending-specific keys to avoid counting total shipment quantities
+            const caseKeys = ['totalPendingCases', 'pendingCases', 'caseQuantityTotal'];
+            const itemKeys = ['totalPendingItems', 'pendingItems', 'quantityItemsTotal'];
 
             let cases = 0, items = 0;
             for (const k of caseKeys) { if (data[k] !== undefined) { cases = parseInt(data[k],10)||0; break; } }
@@ -518,15 +524,21 @@
                 console.log('[OculusDash] AFT API returned', arr.length, 'transfers');
                 if (arr[0]) console.log('[OculusDash] First transfer keys:', Object.keys(arr[0]));
 
-                // Pass 1: Try to find inline case/item data from ALL transfers (not just YMS)
+                // Pass 1: Try to find inline PENDING case/item data from ALL transfers (not just YMS)
+                // IMPORTANT: Only use pending-specific keys to avoid counting total shipment quantities
                 let totalCases = 0, totalItems = 0, count = 0;
-                const caseKeyNames = ['totalPendingCases','pendingCases','cases','totalCases','caseQuantity','caseCount','numberOfCases'];
-                const itemKeyNames = ['totalPendingItems','pendingItems','items','totalItems','itemQuantity','itemCount','numberOfItems'];
+                const pendingCaseKeyNames = ['totalPendingCases','pendingCases'];
+                const pendingItemKeyNames = ['totalPendingItems','pendingItems'];
 
                 for (const t of arr) {
                     let c = 0, it = 0;
-                    for (const k of caseKeyNames) { if (t[k] !== undefined && t[k] !== null) { c = parseInt(t[k],10)||0; break; } }
-                    for (const k of itemKeyNames) { if (t[k] !== undefined && t[k] !== null) { it = parseInt(t[k],10)||0; break; } }
+                    for (const k of pendingCaseKeyNames) { if (t[k] !== undefined && t[k] !== null) { c = parseInt(t[k],10)||0; break; } }
+                    for (const k of pendingItemKeyNames) { if (t[k] !== undefined && t[k] !== null) { it = parseInt(t[k],10)||0; break; } }
+                    // Also check nested totalPending object
+                    if (c === 0 && it === 0 && t.totalPending) {
+                        c = parseInt(t.totalPending.cases,10)||0;
+                        it = parseInt(t.totalPending.items,10)||0;
+                    }
                     if (c > 0 || it > 0) { totalCases += c; totalItems += it; count++; }
                 }
 
@@ -544,8 +556,12 @@
                         }
                         if (!hasYms) continue;
                         let c = 0, it = 0;
-                        for (const k of caseKeyNames) { if (t[k] !== undefined && t[k] !== null) { c = parseInt(t[k],10)||0; break; } }
-                        for (const k of itemKeyNames) { if (t[k] !== undefined && t[k] !== null) { it = parseInt(t[k],10)||0; break; } }
+                        for (const k of pendingCaseKeyNames) { if (t[k] !== undefined && t[k] !== null) { c = parseInt(t[k],10)||0; break; } }
+                        for (const k of pendingItemKeyNames) { if (t[k] !== undefined && t[k] !== null) { it = parseInt(t[k],10)||0; break; } }
+                        if (c === 0 && it === 0 && t.totalPending) {
+                            c = parseInt(t.totalPending.cases,10)||0;
+                            it = parseInt(t.totalPending.items,10)||0;
+                        }
                         if (c > 0 || it > 0) { ymsCases += c; ymsItems += it; ymsCount++; }
                     }
                     // Use YMS-filtered if we got results, otherwise use all
@@ -590,8 +606,8 @@
                         }));
                         for (const detail of results) {
                             if (!detail) continue;
-                            const ck = ['caseQuantity', 'caseQuantityTotal', 'totalPendingCases', 'pendingCases', 'totalCases', 'cases'];
-                            const ik = ['itemQuantity', 'quantityItemsTotal', 'totalPendingItems', 'pendingItems', 'totalItems', 'items'];
+                            const ck = ['totalPendingCases', 'pendingCases', 'caseQuantityTotal'];
+                            const ik = ['totalPendingItems', 'pendingItems', 'quantityItemsTotal'];
                             let c = 0, it = 0;
                             for (const k of ck) { if (detail[k] !== undefined) { c = parseInt(detail[k],10)||0; break; } }
                             for (const k of ik) { if (detail[k] !== undefined) { it = parseInt(detail[k],10)||0; break; } }
@@ -674,10 +690,10 @@
                             const transfers = findTransfers(state);
                             if (transfers) {
                                 console.log('[OculusDash] Found embedded transfers:', transfers.length);
-                                // Process same as API response
+                                // Process same as API response — only use pending-specific keys
                                 let tc = 0, ti = 0, cnt = 0;
-                                const ck = ['totalPendingCases','pendingCases','cases','totalCases','caseQuantity','caseCount'];
-                                const ik = ['totalPendingItems','pendingItems','items','totalItems','itemQuantity','itemCount'];
+                                const ck = ['totalPendingCases','pendingCases'];
+                                const ik = ['totalPendingItems','pendingItems'];
                                 for (const t of transfers) {
                                     let c = 0, it = 0;
                                     for (const k of ck) { if (t[k] !== undefined) { c = parseInt(t[k],10)||0; break; } }
@@ -720,8 +736,8 @@
                             if (!arr) { for (const v of Object.values(resp)) { if (Array.isArray(v) && v.length > 0) { arr = v; break; } } }
                             if (arr && arr.length > 0) {
                                 let tc = 0, ti = 0, cnt = 0;
-                                const ck = ['totalPendingCases','pendingCases','cases','totalCases','caseQuantity'];
-                                const ik = ['totalPendingItems','pendingItems','items','totalItems','itemQuantity'];
+                                const ck = ['totalPendingCases','pendingCases'];
+                                const ik = ['totalPendingItems','pendingItems'];
                                 for (const t of arr) {
                                     let c = 0, it = 0;
                                     for (const k of ck) { if (t[k] !== undefined) { c = parseInt(t[k],10)||0; break; } }
