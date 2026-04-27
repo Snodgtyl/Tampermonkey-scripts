@@ -824,8 +824,13 @@
             const dayStart   = shift.dayStartH * 60 + shift.dayStartM;
             const dayEnd     = shift.dayEndH * 60 + shift.dayEndM;
 
-            const isNight = timeVal >= nightStart || timeVal < nightEnd;
-            const isDay = timeVal >= dayStart && timeVal < dayEnd;
+            // 30-minute grace period after shift ends
+            const grace = 30;
+            const dayEndGrace = dayEnd + grace;
+            const nightEndGrace = nightEnd + grace;
+
+            const isNight = timeVal >= nightStart || timeVal < nightEndGrace;
+            const isDay = timeVal >= dayStart && timeVal < dayEndGrace;
 
             if (!isNight && !isDay) {
                 resolve(null);
@@ -908,8 +913,13 @@
             const dayStart   = shift.dayStartH * 60 + shift.dayStartM;
             const dayEnd     = shift.dayEndH * 60 + shift.dayEndM;
 
-            const isNight = timeVal >= nightStart || timeVal < nightEnd;
-            const isDay = timeVal >= dayStart && timeVal < dayEnd;
+            // 30-minute grace period after shift ends
+            const grace = 30;
+            const dayEndGrace = dayEnd + grace;
+            const nightEndGrace = nightEnd + grace;
+
+            const isNight = timeVal >= nightStart || timeVal < nightEndGrace;
+            const isDay = timeVal >= dayStart && timeVal < dayEndGrace;
 
             if (!isNight && !isDay) { resolve(null); return; }
 
