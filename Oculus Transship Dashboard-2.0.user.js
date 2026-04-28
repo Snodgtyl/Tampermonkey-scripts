@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Oculus Transship Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      5.5
+// @version      5.8
 // @description  Adds a formatted summary dashboard to Oculus transship pages with AFT pending cases, items, and case density
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
@@ -78,8 +78,8 @@
         // Wait for page to settle, then call the API (same-origin = auth works)
         setTimeout(async () => {
             const today = new Date();
-            const sd = new Date(today); sd.setDate(today.getDate() - 14);
-            const ed = new Date(today); ed.setDate(today.getDate() + 28);
+            const sd = new Date(today); sd.setDate(today.getDate() - 7);
+            const ed = new Date(today); ed.setDate(today.getDate() + 14);
             const fmt = d => d.toISOString().split('T')[0];
 
             // Try multiple API paths — different AFT versions use different endpoints
@@ -129,7 +129,7 @@
                     if (arr[0]) console.log('[OculusDash-AFT] First item keys:', Object.keys(arr[0]));
 
                     // Check if API has inline PENDING cases/items data
-                    // IMPORTANT: Only use pending-specific keys to avoid counting total shipment quantities
+                    // First try pending-specific keys, then fall back to detail page fetches
                     let totalCases = 0, totalItems = 0, count = 0;
                     const detailUrls = [];
                     const pendingCaseKeys = ['totalPendingCases','pendingCases'];
@@ -159,9 +159,31 @@
                         console.log('[OculusDash-AFT] ✓ Stored from API (pending only):', result);
                         apiSuccess = true;
                     } else if (detailUrls.length > 0) {
-                        console.log(`[OculusDash-AFT] Fetching ${detailUrls.length} detail pages...`);
+                        // No pending-specific keys — fetch each trailer's detail page for Total Pending
+                        console.log(`[OculusDash-AFT] No pending keys in manifest, fetching ${detailUrls.length} detail pages...`);
                         await fetchAndStoreDetails(detailUrls, fc);
-                        apiSuccess = true;
+                        apiSuccess = GM_getValue('aftData_' + fc, null) !== null;
+                    }
+
+                    if (!apiSuccess && detailUrls.length > 0) {
+                        // Detail pages also failed — last resort: use manifest generic keys
+                        // This may overcount but is better than showing nothing
+                        console.log('[OculusDash-AFT] Detail pages failed, falling back to manifest generic keys...');
+                        const genCaseKeys = ['cases','totalCases','caseQuantity','caseCount'];
+                        const genItemKeys = ['items','totalItems','itemQuantity','itemCount'];
+                        let gc = 0, gi = 0, gcount = 0;
+                        for (const t of arr) {
+                            let c = 0, it = 0;
+                            for (const k of genCaseKeys) { if (t[k] !== undefined && t[k] !== null) { c = parseInt(t[k],10)||0; break; } }
+                            for (const k of genItemKeys) { if (t[k] !== undefined && t[k] !== null) { it = parseInt(t[k],10)||0; break; } }
+                            if (c > 0 || it > 0) { gc += c; gi += it; gcount++; }
+                        }
+                        if (gcount > 0) {
+                            const result = { totalCases: gc, totalItems: gi, count: gcount, trailerCount: gcount, timestamp: Date.now(), fc, approx: true };
+                            GM_setValue('aftData_' + fc, JSON.stringify(result));
+                            console.log('[OculusDash-AFT] ✓ Stored from manifest (generic, may overcount):', result);
+                            apiSuccess = true;
+                        }
                     }
                     break; // Got a valid response, stop trying
                 } catch (e) {
@@ -310,9 +332,9 @@
         function findPendingInJson(data) {
             if (!data || typeof data !== 'object') return null;
 
-            // Only use pending-specific keys to avoid counting total shipment quantities
-            const caseKeys = ['totalPendingCases', 'pendingCases', 'caseQuantityTotal'];
-            const itemKeys = ['totalPendingItems', 'pendingItems', 'quantityItemsTotal'];
+            // Per-trailer detail API — pending-specific keys first, then broader keys as fallback
+            const caseKeys = ['totalPendingCases', 'pendingCases', 'caseQuantityTotal', 'caseQuantity', 'totalCases', 'cases'];
+            const itemKeys = ['totalPendingItems', 'pendingItems', 'quantityItemsTotal', 'itemQuantity', 'totalItems', 'items'];
 
             let cases = 0, items = 0;
             for (const k of caseKeys) { if (data[k] !== undefined) { cases = parseInt(data[k],10)||0; break; } }
@@ -451,8 +473,8 @@
         console.log('[OculusDash] Fetching AFT data directly for', fc);
         const aftDomain = (AFT_DOMAINS[(fc || '').toUpperCase()] || DEFAULT_AFT_DOMAIN);
         const today = new Date();
-        const sd = new Date(today); sd.setDate(today.getDate() - 14);
-        const ed = new Date(today); ed.setDate(today.getDate() + 28);
+        const sd = new Date(today); sd.setDate(today.getDate() - 7);
+        const ed = new Date(today); ed.setDate(today.getDate() + 14);
         const fmt = d => d.toISOString().split('T')[0];
         const fmtSlash = d => `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')}`;
 
@@ -606,8 +628,9 @@
                         }));
                         for (const detail of results) {
                             if (!detail) continue;
-                            const ck = ['totalPendingCases', 'pendingCases', 'caseQuantityTotal'];
-                            const ik = ['totalPendingItems', 'pendingItems', 'quantityItemsTotal'];
+                            // Detail API returns per-trailer pending data — broader keys are safe here
+                            const ck = ['totalPendingCases', 'pendingCases', 'caseQuantityTotal', 'caseQuantity', 'totalCases', 'cases'];
+                            const ik = ['totalPendingItems', 'pendingItems', 'quantityItemsTotal', 'itemQuantity', 'totalItems', 'items'];
                             let c = 0, it = 0;
                             for (const k of ck) { if (detail[k] !== undefined) { c = parseInt(detail[k],10)||0; break; } }
                             for (const k of ik) { if (detail[k] !== undefined) { it = parseInt(detail[k],10)||0; break; } }
@@ -623,7 +646,24 @@
                     }
                 }
 
-                console.warn('[OculusDash] API returned transfers but no case data extractable');
+                console.warn('[OculusDash] API returned transfers but no pending data extractable from detail pages');
+                // Last resort: use manifest generic keys — may overcount but better than nothing
+                console.log('[OculusDash] Falling back to manifest generic keys...');
+                const genCK = ['cases','totalCases','caseQuantity','caseCount','numberOfCases'];
+                const genIK = ['items','totalItems','itemQuantity','itemCount','numberOfItems'];
+                let gc = 0, gi = 0, gcount = 0;
+                for (const t of arr) {
+                    let c = 0, it = 0;
+                    for (const k of genCK) { if (t[k] !== undefined && t[k] !== null) { c = parseInt(t[k],10)||0; break; } }
+                    for (const k of genIK) { if (t[k] !== undefined && t[k] !== null) { it = parseInt(t[k],10)||0; break; } }
+                    if (c > 0 || it > 0) { gc += c; gi += it; gcount++; }
+                }
+                if (gcount > 0) {
+                    const result = { totalCases: gc, totalItems: gi, count: gcount, trailerCount: gcount, timestamp: Date.now(), fc, approx: true };
+                    GM_setValue('aftData_' + fc, JSON.stringify(result));
+                    console.log('[OculusDash] ✓ AFT generic fallback:', result);
+                    return result;
+                }
                 // Don't try next URL — we got a valid response, just no data
                 break;
             } catch (err) {
