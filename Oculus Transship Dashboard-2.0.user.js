@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Oculus Transship Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      5.8
+// @version      5.9
 // @description  Adds a formatted summary dashboard to Oculus transship pages with AFT pending cases, items, and case density
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
@@ -14,6 +14,8 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_listValues
+// @grant        GM_deleteValue
 // @connect      afttransshipmenthub-na.aka.amazon.com
 // @connect      afttransshipmenthub-eu.aka.amazon.com
 // @connect      afttransshipmenthub-fe.aka.amazon.com
@@ -23,6 +25,17 @@
 
 (function () {
     'use strict';
+
+    // ─── Auto-clear stale cache on version update ───────────────────────────
+    const SCRIPT_VERSION = '5.9';
+    const lastVer = GM_getValue('_scriptVersion', '');
+    if (lastVer !== SCRIPT_VERSION) {
+        // Clear all cached AFT data from previous versions
+        const keys = GM_listValues ? GM_listValues() : [];
+        keys.forEach(k => { if (k.startsWith('aftData_')) GM_deleteValue(k); });
+        GM_setValue('_scriptVersion', SCRIPT_VERSION);
+        console.log(`[OculusDash] Version updated ${lastVer} → ${SCRIPT_VERSION}, cleared cached AFT data`);
+    }
 
     // ─── FC Shift Configuration ─────────────────────────────────────────────
     // FHD = First Half Day (Day shift), FHN = First Half Night (Night shift)
