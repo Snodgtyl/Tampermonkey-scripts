@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rodeo CPT Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      1.5
+// @version      1.7
 // @description  Overlays a CPT breakdown dashboard on Rodeo ExSD pages — current shift & next shift
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/Rodeo%20CPT%20Dashboard-1.4.user.js
@@ -24,6 +24,16 @@
 
 (function () {
     'use strict';
+
+    // ─── Auto-clear stale cache on version update ───────────────────────────
+    const SCRIPT_VERSION = '1.7';
+    const lastVer = localStorage.getItem('_rcd_scriptVersion') || '';
+    if (lastVer !== SCRIPT_VERSION) {
+        // Clear cached prefs/data from previous versions
+        localStorage.removeItem('rcd_prefs_v1');
+        localStorage.setItem('_rcd_scriptVersion', SCRIPT_VERSION);
+        console.log(`[RodeoCPT] Version updated ${lastVer} → ${SCRIPT_VERSION}, cleared cached data`);
+    }
 
     // ─── Auto-refresh at :00, :15, :30, :45 ────────────────────────────────────
     const now = new Date();
