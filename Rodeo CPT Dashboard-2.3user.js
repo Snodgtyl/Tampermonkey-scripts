@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rodeo CPT Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      1.7
+// @version      2.3
 // @description  Overlays a CPT breakdown dashboard on Rodeo ExSD pages — current shift & next shift
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/Rodeo%20CPT%20Dashboard-1.4.user.js
@@ -26,7 +26,7 @@
     'use strict';
 
     // ─── Auto-clear stale cache on version update ───────────────────────────
-    const SCRIPT_VERSION = '1.7';
+    const SCRIPT_VERSION = '2.3';
     const lastVer = localStorage.getItem('_rcd_scriptVersion') || '';
     if (lastVer !== SCRIPT_VERSION) {
         // Clear cached prefs/data from previous versions
@@ -325,6 +325,42 @@
                 onerror: () => resolve({ count: 0, url: fetchUrl }),
                 ontimeout: () => resolve({ count: 0, url: fetchUrl }),
                 timeout: 60000
+            });
+        });
+    }
+
+    // ─── Fetch Destination Warehouse IDs with counts from a Picking Picked detail page ───
+    function fetchDestWarehouseIds(url) {
+        return new Promise((resolve) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: url,
+                onload: (resp) => {
+                    const text = resp.responseText || '';
+                    const destCounts = {};
+                    try {
+                        const doc = new DOMParser().parseFromString(text, 'text/html');
+                        const headers = Array.from(doc.querySelectorAll('th')).map(h => h.textContent.trim());
+                        const destCol = headers.findIndex(h => /destination\s*warehouse/i.test(h));
+                        if (destCol >= 0) {
+                            doc.querySelectorAll('tbody tr').forEach(row => {
+                                const cells = row.querySelectorAll('td');
+                                if (cells[destCol]) {
+                                    const val = cells[destCol].textContent.trim();
+                                    if (val && val !== '—' && val !== '-') {
+                                        destCounts[val] = (destCounts[val] || 0) + 1;
+                                    }
+                                }
+                            });
+                        }
+                    } catch (e) {
+                        console.warn('[RCD] fetchDestWarehouseIds parse error:', e);
+                    }
+                    resolve(destCounts);
+                },
+                onerror: () => resolve({}),
+                ontimeout: () => resolve({}),
+                timeout: 30000
             });
         });
     }
@@ -963,9 +999,9 @@
                             if (!d || d.count === 0) return `<td style="text-align:right;padding:0.1em 0.4em;"></td>`;
                             const disp = d.count.toLocaleString();
                             const content = d.url
-                                ? `<a href="${forceTransshipments(d.url)}" target="_blank" style="color:#c9d1d9;text-decoration:underline dotted;">${disp}</a>`
+                                ? `<a href="${forceTransshipments(d.url)}" target="_blank" style="color:#e8e8e8;text-decoration:underline dotted;font-size:1.15em;">${disp}</a>`
                                 : disp;
-                            return `<td style="text-align:right;padding:0.1em 0.4em;color:#c9d1d9;">${content}</td>`;
+                            return `<td style="text-align:right;padding:0.1em 0.4em;color:#e8e8e8;font-size:1.15em;">${content}</td>`;
                         }).join('');
                         // Active pickers cell for PNYP paths
                         let pickerDisp = '';
@@ -975,7 +1011,25 @@
                                 pickerDisp = `<span style="color:#a6e3a1;font-weight:bold;">${pc}</span>`;
                             }
                         }
-                        destRows += `<tr style="background:rgba(255,255,255,0.03)"><td style="padding-left:1em;color:#c9d1d9;">↳ ${path}</td><td style="text-align:center;">${pickerDisp}</td>${pathCells}<td style="text-align:right;padding:0.1em 0.4em;color:#c9d1d9;">${total.toLocaleString()}</td></tr>`;
+                        // Destination warehouse IDs with counts for Picking Picked and PNYP paths
+                        let destDisp = '';
+                        if (group === 'Picking Picked' || group === 'Picking Not Yet Picked') {
+                            const mergedDests = {};
+                            shiftCPTs.forEach(cpt => {
+                                const ppEntry = ppData[cpt] && ppData[cpt][group] && ppData[cpt][group][path];
+                                if (ppEntry && ppEntry.destWarehouses) {
+                                    for (const [wh, cnt] of Object.entries(ppEntry.destWarehouses)) {
+                                        mergedDests[wh] = (mergedDests[wh] || 0) + cnt;
+                                    }
+                                }
+                            });
+                            const entries = Object.entries(mergedDests).sort((a, b) => b[1] - a[1]);
+                            if (entries.length > 0) {
+                                const parts = entries.map(([wh, cnt]) => `${wh}: ${cnt.toLocaleString()}`);
+                                destDisp = ` <span style="color:#f9e2af;font-size:1.15em;font-weight:bold;">[${parts.join(', ')}]</span>`;
+                            }
+                        }
+                        destRows += `<tr style="background:rgba(255,255,255,0.03)"><td style="padding-left:1em;color:#e8e8e8;font-size:1.15em;">↳ ${path}${destDisp}</td><td style="text-align:center;">${pickerDisp}</td>${pathCells}<td style="text-align:right;padding:0.1em 0.4em;color:#e8e8e8;font-size:1.15em;">${total.toLocaleString()}</td></tr>`;
                     });
                 }
             }
@@ -1226,7 +1280,15 @@
                         } else {
                             ppFetches.push(fetchCaseCountRaw(info.url).then(async count => {
                                 if (count === null) count = await fetchCaseCountRawFull(info.url);
-                                ppData[cptLabel][group][pathName] = { count: count || 0, url: info.url };
+                                // For Picking Picked paths, also fetch destination warehouse IDs
+                                let destWarehouses = [];
+                                if (group === 'Picking Picked' && info.url) {
+                                    destWarehouses = await fetchDestWarehouseIds(info.url);
+                                }
+                                if (group === 'Picking Not Yet Picked' && info.url) {
+                                    destWarehouses = await fetchDestWarehouseIds(info.url);
+                                }
+                                ppData[cptLabel][group][pathName] = { count: count || 0, url: info.url, destWarehouses };
                             }));
                         }
                     } else {
