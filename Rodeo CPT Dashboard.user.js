@@ -4,8 +4,8 @@
 // @version      2.3
 // @description  Overlays a CPT breakdown dashboard on Rodeo ExSD pages — current shift & next shift
 // @author       You
-// @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/Rodeo%20CPT%20Dashboard-1.4.user.js
-// @downloadURL  https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/Rodeo%20CPT%20Dashboard-1.4.user.js
+// @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/RodeoCPTDashboard.user.js
+// @downloadURL  https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/RodeoCPTDashboard.user.js
 // @match        https://rodeo-iad.amazon.com/*
 // @match        https://rodeo-pdx.amazon.com/*
 // @match        https://rodeo-dub.amazon.com/*
