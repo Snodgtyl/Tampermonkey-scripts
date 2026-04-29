@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Oculus Transship Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      6.2
+// @version      6.3
 // @description  Adds a formatted summary dashboard to Oculus transship pages with AFT pending cases, items, and case density — VRIDs link to YMS
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
@@ -106,7 +106,7 @@
     }
 
     // ─── Auto-clear stale cache on version update ───────────────────────────
-    const SCRIPT_VERSION = '6.2';
+    const SCRIPT_VERSION = '6.3';
     const lastVer = GM_getValue('_scriptVersion', '');
     if (lastVer !== SCRIPT_VERSION) {
         // Clear all cached AFT data from previous versions
@@ -557,8 +557,10 @@
             const data = JSON.parse(stored);
             const ageMin = ((Date.now() - data.timestamp) / 60000).toFixed(1);
             console.log(`[OculusDash] ✓ AFT data found (${ageMin} min old):`, data);
-            if (parseFloat(ageMin) <= 60) return data;
-            console.warn('[OculusDash] Cached data is stale, fetching fresh from AFT...');
+            // Only use cache if it has actual data AND is less than 60 min old
+            if (parseFloat(ageMin) <= 60 && data.totalCases > 0) return data;
+            if (data.totalCases === 0) console.warn('[OculusDash] Cached data has 0 cases, re-fetching...');
+            else console.warn('[OculusDash] Cached data is stale, fetching fresh from AFT...');
         }
 
         // Direct fetch from AFT API via GM_xmlhttpRequest (cross-origin)
@@ -721,46 +723,75 @@
                     const ref = t.shipmentReferenceId || t.shipment_reference_id || t.referenceId || t.id || t.amazonShipmentReferenceId;
                     if (ref) {
                         const tid = t.trailerId || t.vehicleReferenceId || t.vrid || '';
-                        // If we have Oculus VRIDs, only fetch details for matching trailers
-                        if (oculusSet && tid && !oculusSet.has(tid.toUpperCase())) continue;
-                        detailRefs.push(ref);
                         if (tid) refToTrailerId[ref] = tid;
+                        // Only fetch details for trailers visible in Oculus yard
+                        if (oculusSet) {
+                            if (tid && oculusSet.has(tid.toUpperCase())) detailRefs.push(ref);
+                        } else {
+                            detailRefs.push(ref);
+                        }
                     }
                 }
+                console.log(`[OculusDash] Matched ${detailRefs.length} of ${arr.length} AFT transfers to Oculus in-yard VRIDs`);
 
                 if (detailRefs.length > 0) {
                     console.log(`[OculusDash] Fetching ${detailRefs.length} detail pages (filtered from ${arr.length} total)...`);
                     console.log('[OculusDash] TrailerId map sample:', JSON.stringify(Object.entries(refToTrailerId).slice(0, 5)));
                     let detailCases = 0, detailItems = 0, detailOk = 0;
                     const detailPerTrailer = {};
+                    let firstDetailLogged = false;
                     // Fetch in parallel batches of 5
                     for (let i = 0; i < detailRefs.length; i += 5) {
                         const batch = detailRefs.slice(i, i + 5);
                         const results = await Promise.all(batch.map(ref => {
-                            const detailUrl = `https://${aftDomain}/stowing-in-progress/?warehouseId=${fc}&amazonShipmentRefId=${ref}`;
+                            // Fetch the AFT inbound detail HTML page which has the Total Pending table
+                            const detailUrl = `https://${aftDomain}/${fc}/view-transfers/inbound/${ref}`;
                             return new Promise((resolve) => {
                                 GM_xmlhttpRequest({
                                     method: 'GET', url: detailUrl,
-                                    headers: { 'Accept': 'application/json' },
+                                    headers: { 'Accept': 'text/html' },
                                     onload: (resp) => {
-                                        try { resolve({ ref, data: JSON.parse(resp.responseText) }); }
-                                        catch(e) { resolve({ ref, data: null }); }
+                                        const html = resp.responseText || '';
+                                        if (!firstDetailLogged) {
+                                            firstDetailLogged = true;
+                                            console.log('[OculusDash] First detail response status:', resp.status, 'length:', html.length, 'has Total Pending:', html.includes('Total Pending'));
+                                        }
+                                        // Parse Total Pending from the HTML
+                                        try {
+                                            const doc = new DOMParser().parseFromString(html, 'text/html');
+                                            let cases = 0, items = 0;
+                                            // Look for table with Cases/Items columns and Total Pending row
+                                            for (const table of doc.querySelectorAll('table')) {
+                                                const ths = Array.from(table.querySelectorAll('th')).map(h => h.textContent.trim());
+                                                const ci = ths.findIndex(h => h === 'Cases');
+                                                const ii = ths.findIndex(h => h === 'Items');
+                                                if (ci === -1 && ii === -1) continue;
+                                                for (const row of table.querySelectorAll('tr')) {
+                                                    if (!row.textContent.includes('Total Pending')) continue;
+                                                    const cells = row.querySelectorAll('td, th');
+                                                    if (ci !== -1 && cells[ci]) cases = parseInt(cells[ci].textContent.trim().replace(/,/g,''),10)||0;
+                                                    if (ii !== -1 && cells[ii]) items = parseInt(cells[ii].textContent.trim().replace(/,/g,''),10)||0;
+                                                    if (cases === 0 && items === 0) {
+                                                        // Fallback: grab all numbers from the row
+                                                        const nums = Array.from(cells).map(x => parseInt(x.textContent.trim().replace(/,/g,''),10)).filter(n => !isNaN(n) && n > 0);
+                                                        if (nums.length >= 2) { cases = nums[nums.length - 2]; items = nums[nums.length - 1]; }
+                                                    }
+                                                    break;
+                                                }
+                                                if (cases > 0 || items > 0) break;
+                                            }
+                                            resolve({ ref, cases, items });
+                                        } catch(e) {
+                                            resolve({ ref, cases: 0, items: 0 });
+                                        }
                                     },
-                                    onerror: () => resolve({ ref, data: null }),
-                                    ontimeout: () => resolve({ ref, data: null }),
-                                    timeout: 15000
+                                    onerror: () => resolve({ ref, cases: 0, items: 0 }),
+                                    ontimeout: () => resolve({ ref, cases: 0, items: 0 }),
+                                    timeout: 20000
                                 });
                             });
                         }));
-                        for (const { ref, data: detail } of results) {
-                            if (!detail) continue;
-                            // Detail API returns per-trailer pending data — broader keys are safe here
-                            const ck = ['totalPendingCases', 'pendingCases', 'caseQuantityTotal', 'caseQuantity', 'totalCases', 'cases'];
-                            const ik = ['totalPendingItems', 'pendingItems', 'quantityItemsTotal', 'itemQuantity', 'totalItems', 'items'];
-                            let c = 0, it = 0;
-                            for (const k of ck) { if (detail[k] !== undefined) { c = parseInt(detail[k],10)||0; break; } }
-                            for (const k of ik) { if (detail[k] !== undefined) { it = parseInt(detail[k],10)||0; break; } }
-                            if (detail.totalPending) { c = c || parseInt(detail.totalPending.cases,10)||0; it = it || parseInt(detail.totalPending.items,10)||0; }
+                        for (const { ref, cases: c, items: it } of results) {
                             if (c > 0 || it > 0) {
                                 detailCases += c; detailItems += it; detailOk++;
                                 const tid = refToTrailerId[ref];
@@ -1340,7 +1371,15 @@
                         flCases: vals[col('flcases')]||vals[18]||'0',
                         palletizedSACases: vals[col('palletizedsacases')]||vals[20]||'0',
                         palletizedMixCases: vals[col('palletizedmixcases')]||vals[21]||'0',
-                        totalCartons: vals[22]||'0',
+                        totalCartons: (() => {
+                            // FLOOR-LOAD rows: vals[22], PALLETIZED rows (51+ cells): vals[21]
+                            // Use whichever has a valid number
+                            const v22 = parseInt((vals[22]||'0').replace(/,/g,''), 10) || 0;
+                            if (v22 > 0) return vals[22];
+                            const v21 = parseInt((vals[21]||'0').replace(/,/g,''), 10) || 0;
+                            if (v21 > 0) return vals[21];
+                            return '0';
+                        })(),
                         totalUnits: (() => {
                             // Total Units is the last large non-zero numeric value in the row (after index 22)
                             // Skip percentage values (contain %)
@@ -1602,7 +1641,8 @@
                 const aftUrl = getAFTUrl(fc);
                 // If AFT returned 0 cases, fall back to Oculus totalCartons from arrived trailers
                 const effectiveCases = aft.totalCases > 0 ? aft.totalCases : parseInt(sum(arrived, 'totalCartons').replace(/,/g,''),10) || 0;
-                const effectiveItems = aft.totalItems > 0 ? aft.totalItems : parseInt(sum(arrived, 'totalUnits').replace(/,/g,''),10) || 0;
+                // Total Units always comes from Oculus (AFT "Items" is a different metric — individual items per case)
+                const effectiveItems = parseInt(sum(arrived, 'totalUnits').replace(/,/g,''),10) || 0;
                 const tip = `AFT: ${aft.trailerCount} trailers, ${aft.count} parsed${aft.totalCases === 0 ? ' (using Oculus data)' : ''}`;
                 const cd = effectiveCases > 0 ? (effectiveItems / effectiveCases).toFixed(2) : 'N/A';
                 for (const r of cRows) {
@@ -1749,4 +1789,3 @@
     else setTimeout(mount, 3000);
 
 })();
-7
