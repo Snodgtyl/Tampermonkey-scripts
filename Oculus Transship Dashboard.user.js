@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Oculus Transship Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      5.9
-// @description  Adds a formatted summary dashboard to Oculus transship pages with AFT pending cases, items, and case density
+// @version      6.0
+// @description  Adds a formatted summary dashboard to Oculus transship pages with AFT pending cases, items, and case density — VRIDs link to YMS
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
 // @downloadURL  https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
@@ -11,6 +11,7 @@
 // @match        https://afttransshipmenthub-eu.aka.amazon.com/*/view-transfers/inbound*
 // @match        https://afttransshipmenthub-fe.aka.amazon.com/*/view-transfers/inbound*
 // @match        https://afttransshipmenthub.aka.amazon.com/*/view-transfers/inbound*
+// @match        https://trans-logistics.amazon.com/yms/shipclerk*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -26,8 +27,86 @@
 (function () {
     'use strict';
 
+    // ─── YMS Ship Clerk: Auto-fill warehouse & search from URL hash ─────────
+    if (window.location.hostname === 'trans-logistics.amazon.com' && window.location.pathname.includes('/yms/shipclerk')) {
+        const hash = window.location.hash || '';
+        const params = new URLSearchParams(hash.replace(/^#\/yard\??/, ''));
+        const nodeId = params.get('nodeId');
+        const searchQuery = params.get('searchQuery');
+        if (!nodeId && !searchQuery) return; // Nothing to auto-fill
+
+        console.log('[OculusDash-YMS] Auto-fill: nodeId=' + nodeId + ', searchQuery=' + searchQuery);
+
+        let warehouseSelected = !nodeId; // skip if no nodeId
+        let searchDone = !searchQuery;   // skip if no searchQuery
+        let attempts = 0;
+        const maxAttempts = 60; // 30 seconds
+
+        const interval = setInterval(() => {
+            attempts++;
+
+            // Step 1: Select the warehouse first
+            if (!warehouseSelected) {
+                const sel = document.querySelector('select[ng-model="$root.selectedYardSite"]') || document.querySelector('select[ng-change="refreshFunction()"]');
+                if (sel && sel.options.length > 1) {
+                    const opts = Array.from(sel.options);
+                    const match = opts.find(o => o.text.trim().toUpperCase() === nodeId.toUpperCase() || o.value.toUpperCase().includes(nodeId.toUpperCase()));
+                    if (match) {
+                        sel.value = match.value;
+                        sel.dispatchEvent(new Event('change', { bubbles: true }));
+                        try {
+                            const scope = angular.element(sel).scope();
+                            if (scope) {
+                                const rootScope = scope.$root || scope;
+                                scope.$apply(() => { rootScope.selectedYardSite = match.text.trim(); });
+                                const fn = scope.refreshFunction || rootScope.refreshFunction;
+                                if (typeof fn === 'function') fn();
+                            }
+                        } catch(e) { console.log('[OculusDash-YMS] Warehouse scope error:', e); }
+                        console.log('[OculusDash-YMS] Selected warehouse:', match.text.trim());
+                        warehouseSelected = true;
+                        // Give the yard data time to load before searching
+                        if (searchQuery) return;
+                    }
+                }
+            }
+
+            // Step 2: Fill search box (only after warehouse is selected)
+            if (warehouseSelected && !searchDone) {
+                const searchInput = document.getElementById('searchInput') || document.querySelector('input[placeholder*="Search"]');
+                if (searchInput) {
+                    searchInput.value = searchQuery;
+                    searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+                    searchInput.dispatchEvent(new Event('change', { bubbles: true }));
+                    try {
+                        const scope = angular.element(searchInput).scope();
+                        if (scope) {
+                            scope.$apply(() => {
+                                scope.topbar = scope.topbar || {};
+                                scope.topbar.filters = scope.topbar.filters || {};
+                                scope.topbar.filters.searchQuery = searchQuery;
+                            });
+                            if (scope.topbar && typeof scope.topbar.textSearch === 'function') {
+                                scope.topbar.textSearch(scope.topbar.filters.searchQuery);
+                            }
+                        }
+                    } catch(e) { console.log('[OculusDash-YMS] Search scope error:', e); }
+                    console.log('[OculusDash-YMS] Filled search:', searchQuery);
+                    searchDone = true;
+                }
+            }
+
+            if ((warehouseSelected && searchDone) || attempts >= maxAttempts) {
+                if (attempts >= maxAttempts) console.warn('[OculusDash-YMS] Timed out');
+                clearInterval(interval);
+            }
+        }, 500);
+
+        return; // Don't run the rest of the script on YMS
+    }
+
     // ─── Auto-clear stale cache on version update ───────────────────────────
-    const SCRIPT_VERSION = '5.9';
+    const SCRIPT_VERSION = '6.0';
     const lastVer = GM_getValue('_scriptVersion', '');
     if (lastVer !== SCRIPT_VERSION) {
         // Clear all cached AFT data from previous versions
@@ -1292,7 +1371,7 @@
         return `<div class="summary-card"><div class="card-header ${cls}">${title}</div><table class="card-table">${rows}</table></div>`;
     }
     let trailerSortDesc = false;
-    function buildTrailerTable(trailers) {
+    function buildTrailerTable(trailers, fc) {
         if (!trailers.length) return '<div class="no-trailers">No trailer data found — try refreshing.</div>';
         const order = { 'CHECKED_IN':0,'ARRIVED':1,'ARRIVAL_SCHEDULED':2,'DEPARTED':3 };
         let sorted;
@@ -1313,8 +1392,14 @@
             }
             return `<th>${h}</th>`;
         }).join('');
-        const body = sorted.map(t => `<tr>
-            <td>${t.trailerNum}</td><td>${t.isa}</td>
+        const body = sorted.map(t => {
+            const isInYard = t.apptStatus === 'ARRIVED' || t.apptStatus === 'CHECKED_IN';
+            const ymsUrl = `https://trans-logistics.amazon.com/yms/shipclerk#/yard?nodeId=${encodeURIComponent(fc)}&searchQuery=${encodeURIComponent(t.trailerNum)}`;
+            const vridCell = isInYard
+                ? `<a href="${ymsUrl}" target="_blank" style="color:#cba6f7;text-decoration:underline dotted;">${t.trailerNum}</a>`
+                : t.trailerNum;
+            return `<tr>
+            <td>${vridCell}</td><td>${t.isa}</td>
             <td class="${statusClass(t.apptStatus)}">${t.apptStatus}</td>
             <td>${t.trailerLocation}</td>
             <td>${t.loadConfig}</td><td>${t.flType}</td>
@@ -1324,7 +1409,8 @@
             <td style="text-align:right;color:#89dceb">${t.mixedASINPallets}</td>
             <td style="text-align:right;color:#89dceb">${t.flCases}</td>
             <td style="text-align:right;color:#cba6f7;font-weight:bold">${t.totalCartons}</td>
-        </tr>`).join('');
+        </tr>`;
+        }).join('');
         return `<div class="trailer-wrap"><table class="trailer-tbl"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
     }
     function sum(trailers, field) {
@@ -1375,9 +1461,9 @@
         const sapTotal = sapTrailers.reduce((s, t) => s + (parseInt((t.singleASINPallets||'0').replace(/,/g,''), 10)||0), 0);
         let sapBanner = '';
         if (sapTrailers.length > 0) {
-            const sapRows = sapTrailers.map(t =>
-                `<tr><td style="padding:4px 10px;">${t.trailerNum}</td><td style="padding:4px 10px;">${t.source}</td><td style="padding:4px 10px;text-align:right;color:#89dceb;font-weight:bold;">${t.singleASINPallets}</td><td style="padding:4px 10px;">${t.arrivalTime || 'TBD'}</td></tr>`
-            ).join('');
+            const sapRows = sapTrailers.map(t => {
+                return `<tr><td style="padding:4px 10px;">${t.trailerNum}</td><td style="padding:4px 10px;">${t.source}</td><td style="padding:4px 10px;text-align:right;color:#89dceb;font-weight:bold;">${t.singleASINPallets}</td><td style="padding:4px 10px;">${t.arrivalTime || 'TBD'}</td></tr>`;
+            }).join('');
             sapBanner = `<div style="background:#313244;border:1px solid #89dceb;border-radius:6px;padding:12px 14px;margin-bottom:10px;">
                 <div style="font-weight:bold;font-size:18px;color:#89dceb;margin-bottom:6px;">📦 Incoming SA Pallets — ${sapTotal.toLocaleString()} SAP across ${sapTrailers.length} trailer${sapTrailers.length > 1 ? 's' : ''}</div>
                 <table style="width:100%;border-collapse:collapse;font-size:16px;color:#cdd6f4;">
@@ -1411,7 +1497,7 @@
                 <button class="trailer-toggle-btn" id="oc-trailer-toggle">▲ Collapse</button>
             </div>
             <div class="trailer-section-body" id="oc-trailer-body">
-                ${buildTrailerTable(trailers)}
+                ${buildTrailerTable(trailers, fc)}
             </div>
         </div>`;
 
@@ -1434,7 +1520,7 @@
                 e.stopPropagation();
                 trailerSortDesc = !trailerSortDesc;
                 const body = document.getElementById('oc-trailer-body');
-                if (body) body.innerHTML = buildTrailerTable(trailers);
+                if (body) body.innerHTML = buildTrailerTable(trailers, fc);
                 // Re-attach sort handler after re-render
                 const newBtn = document.getElementById('oc-sort-cartons');
                 if (newBtn) newBtn.onclick = sortBtn.onclick;
