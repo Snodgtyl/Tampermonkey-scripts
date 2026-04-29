@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Oculus Transship Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      6.0
+// @version      6.2
 // @description  Adds a formatted summary dashboard to Oculus transship pages with AFT pending cases, items, and case density — VRIDs link to YMS
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
@@ -106,7 +106,7 @@
     }
 
     // ─── Auto-clear stale cache on version update ───────────────────────────
-    const SCRIPT_VERSION = '6.0';
+    const SCRIPT_VERSION = '6.2';
     const lastVer = GM_getValue('_scriptVersion', '');
     if (lastVer !== SCRIPT_VERSION) {
         // Clear all cached AFT data from previous versions
@@ -547,7 +547,7 @@
     const AUTO_REFRESH_MS = 20 * 60 * 1000;
     setTimeout(() => location.reload(), AUTO_REFRESH_MS);
 
-    async function fetchAFTData() {
+    async function fetchAFTData(oculusVrids) {
         const fc = window.location.pathname.split('/').pop();
         console.log('[OculusDash] Reading stored AFT data for', fc);
 
@@ -641,8 +641,10 @@
                 // Pass 1: Try to find inline PENDING case/item data from ALL transfers (not just YMS)
                 // IMPORTANT: Only use pending-specific keys to avoid counting total shipment quantities
                 let totalCases = 0, totalItems = 0, count = 0;
+                const perTrailer = {}; // Map of VRID → { cases, items }
                 const pendingCaseKeyNames = ['totalPendingCases','pendingCases'];
                 const pendingItemKeyNames = ['totalPendingItems','pendingItems'];
+                const vridKeyNames = ['trailerId','vehicleReferenceId','vrid','loadIdentifier','trailerNumber','vehicleId','loadId'];
 
                 for (const t of arr) {
                     let c = 0, it = 0;
@@ -654,6 +656,23 @@
                         it = parseInt(t.totalPending.items,10)||0;
                     }
                     if (c > 0 || it > 0) { totalCases += c; totalItems += it; count++; }
+                    // Extract VRID for per-trailer map
+                    let vrid = '';
+                    for (const k of vridKeyNames) { if (t[k]) { vrid = String(t[k]).trim(); break; } }
+                    if (!vrid) {
+                        // Try any key containing 'vrid' or 'vehicle'
+                        for (const [k, v] of Object.entries(t)) {
+                            const kl = k.toLowerCase();
+                            if ((kl.includes('vrid') || kl.includes('vehicle')) && v && typeof v === 'string') { vrid = v.trim(); break; }
+                        }
+                    }
+                    if (vrid && (c > 0 || it > 0)) {
+                        perTrailer[vrid] = { cases: c, items: it };
+                    }
+                    // Log first transfer's keys to help debug VRID field
+                    if (count === 1 && !vrid) {
+                        console.log('[OculusDash] First transfer all keys/values:', JSON.stringify(Object.entries(t).map(([k,v]) => [k, typeof v === 'string' ? v : typeof v]).slice(0, 30)));
+                    }
                 }
 
                 // If we got inline data, filter to only YMS-arrived trailers
@@ -682,23 +701,38 @@
                     const useCases = ymsCount > 0 ? ymsCases : totalCases;
                     const useItems = ymsCount > 0 ? ymsItems : totalItems;
                     const useCount = ymsCount > 0 ? ymsCount : count;
-                    const result = { totalCases: useCases, totalItems: useItems, count: useCount, trailerCount: useCount, timestamp: Date.now(), fc };
+                    const result = { totalCases: useCases, totalItems: useItems, count: useCount, trailerCount: useCount, timestamp: Date.now(), fc, perTrailer };
                     GM_setValue('aftData_' + fc, JSON.stringify(result));
-                    console.log('[OculusDash] ✓ AFT direct fetch:', result);
+                    console.log('[OculusDash] ✓ AFT direct fetch:', result.totalCases, 'cases,', result.totalItems, 'items,', Object.keys(perTrailer).length, 'per-trailer entries');
                     return result;
                 }
 
                 // Pass 2: No inline data — collect detail refs from ALL transfers
+                // But only fetch details for trailers visible in Oculus (if provided)
                 console.log('[OculusDash] No inline case data, trying detail pages...');
                 const detailRefs = [];
+                const refToTrailerId = {}; // Map shipmentRef → trailerId for per-trailer data
+                const oculusSet = oculusVrids ? new Set(oculusVrids.map(v => v.toUpperCase())) : null;
+                // Log first few trailerIds to debug matching
+                const sampleTids = arr.slice(0, 5).map(t => t.trailerId || t.vehicleReferenceId || t.vrid || 'NONE');
+                console.log('[OculusDash] Sample AFT trailerIds:', JSON.stringify(sampleTids));
+                console.log('[OculusDash] Sample Oculus VRIDs:', JSON.stringify(oculusVrids ? oculusVrids.slice(0, 5) : 'none'));
                 for (const t of arr) {
                     const ref = t.shipmentReferenceId || t.shipment_reference_id || t.referenceId || t.id || t.amazonShipmentReferenceId;
-                    if (ref) detailRefs.push(ref);
+                    if (ref) {
+                        const tid = t.trailerId || t.vehicleReferenceId || t.vrid || '';
+                        // If we have Oculus VRIDs, only fetch details for matching trailers
+                        if (oculusSet && tid && !oculusSet.has(tid.toUpperCase())) continue;
+                        detailRefs.push(ref);
+                        if (tid) refToTrailerId[ref] = tid;
+                    }
                 }
 
                 if (detailRefs.length > 0) {
-                    console.log(`[OculusDash] Fetching ${detailRefs.length} detail pages...`);
+                    console.log(`[OculusDash] Fetching ${detailRefs.length} detail pages (filtered from ${arr.length} total)...`);
+                    console.log('[OculusDash] TrailerId map sample:', JSON.stringify(Object.entries(refToTrailerId).slice(0, 5)));
                     let detailCases = 0, detailItems = 0, detailOk = 0;
+                    const detailPerTrailer = {};
                     // Fetch in parallel batches of 5
                     for (let i = 0; i < detailRefs.length; i += 5) {
                         const batch = detailRefs.slice(i, i + 5);
@@ -709,16 +743,16 @@
                                     method: 'GET', url: detailUrl,
                                     headers: { 'Accept': 'application/json' },
                                     onload: (resp) => {
-                                        try { resolve(JSON.parse(resp.responseText)); }
-                                        catch(e) { resolve(null); }
+                                        try { resolve({ ref, data: JSON.parse(resp.responseText) }); }
+                                        catch(e) { resolve({ ref, data: null }); }
                                     },
-                                    onerror: () => resolve(null),
-                                    ontimeout: () => resolve(null),
+                                    onerror: () => resolve({ ref, data: null }),
+                                    ontimeout: () => resolve({ ref, data: null }),
                                     timeout: 15000
                                 });
                             });
                         }));
-                        for (const detail of results) {
+                        for (const { ref, data: detail } of results) {
                             if (!detail) continue;
                             // Detail API returns per-trailer pending data — broader keys are safe here
                             const ck = ['totalPendingCases', 'pendingCases', 'caseQuantityTotal', 'caseQuantity', 'totalCases', 'cases'];
@@ -727,13 +761,17 @@
                             for (const k of ck) { if (detail[k] !== undefined) { c = parseInt(detail[k],10)||0; break; } }
                             for (const k of ik) { if (detail[k] !== undefined) { it = parseInt(detail[k],10)||0; break; } }
                             if (detail.totalPending) { c = c || parseInt(detail.totalPending.cases,10)||0; it = it || parseInt(detail.totalPending.items,10)||0; }
-                            if (c > 0 || it > 0) { detailCases += c; detailItems += it; detailOk++; }
+                            if (c > 0 || it > 0) {
+                                detailCases += c; detailItems += it; detailOk++;
+                                const tid = refToTrailerId[ref];
+                                if (tid) detailPerTrailer[tid] = { cases: c, items: it };
+                            }
                         }
                     }
                     if (detailOk > 0) {
-                        const result = { totalCases: detailCases, totalItems: detailItems, count: detailOk, trailerCount: detailRefs.length, timestamp: Date.now(), fc };
+                        const result = { totalCases: detailCases, totalItems: detailItems, count: detailOk, trailerCount: detailRefs.length, timestamp: Date.now(), fc, perTrailer: detailPerTrailer };
                         GM_setValue('aftData_' + fc, JSON.stringify(result));
-                        console.log('[OculusDash] ✓ AFT detail fetch:', result);
+                        console.log('[OculusDash] ✓ AFT detail fetch:', detailCases, 'cases,', detailItems, 'items,', Object.keys(detailPerTrailer).length, 'per-trailer entries');
                         return result;
                     }
                 }
@@ -1273,7 +1311,16 @@
                 const thCells = Array.from(row.querySelectorAll('th'));
                 const vrid = thCells.length > 0 ? thCells[0].textContent.trim() : '';
                 if (statuses.some(s => vals.includes(s))) {
-                    if (trailers.length === 0) console.log('[OculusDash DEBUG] First data row vrid:', vrid, 'vals[0..5]:', JSON.stringify(vals.slice(0, 6)));
+                    if (trailers.length === 0) {
+                        console.log('[OculusDash DEBUG] First data row vrid:', vrid, 'vals[0..5]:', JSON.stringify(vals.slice(0, 6)));
+                        console.log('[OculusDash DEBUG] First data row vals[20..30]:', JSON.stringify(vals.slice(20, 30)));
+                        console.log('[OculusDash DEBUG] col totalcartons:', col('totalcartons'), 'col totalunits:', col('totalunits'), 'col units:', col('units'));
+                    }
+                    // Log palletized rows to debug Total Units column
+                    const loadCfg = vals[col('loadconfig')]||(vals.includes('PALLETIZED') ? 'PALLETIZED' : '');
+                    if (loadCfg === 'PALLETIZED' && trailers.filter(t => t.loadConfig === 'PALLETIZED').length === 0) {
+                        console.log('[OculusDash DEBUG] First PALLETIZED row vrid:', vrid, 'cells:', cells.length, 'vals[18..28]:', JSON.stringify(vals.slice(18, 28)));
+                    }
                     const apptIdx = col('apptstatus') >= 0 ? col('apptstatus') : vals.findIndex(v => statuses.includes(v));
                     trailers.push({
                         trailerNum: vrid || vals[0]||'',
@@ -1293,8 +1340,17 @@
                         flCases: vals[col('flcases')]||vals[18]||'0',
                         palletizedSACases: vals[col('palletizedsacases')]||vals[20]||'0',
                         palletizedMixCases: vals[col('palletizedmixcases')]||vals[21]||'0',
-                        totalCartons: vals[col('totalcartons')]||vals[22]||'0',
-                        totalUnits: vals[col('totalunits')]||vals[27]||'0',
+                        totalCartons: vals[22]||'0',
+                        totalUnits: (() => {
+                            // Total Units is the last large non-zero numeric value in the row (after index 22)
+                            // Skip percentage values (contain %)
+                            for (let i = vals.length - 1; i > 22; i--) {
+                                if ((vals[i]||'').includes('%')) continue;
+                                const n = parseInt((vals[i]||'0').replace(/,/g,''), 10);
+                                if (n > 0) return vals[i];
+                            }
+                            return '0';
+                        })(),
                     });
                 }
             }
@@ -1371,8 +1427,9 @@
         return `<div class="summary-card"><div class="card-header ${cls}">${title}</div><table class="card-table">${rows}</table></div>`;
     }
     let trailerSortDesc = false;
-    function buildTrailerTable(trailers, fc) {
+    function buildTrailerTable(trailers, fc, aftPerTrailer) {
         if (!trailers.length) return '<div class="no-trailers">No trailer data found — try refreshing.</div>';
+        const aftMap = aftPerTrailer || {};
         const order = { 'CHECKED_IN':0,'ARRIVED':1,'ARRIVAL_SCHEDULED':2,'DEPARTED':3 };
         let sorted;
         if (trailerSortDesc) {
@@ -1384,7 +1441,7 @@
         } else {
             sorted = [...trailers].sort((a,b) => (order[a.apptStatus]??9) - (order[b.apptStatus]??9));
         }
-        const hdrs = ['VRID','ISA','Appt Status','Trailer Location','Load Config','FL Type','Priority','SCAC','Source','Arrival Time','SA Pallets','Mixed Pallets','FL Cases','Total Cartons'];
+        const hdrs = ['VRID','ISA','Appt Status','Trailer Location','Load Config','FL Type','Priority','Source','Arrival Time','SA Pallets','Mixed Pallets','FL Cases','Total Cartons','Total Units'];
         const head = hdrs.map(h => {
             if (h === 'Total Cartons') {
                 const arrow = trailerSortDesc ? ' ▼' : ' ⇅';
@@ -1404,11 +1461,12 @@
             <td>${t.trailerLocation}</td>
             <td>${t.loadConfig}</td><td>${t.flType}</td>
             <td class="${scoreClass(t.priorityScore)}">${t.priorityScore}</td>
-            <td>${t.scac}</td><td>${t.source}</td><td>${t.arrivalTime}</td>
+            <td>${t.source}</td><td>${t.arrivalTime}</td>
             <td style="text-align:right;color:#89dceb">${t.singleASINPallets}</td>
             <td style="text-align:right;color:#89dceb">${t.mixedASINPallets}</td>
             <td style="text-align:right;color:#89dceb">${t.flCases}</td>
-            <td style="text-align:right;color:#cba6f7;font-weight:bold">${t.totalCartons}</td>
+            <td style="text-align:right;color:#cba6f7;font-weight:bold">${isInYard && aftMap[t.trailerNum] ? aftMap[t.trailerNum].cases.toLocaleString() : t.totalCartons}</td>
+            <td style="text-align:right;color:#a6e3a1;font-weight:bold">${isInYard && aftMap[t.trailerNum] ? aftMap[t.trailerNum].items.toLocaleString() : t.totalUnits}</td>
         </tr>`;
         }).join('');
         return `<div class="trailer-wrap"><table class="trailer-tbl"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
@@ -1528,8 +1586,9 @@
         }
 
         // ─── Async: Update IN YARD card with AFT data ───────────────────────
+        const inYardVrids = arrived.map(t => t.trailerNum);
         try {
-            const aft = await fetchAFTData();
+            const aft = await fetchAFTData(inYardVrids);
             const card = container.querySelector('.summary-card');
             if (!card) return;
             const cRows = card.querySelectorAll('.card-table tr');
@@ -1572,6 +1631,33 @@
             }
         } catch (err) {
             console.error('[OculusDash] AFT error:', err);
+        }
+
+        // ─── Re-render trailer table with AFT per-trailer data ──────────────
+        try {
+            const aft = await fetchAFTData(inYardVrids);
+            const aftPerTrailer = (aft && aft.perTrailer) || {};
+            if (Object.keys(aftPerTrailer).length > 0) {
+                console.log('[OculusDash] Re-rendering trailer table with', Object.keys(aftPerTrailer).length, 'per-trailer AFT entries');
+                const body = document.getElementById('oc-trailer-body');
+                if (body) {
+                    body.innerHTML = buildTrailerTable(trailers, fc, aftPerTrailer);
+                    // Re-attach sort handler
+                    const sortBtn = document.getElementById('oc-sort-cartons');
+                    if (sortBtn) {
+                        sortBtn.onclick = (e) => {
+                            e.stopPropagation();
+                            trailerSortDesc = !trailerSortDesc;
+                            const b = document.getElementById('oc-trailer-body');
+                            if (b) b.innerHTML = buildTrailerTable(trailers, fc, aftPerTrailer);
+                            const newBtn = document.getElementById('oc-sort-cartons');
+                            if (newBtn) newBtn.onclick = sortBtn.onclick;
+                        };
+                    }
+                }
+            }
+        } catch (err) {
+            console.error('[OculusDash] AFT per-trailer re-render error:', err);
         }
 
         // ─── Fetch Stow Rate JPH from FCLM ─────────────────────────────────
@@ -1622,7 +1708,7 @@
 
         // ─── Calculate Days of Backlog ──────────────────────────────────────
         try {
-            const aft = await fetchAFTData();
+            const aft = await fetchAFTData(inYardVrids);
             // Use AFT cases if available, otherwise fall back to Oculus totalCartons
             let totalCases = aft && aft.totalCases ? aft.totalCases : 0;
             if (totalCases === 0) {
@@ -1663,3 +1749,4 @@
     else setTimeout(mount, 3000);
 
 })();
+7
