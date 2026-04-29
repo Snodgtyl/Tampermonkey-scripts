@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Rodeo CPT Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      2.3
-// @description  Overlays a CPT breakdown dashboard on Rodeo ExSD pages — current shift & next shift
+// @version      2.4
+// @description  Overlays a CPT breakdown dashboard on Rodeo ExSD pages — current shift & next shift (switches 30 min before SOS)
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/RodeoCPTDashboard.user.js
 // @downloadURL  https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/RodeoCPTDashboard.user.js
@@ -26,7 +26,7 @@
     'use strict';
 
     // ─── Auto-clear stale cache on version update ───────────────────────────
-    const SCRIPT_VERSION = '2.3';
+    const SCRIPT_VERSION = '2.4';
     const lastVer = localStorage.getItem('_rcd_scriptVersion') || '';
     if (lastVer !== SCRIPT_VERSION) {
         // Clear cached prefs/data from previous versions
@@ -137,7 +137,8 @@
     }
 
     // ─── Shift boundaries ─────────────────────────────────────────────────────────
-    function getShiftBoundaries(fc) {
+    // Returns ACTUAL shift boundaries (for FCLM pick rate, etc.)
+    function getActualShiftBoundaries(fc) {
         const shift = getShiftConfig(fc);
         const now = new Date();
         const h = now.getHours(), m = now.getMinutes();
@@ -174,6 +175,48 @@
         // Next shift
         nextShiftStart = new Date(shiftEnd);
         if (shiftEnd.getHours() < 12) {
+            nextShiftStart.setHours(shift.dayStartH, shift.dayStartM, 0, 0);
+            nextShiftEnd = new Date(nextShiftStart); nextShiftEnd.setHours(shift.dayEndH, shift.dayEndM, 0, 0);
+        } else {
+            nextShiftStart.setHours(shift.nightStartH, shift.nightStartM, 0, 0);
+            nextShiftEnd = new Date(nextShiftStart); nextShiftEnd.setDate(nextShiftEnd.getDate() + 1); nextShiftEnd.setHours(shift.nightEndH, shift.nightEndM, 0, 0);
+        }
+        return { shiftStart, shiftEnd, nextShiftStart, nextShiftEnd };
+    }
+
+    // Returns DISPLAY shift boundaries for Rodeo CPT data
+    // Switches to next shift data at fixed times: 5:45 PM → night shift, 5:45 AM → day shift
+    function getShiftBoundaries(fc) {
+        const shift = getShiftConfig(fc);
+        const now = new Date();
+        const h = now.getHours(), m = now.getMinutes();
+        const timeVal = h * 60 + m;
+
+        const NIGHT_SWITCH = 17 * 60 + 45; // 5:45 PM — start showing night shift data
+        const DAY_SWITCH   =  5 * 60 + 45; // 5:45 AM — start showing day shift data
+
+        const dayStart   = shift.dayStartH * 60 + shift.dayStartM;
+        const nightEnd   = shift.nightEndH * 60 + shift.nightEndM;
+
+        let shiftStart, shiftEnd, nextShiftStart, nextShiftEnd;
+
+        if (timeVal >= DAY_SWITCH && timeVal < NIGHT_SWITCH) {
+            // Day shift window (5:45 AM to 5:44 PM)
+            shiftStart = new Date(now); shiftStart.setHours(shift.dayStartH, shift.dayStartM, 0, 0);
+            shiftEnd   = new Date(now); shiftEnd.setHours(shift.dayEndH, shift.dayEndM, 0, 0);
+        } else if (timeVal >= NIGHT_SWITCH) {
+            // Night shift window (5:45 PM to midnight)
+            shiftStart = new Date(now); shiftStart.setHours(shift.nightStartH, shift.nightStartM, 0, 0);
+            shiftEnd = new Date(shiftStart); shiftEnd.setDate(shiftEnd.getDate() + 1); shiftEnd.setHours(shift.nightEndH, shift.nightEndM, 0, 0);
+        } else {
+            // Night shift window (midnight to 5:44 AM)
+            shiftStart = new Date(now); shiftStart.setDate(shiftStart.getDate() - 1); shiftStart.setHours(shift.nightStartH, shift.nightStartM, 0, 0);
+            shiftEnd = new Date(shiftStart); shiftEnd.setDate(shiftEnd.getDate() + 1); shiftEnd.setHours(shift.nightEndH, shift.nightEndM, 0, 0);
+        }
+
+        // Next shift
+        nextShiftStart = new Date(shiftEnd);
+        if (shiftEnd.getHours() < 12) {
             // Night ended, next is day
             nextShiftStart.setHours(shift.dayStartH, shift.dayStartM, 0, 0);
             nextShiftEnd = new Date(nextShiftStart); nextShiftEnd.setHours(shift.dayEndH, shift.dayEndM, 0, 0);
@@ -182,7 +225,12 @@
             nextShiftStart.setHours(shift.nightStartH, shift.nightStartM, 0, 0);
             nextShiftEnd = new Date(nextShiftStart); nextShiftEnd.setDate(nextShiftEnd.getDate() + 1); nextShiftEnd.setHours(shift.nightEndH, shift.nightEndM, 0, 0);
         }
-        return { shiftStart, shiftEnd, nextShiftStart, nextShiftEnd };
+
+        // Determine which shift is "current" for labeling
+        const isNightShift = shiftStart.getHours() >= 12 || shiftStart.getHours() < 6;
+        const currentShiftLabel = isNightShift ? 'Night Shift' : 'Day Shift';
+
+        return { shiftStart, shiftEnd, nextShiftStart, nextShiftEnd, currentShiftLabel };
     }
 
     function fmtTime(d) { return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }); }
@@ -878,6 +926,8 @@
         const t = THEMES[curTheme] || THEMES['Dark'];
         const shiftCPTs = Object.keys(cpts).filter(cpt => {
             const d = parseCPTDate(cpt);
+            // Exclude 11:00 CPTs (removal/donation work)
+            if (d && d.getHours() === 11 && d.getMinutes() === 0) return false;
             return d && d >= shiftStart && d < shiftEnd;
         }).sort((a, b) => parseCPTDate(a) - parseCPTDate(b)).filter(cpt => {
             const colTotal = GROUP_ORDER.reduce((s, g) => {
@@ -1098,6 +1148,8 @@
         Object.keys(cases).forEach(cpt => {
             const d = parseCPTDate(cpt);
             if (!d || d <= afterDate) return;
+            // Exclude 11:00 CPTs (removal/donation work)
+            if (d.getHours() === 11 && d.getMinutes() === 0) return;
 
             const rtpEntry = cases[cpt] && cases[cpt]['Ready to Pick'];
             const val = rtpEntry ? (rtpEntry.count !== undefined ? rtpEntry.count : rtpEntry) : 0;
@@ -1129,31 +1181,32 @@
         const now = new Date();
         const fc = window.location.pathname.split('/')[1] || '';
         const shift = getShiftConfig(fc);
-        const { shiftStart, shiftEnd, nextShiftStart, nextShiftEnd } = getShiftBoundaries(fc);
+        const { shiftStart, shiftEnd, nextShiftStart, nextShiftEnd, currentShiftLabel } = getShiftBoundaries(fc);
+        const { shiftStart: actualShiftStart, shiftEnd: actualShiftEnd } = getActualShiftBoundaries(fc);
         const timeVal = now.getHours() * 60 + now.getMinutes();
         const dayStart   = shift.dayStartH * 60 + shift.dayStartM;
         const nightStart = shift.nightStartH * 60 + shift.nightStartM;
-        const shiftLabel     = (timeVal >= dayStart && timeVal < nightStart) ? 'Day Shift' : 'Night Shift';
+        const shiftLabel     = currentShiftLabel;
         const nextShiftLabel = shiftLabel === 'Day Shift' ? 'Night Shift' : 'Day Shift';
         const { cptLinks, cptCounts, ppData, debugInfo } = extractLinks();
         const mpScraped = scrapeManifestPending();
         const hasCPTs = Object.keys(cptLinks).length > 0 || Object.keys(cptCounts).length > 0;
 
         let pickerData = {};
-        // Only show pick rate during shift + 30 min grace period after shift ends
+        // Only show pick rate during actual shift + 30 min grace period after shift ends
         const pickRateGrace = 30 * 60 * 1000; // 30 minutes in ms
-        const withinPickRateWindow = now >= shiftStart && now <= new Date(shiftEnd.getTime() + pickRateGrace);
+        const withinPickRateWindow = now >= actualShiftStart && now <= new Date(actualShiftEnd.getTime() + pickRateGrace);
         let pickRateJPH = withinPickRateWindow ? 'loading...' : '';
         let totalPicks = 0;
         let mpResult = null; // resolved manifest pending data with case counts
 
         const renderHTML = (cases, loading) => {
             const t = THEMES[curTheme] || THEMES['Dark'];
-            const fclmStartDate = `${shiftStart.getFullYear()}/${String(shiftStart.getMonth()+1).padStart(2,'0')}/${String(shiftStart.getDate()).padStart(2,'0')}`;
-            const fclmEndDate = `${shiftEnd.getFullYear()}/${String(shiftEnd.getMonth()+1).padStart(2,'0')}/${String(shiftEnd.getDate()).padStart(2,'0')}`;
+            const fclmStartDate = `${actualShiftStart.getFullYear()}/${String(actualShiftStart.getMonth()+1).padStart(2,'0')}/${String(actualShiftStart.getDate()).padStart(2,'0')}`;
+            const fclmEndDate = `${actualShiftEnd.getFullYear()}/${String(actualShiftEnd.getMonth()+1).padStart(2,'0')}/${String(actualShiftEnd.getDate()).padStart(2,'0')}`;
             const fclmUrl = `https://fclm-portal.amazon.com/reports/functionRollup?warehouseId=${fc}&processId=1003065&maxIntradayDays=1&spanType=Intraday` +
-                `&startDateIntraday=${encodeURIComponent(fclmStartDate)}&startHourIntraday=${shiftStart.getHours()}&startMinuteIntraday=${String(shiftStart.getMinutes()).padStart(2,'0')}` +
-                `&endDateIntraday=${encodeURIComponent(fclmEndDate)}&endHourIntraday=${shiftEnd.getHours()}&endMinuteIntraday=${String(shiftEnd.getMinutes()).padStart(2,'0')}`;
+                `&startDateIntraday=${encodeURIComponent(fclmStartDate)}&startHourIntraday=${actualShiftStart.getHours()}&startMinuteIntraday=${String(actualShiftStart.getMinutes()).padStart(2,'0')}` +
+                `&endDateIntraday=${encodeURIComponent(fclmEndDate)}&endHourIntraday=${actualShiftEnd.getHours()}&endMinuteIntraday=${String(actualShiftEnd.getMinutes()).padStart(2,'0')}`;
             dashEl.innerHTML = `
             <div id="rcd-header">
                 <div style="flex:1;display:flex;align-items:center;">
@@ -1231,7 +1284,7 @@
         const pickerPromise = fetchActivePickers(fc).then(data => { pickerData = data; });
         // Fetch pick rate JPH in parallel (only during shift + 30 min after)
         const pickRatePromise = withinPickRateWindow
-            ? fetchPickRate(fc, shiftStart, shiftEnd).then(data => { pickRateJPH = data.jph; totalPicks = data.totalPicks; })
+            ? fetchPickRate(fc, actualShiftStart, actualShiftEnd).then(data => { pickRateJPH = data.jph; totalPicks = data.totalPicks; })
             : Promise.resolve();
 
         const cases = {};
