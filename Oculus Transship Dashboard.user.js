@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Oculus Transship Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      6.3
+// @version      6.4
 // @description  Adds a formatted summary dashboard to Oculus transship pages with AFT pending cases, items, and case density — VRIDs link to YMS
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
@@ -106,7 +106,7 @@
     }
 
     // ─── Auto-clear stale cache on version update ───────────────────────────
-    const SCRIPT_VERSION = '6.3';
+    const SCRIPT_VERSION = '6.4';
     const lastVer = GM_getValue('_scriptVersion', '');
     if (lastVer !== SCRIPT_VERSION) {
         // Clear all cached AFT data from previous versions
@@ -1099,6 +1099,87 @@
         });
     }
 
+    // ─── Fetch Inbound Total Hours from FCLM processPathRollup ──────────────
+    function fetchInboundHours(fc) {
+        return new Promise((resolve) => {
+            const shift = getShiftConfig(fc);
+            const now = new Date();
+            const hour = now.getHours();
+            const min = now.getMinutes();
+            const timeVal = hour * 60 + min;
+            let startDate, endDate, startH, startM, endH, endM;
+
+            const nightStart = shift.nightStartH * 60 + shift.nightStartM;
+            const nightEnd   = shift.nightEndH * 60 + shift.nightEndM;
+            const dayStart   = shift.dayStartH * 60 + shift.dayStartM;
+            const dayEnd     = shift.dayEndH * 60 + shift.dayEndM;
+
+            if (timeVal >= dayStart && timeVal < nightStart) {
+                const d = new Date(now); d.setHours(shift.dayStartH, shift.dayStartM, 0, 0);
+                startDate = `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')}`;
+                endDate = `${now.getFullYear()}/${String(now.getMonth()+1).padStart(2,'0')}/${String(now.getDate()).padStart(2,'0')}`;
+                startH = shift.dayStartH; startM = shift.dayStartM;
+                endH = shift.dayEndH; endM = shift.dayEndM;
+            } else if (timeVal >= nightStart || timeVal < nightEnd) {
+                const d = new Date(now);
+                if (timeVal < nightEnd) d.setDate(d.getDate() - 1);
+                d.setHours(shift.nightStartH, shift.nightStartM, 0, 0);
+                startDate = `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')}`;
+                const e = new Date(d); e.setDate(e.getDate() + 1); e.setHours(shift.nightEndH, shift.nightEndM, 0, 0);
+                endDate = `${e.getFullYear()}/${String(e.getMonth()+1).padStart(2,'0')}/${String(e.getDate()).padStart(2,'0')}`;
+                startH = shift.nightStartH; startM = shift.nightStartM;
+                endH = shift.nightEndH; endM = shift.nightEndM;
+            } else {
+                resolve(0); return;
+            }
+
+            const url = `https://fclm-portal.amazon.com/reports/processPathRollup?reportFormat=HTML` +
+                `&warehouseId=${fc}` +
+                `&maxIntradayDays=1&spanType=Intraday` +
+                `&startDateIntraday=${encodeURIComponent(startDate)}` +
+                `&startHourIntraday=${startH}&startMinuteIntraday=${String(startM).padStart(2,'0')}` +
+                `&endDateIntraday=${encodeURIComponent(endDate)}` +
+                `&endHourIntraday=${endH}&endMinuteIntraday=${String(endM).padStart(2,'0')}` +
+                `&_adjustPlanHours=on&_hideEmptyLineItems=on&_rememberViewForWarehouse=on&employmentType=AllEmployees`;
+
+            GM_xmlhttpRequest({
+                method: 'GET', url,
+                onload: (resp) => {
+                    const text = resp.responseText || '';
+                    let totalHours = 0;
+                    try {
+                        const doc = new DOMParser().parseFromString(text, 'text/html');
+                        const rows = doc.querySelectorAll('tr');
+                        // Find "Hrs" column index from headers
+                        let hrsColIdx = -1;
+                        for (const row of rows) {
+                            const ths = Array.from(row.querySelectorAll('th'));
+                            const idx = ths.findIndex(th => th.textContent.trim() === 'Hrs');
+                            if (idx >= 0) { hrsColIdx = idx; break; }
+                        }
+                        // Find the IB Total row (TOTAL cell + "IB Total" in line items)
+                        for (const row of rows) {
+                            const cells = row.querySelectorAll('td');
+                            if (cells.length >= 2 && cells[0].textContent.trim() === 'TOTAL' &&
+                                row.textContent.includes('IB Total')) {
+                                if (hrsColIdx >= 1 && cells[hrsColIdx - 1]) {
+                                    const origDiv = cells[hrsColIdx - 1].querySelector('div[class*="original"]');
+                                    totalHours = parseFloat((origDiv || cells[hrsColIdx - 1]).textContent.trim().replace(/,/g, '')) || 0;
+                                }
+                                console.log('[OculusDash] IB Total hours:', totalHours);
+                                break;
+                            }
+                        }
+                    } catch (e) { console.log('[OculusDash] IB hours parse error:', e); }
+                    resolve(totalHours);
+                },
+                onerror: () => resolve(0),
+                ontimeout: () => resolve(0),
+                timeout: 20000
+            });
+        });
+    }
+
     // ─── Fetch Total Cases (Case Transfer In + Pallet Transfer In) from FCLM ────
     function fetchTotalCases(fc) {
         return new Promise((resolve) => {
@@ -1576,7 +1657,7 @@
             <div class="oc-header-center">
                 <div class="title"><span id="oc-backlog" style="color:#f9e2af;font-size:22px;font-weight:bold;">⏳ Backlog</span> &nbsp; Transship Dashboard — ${fc}</div>
                 <div class="meta">${meta.fc} &nbsp;|&nbsp; ${meta.tz} &nbsp;|&nbsp; Updated: ${meta.refresh}</div>
-                <div id="oc-stow-line" style="margin-top:6px;font-size:22px;font-weight:bold;"><span id="oc-total-stows" style="color:#89dceb;">Total Cases: ⏳</span> &nbsp;|&nbsp; <span id="oc-stow-rate" style="color:#a6e3a1;">Stow Rate: ⏳ JPH</span></div>
+                <div id="oc-stow-line" style="margin-top:6px;font-size:22px;font-weight:bold;"><span id="oc-ib-cplh" style="color:#f9e2af;"></span><span id="oc-total-stows" style="color:#89dceb;">Total Stows: ⏳</span> &nbsp;|&nbsp; <span id="oc-stow-rate" style="color:#a6e3a1;">Stow Rate: ⏳ JPH</span></div>
             </div>
             <div class="oc-btns">
                 <button class="oc-btn refresh" id="oc-refresh">↻ Refresh</button>
@@ -1700,11 +1781,12 @@
             console.error('[OculusDash] AFT per-trailer re-render error:', err);
         }
 
-        // ─── Fetch Stow Rate JPH from FCLM ─────────────────────────────────
+        // ─── Fetch Stow Rate JPH and Inbound CPLH from FCLM ──────────────────
         try {
-            const [result, palletResult] = await Promise.all([fetchStowRate(fc), fetchTotalCases(fc)]);
+            const [result, palletResult, ibHours] = await Promise.all([fetchStowRate(fc), fetchTotalCases(fc), fetchInboundHours(fc)]);
             const rateEl = document.getElementById('oc-stow-rate');
             const stowsEl = document.getElementById('oc-total-stows');
+            const cplhEl = document.getElementById('oc-ib-cplh');
             if (rateEl) {
                 if (result && result.jph) {
                     rateEl.innerHTML = `<a href="${result.url}" target="_blank" style="color:#a6e3a1;text-decoration:underline dotted;">Stow Rate: ${result.jph} JPH</a>`;
@@ -1717,11 +1799,16 @@
                 const caseTransferIn = (result && result.totalStows) || 0;
                 const palletCases = (palletResult && palletResult.totalCases) || 0;
                 const grandTotal = caseTransferIn + palletCases;
+                // Calculate and display CPLH
+                if (cplhEl && grandTotal > 0 && ibHours > 0) {
+                    const ibCplh = (grandTotal / ibHours).toFixed(2);
+                    cplhEl.innerHTML = `CPLH: ${ibCplh} &nbsp;|&nbsp; `;
+                }
                 if (grandTotal > 0) {
                     const caseUrl = result ? result.url : '#';
                     const palletUrl = palletResult ? palletResult.url : '#';
                     stowsEl.innerHTML = `<span style="position:relative;display:inline-block;cursor:pointer;" id="oc-cases-hover">
-                        <span style="color:#89dceb;text-decoration:underline dotted;">Total Cases: ${grandTotal.toLocaleString()}</span>
+                        <span style="color:#89dceb;text-decoration:underline dotted;">Total Stows: ${grandTotal.toLocaleString()}</span>
                         <div id="oc-cases-dropdown" style="display:none;position:absolute;top:100%;left:0;background:#313244;border:1px solid #89dceb;border-radius:6px;padding:6px 0;z-index:100;white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,0.4);margin-top:4px;">
                             <a href="${caseUrl}" target="_blank" style="display:block;padding:6px 14px;color:#a6e3a1;text-decoration:none;font-size:16px;">📦 Case Transfer In: ${caseTransferIn.toLocaleString()}</a>
                             <a href="${palletUrl}" target="_blank" style="display:block;padding:6px 14px;color:#89dceb;text-decoration:none;font-size:16px;">🔲 Pallet Transfer In: ${palletCases.toLocaleString()}</a>
@@ -1734,7 +1821,7 @@
                         hoverEl.onmouseleave = () => dropdown.style.display = 'none';
                     }
                 } else {
-                    stowsEl.textContent = 'Total Cases: —';
+                    stowsEl.textContent = 'Total Stows: —';
                     stowsEl.style.color = '#a6adc8';
                 }
             }
@@ -1743,7 +1830,7 @@
             const rateEl = document.getElementById('oc-stow-rate');
             const stowsEl = document.getElementById('oc-total-stows');
             if (rateEl) { rateEl.textContent = 'Stow Rate: — JPH'; rateEl.style.color = '#a6adc8'; }
-            if (stowsEl) { stowsEl.textContent = 'Total Cases: —'; stowsEl.style.color = '#a6adc8'; }
+            if (stowsEl) { stowsEl.textContent = 'Total Stows: —'; stowsEl.style.color = '#a6adc8'; }
         }
 
         // ─── Calculate Days of Backlog ──────────────────────────────────────
@@ -1763,7 +1850,7 @@
                 const color = backlog === '--' ? '#a6adc8' : parseFloat(backlog) > 3 ? '#f38ba8' : parseFloat(backlog) > 1.5 ? '#f9e2af' : '#a6e3a1';
                 el.textContent = `📊 ${backlog} Days Backlog`;
                 el.style.color = color;
-                el.title = `Total Cases: ${totalCases.toLocaleString()} | Avg Daily Stow (7d, non-zero): ${Math.round(avgDaily).toLocaleString()}`;
+                el.title = `Total Stows: ${totalCases.toLocaleString()} | Avg Daily Stow (7d, non-zero): ${Math.round(avgDaily).toLocaleString()}`;
             }
         } catch (err) {
             console.error('[OculusDash] Backlog calc error:', err);
