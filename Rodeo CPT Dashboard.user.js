@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rodeo CPT Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      2.4
+// @version      2.5
 // @description  Overlays a CPT breakdown dashboard on Rodeo ExSD pages — current shift & next shift (switches 30 min before SOS)
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/RodeoCPTDashboard.user.js
@@ -1110,23 +1110,8 @@
         }, 0), 0);
         const grandDisp = loading ? '…' : grand > 0 ? grand.toLocaleString() : '—';
 
-        // Manifest Pending row — shown below TOTAL with its own time
+        // Manifest Pending already shown as a group row above TOTAL — no need to duplicate below
         let mpRow = '';
-        if (!isNextShift && !loading && mpResult && mpResult.count > 0) {
-            const mpCls = GROUP_CLASS['Manifest Pending'] || '';
-            const mpTime = mpResult.time ? (() => { const d = parseCPTDate(mpResult.time); return d ? fmtTime(d) : mpResult.time; })() : '—';
-            const emptyCells = shiftCPTs.map(() => `<td></td>`).join('');
-            mpRow += `<tr style="border-top:2px solid ${t.tdBdr};${riskBg}"><td class="label-cell ${mpCls}" style="${riskBg}${riskLblClr}">Manifest Pending</td><td style="${riskBg}"></td><td colspan="${shiftCPTs.length}" style="text-align:center;white-space:nowrap;color:var(--rcd-text);${riskBg}${riskClr}">${mpTime}</td><td style="${riskBg}"></td></tr>`;
-            // Sub-rows for process paths
-            Object.entries(mpResult.paths).sort((a, b) => b[1].count - a[1].count).forEach(([name, info]) => {
-                const emptyPP = shiftCPTs.map(() => `<td style="${riskBg}"></td>`).join('');
-                const pathDisp = info.count.toLocaleString();
-                const pathContent = info.url
-                    ? `<a href="${info.url}" target="_blank" style="color:inherit;text-decoration:underline dotted;">${pathDisp}</a>`
-                    : pathDisp;
-                mpRow += `<tr style="${riskBg}"><td style="padding-left:1em;color:#c9d1d9;${riskBg}">${riskLblClr ? '<span style="color:#c9d1d9">' : ''}↳ ${name}${riskLblClr ? '</span>' : ''}</td><td style="${riskBg}"></td>${emptyPP}<td style="text-align:right;padding:0.1em 0.4em;color:#58a6ff;font-weight:bold;${riskBg}">${pathContent}</td></tr>`;
-            });
-        }
 
         return `<div class="rcd-wrap" style="${riskBg}"><table class="rcd-tbl" style="${riskBg}">
             <thead><tr style="${riskHdrBg}"><th class="lbl-hdr" style="${riskHdrBg}${riskLblClr}">Work Pool</th><th style="${riskHdrBg}color:#a6e3a1;text-align:center;"><a href="https://picking-console.na.picking.aft.a2z.com/fc/${fc}" target="_blank" style="color:#a6e3a1;text-decoration:underline dotted;">Pickers</a></th>${headerCells}<th style="${riskHdrBg}color:${tableAtRisk ? t.trowLbl : '#58a6ff'};">Total</th></tr></thead>
