@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rodeo CPT Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      2.6
+// @version      2.7
 // @description  Overlays a CPT breakdown dashboard on Rodeo ExSD pages — current shift & next shift (switches 30 min before SOS)
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/RodeoCPTDashboard.user.js
@@ -1183,7 +1183,7 @@
         let mpRow = '';
 
         return `<div class="rcd-wrap" style="${riskBg}"><table class="rcd-tbl" style="${riskBg}">
-            <thead><tr style="${riskHdrBg}"><th class="lbl-hdr" style="${riskHdrBg}${riskLblClr}">Work Pool</th><th style="${riskHdrBg}color:#a6e3a1;text-align:center;"><a href="https://picking-console.na.picking.aft.a2z.com/fc/${fc}" target="_blank" style="color:#a6e3a1;text-decoration:underline dotted;">Pickers</a></th>${headerCells}<th style="${riskHdrBg}color:${tableAtRisk ? t.trowLbl : '#58a6ff'};">Total</th></tr></thead>
+            <thead><tr style="${riskHdrBg}"><th class="lbl-hdr" style="${riskHdrBg}${riskLblClr}">Work Pool</th><th style="${riskHdrBg}color:#a6e3a1;text-align:center;"><a href="https://fc-eligibility-website-iad.aka.amazon.com/#/dashboard/${fc}" target="_blank" style="color:#a6e3a1;text-decoration:underline dotted;">Pickers</a></th>${headerCells}<th style="${riskHdrBg}color:${tableAtRisk ? t.trowLbl : '#58a6ff'};">Total</th></tr></thead>
             <tbody>${groupRows}
             <tr class="total-row" style="${riskHdrBg}"><td class="label-cell" style="${riskHdrBg}${riskLblClr}">TOTAL</td><td style="${riskHdrBg}"></td>${totalCells}
             <td class="total-cell" style="color:${t.trowLbl};${riskHdrBg}">${grandDisp}</td></tr>
