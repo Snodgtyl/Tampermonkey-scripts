@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rodeo CPT Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      2.7
+// @version      2.8
 // @description  Overlays a CPT breakdown dashboard on Rodeo ExSD pages — current shift & next shift (switches 30 min before SOS)
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/RodeoCPTDashboard.user.js
@@ -478,6 +478,68 @@
                 },
                 onerror: (e) => resolve({ jph: 'err:net', totalPicks: 0 }),
                 ontimeout: () => resolve({ jph: 'err:timeout', totalPicks: 0 }),
+                timeout: 20000
+            });
+        });
+    }
+
+    // ─── Fetch Total Jobs from FCLM functionRollup (processId=1003021) for CPLH ─
+    function fetchCPLHJobs(fc, shiftStart, shiftEnd) {
+        return new Promise((resolve) => {
+            const startDate = `${shiftStart.getFullYear()}/${String(shiftStart.getMonth()+1).padStart(2,'0')}/${String(shiftStart.getDate()).padStart(2,'0')}`;
+            const endDate = `${shiftEnd.getFullYear()}/${String(shiftEnd.getMonth()+1).padStart(2,'0')}/${String(shiftEnd.getDate()).padStart(2,'0')}`;
+            const sH = shiftStart.getHours(), sM = shiftStart.getMinutes();
+            const eH = shiftEnd.getHours(), eM = shiftEnd.getMinutes();
+            const url = `https://fclm-portal.amazon.com/reports/functionRollup?reportFormat=HTML` +
+                `&warehouseId=${fc}&processId=1003021&maxIntradayDays=1&spanType=Intraday` +
+                `&startDateIntraday=${encodeURIComponent(startDate)}` +
+                `&startHourIntraday=${sH}&startMinuteIntraday=${String(sM).padStart(2,'0')}` +
+                `&endDateIntraday=${encodeURIComponent(endDate)}` +
+                `&endHourIntraday=${eH}&endMinuteIntraday=${String(eM).padStart(2,'0')}`;
+
+            GM_xmlhttpRequest({
+                method: 'GET', url, anonymous: false,
+                headers: { 'Accept': 'text/html' },
+                onload: (resp) => {
+                    const text = resp.responseText || '';
+                    let totalJobs = 0;
+                    try {
+                        const doc = new DOMParser().parseFromString(text, 'text/html');
+                        // Find the Total row's Jobs cell: <td class="numeric size-total highlighted">
+                        const rows = doc.querySelectorAll('tr');
+                        for (const row of rows) {
+                            const cells = row.querySelectorAll('td');
+                            if (cells.length >= 3) {
+                                const cellTexts = Array.from(cells).map(c => c.textContent.trim());
+                                if (cellTexts.includes('Total')) {
+                                    // Find the highlighted total cell
+                                    const highlightedCell = row.querySelector('td.size-total.highlighted, td.numeric.size-total');
+                                    if (highlightedCell) {
+                                        totalJobs = parseInt(highlightedCell.textContent.trim().replace(/,/g, ''), 10) || 0;
+                                        if (totalJobs > 0) {
+                                            console.log('[CPLH DEBUG] Found Total Jobs:', totalJobs);
+                                            break;
+                                        }
+                                    }
+                                    // Fallback: second numeric value in Total row is Jobs
+                                    const nums = [];
+                                    for (let i = 1; i < cellTexts.length; i++) {
+                                        const v = parseFloat(cellTexts[i].replace(/,/g, ''));
+                                        if (!isNaN(v) && v > 0) nums.push(v);
+                                    }
+                                    if (nums.length >= 2) {
+                                        totalJobs = Math.round(nums[1]); // Jobs is second numeric after Hours
+                                        console.log('[CPLH DEBUG] Fallback Total Jobs:', totalJobs);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e) { console.log('[CPLH DEBUG] Jobs parse error:', e); }
+                    resolve(totalJobs);
+                },
+                onerror: () => resolve(0),
+                ontimeout: () => resolve(0),
                 timeout: 20000
             });
         });
@@ -1343,8 +1405,12 @@
             : Promise.resolve();
         // Fetch total hours for CPLH in parallel (calculation happens after both resolve)
         let totalHours = 0;
+        let cplhJobs = 0;
         const cplhPromise = withinPickRateWindow
-            ? fetchTotalHours(fc, actualShiftStart, actualShiftEnd).then(hours => { totalHours = hours; })
+            ? Promise.all([
+                fetchTotalHours(fc, actualShiftStart, actualShiftEnd).then(hours => { totalHours = hours; }),
+                fetchCPLHJobs(fc, actualShiftStart, actualShiftEnd).then(jobs => { cplhJobs = jobs; })
+            ])
             : Promise.resolve();
 
         const cases = {};
@@ -1442,10 +1508,10 @@
 
         await Promise.all([...ppFetches, pickerPromise, pickRatePromise, cplhPromise, mpPromise]);
 
-        // Calculate CPLH after both totalPicks and totalHours are available
-        console.log('[CPLH DEBUG] totalPicks:', totalPicks, 'totalHours:', totalHours);
-        if (totalHours > 0 && totalPicks > 0) {
-            cplh = (totalPicks / totalHours).toFixed(2);
+        // Calculate CPLH after both cplhJobs and totalHours are available
+        console.log('[CPLH DEBUG] cplhJobs:', cplhJobs, 'totalHours:', totalHours);
+        if (totalHours > 0 && cplhJobs > 0) {
+            cplh = (cplhJobs / totalHours).toFixed(2);
             console.log('[CPLH DEBUG] CPLH:', cplh);
         }
 
