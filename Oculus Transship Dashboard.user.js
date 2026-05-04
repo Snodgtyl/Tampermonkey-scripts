@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Oculus Transship Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      6.4
+// @version      6.5
 // @description  Adds a formatted summary dashboard to Oculus transship pages with AFT pending cases, items, and case density — VRIDs link to YMS
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
@@ -1561,7 +1561,7 @@
         } else {
             sorted = [...trailers].sort((a,b) => (order[a.apptStatus]??9) - (order[b.apptStatus]??9));
         }
-        const hdrs = ['VRID','ISA','Appt Status','Trailer Location','Load Config','FL Type','Priority','Source','Arrival Time','SA Pallets','Mixed Pallets','FL Cases','Total Cartons','Total Units'];
+        const hdrs = ['VRID','ISA','Appt Status','Trailer Location','Load Config','FL Type','Priority','Source','Arrival Time','SA Pallets','SA Pallet Cases','Mixed Pallets','FL Cases','Total Cartons','Total Units'];
         const head = hdrs.map(h => {
             if (h === 'Total Cartons') {
                 const arrow = trailerSortDesc ? ' ▼' : ' ⇅';
@@ -1583,6 +1583,7 @@
             <td class="${scoreClass(t.priorityScore)}">${t.priorityScore}</td>
             <td>${t.source}</td><td>${t.arrivalTime}</td>
             <td style="text-align:right;color:#89dceb">${t.singleASINPallets}</td>
+            <td style="text-align:right;color:#89dceb">${t.palletizedSACases}</td>
             <td style="text-align:right;color:#89dceb">${t.mixedASINPallets}</td>
             <td style="text-align:right;color:#89dceb">${t.flCases}</td>
             <td style="text-align:right;color:#cba6f7;font-weight:bold">${isInYard && aftMap[t.trailerNum] ? aftMap[t.trailerNum].cases.toLocaleString() : t.totalCartons}</td>
