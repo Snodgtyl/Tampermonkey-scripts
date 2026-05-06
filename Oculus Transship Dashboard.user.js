@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Oculus Transship Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      6.6
+// @version      6.7
 // @description  Adds a formatted summary dashboard to Oculus transship pages with AFT pending cases, items, and case density — VRIDs link to YMS
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
@@ -1546,37 +1546,35 @@
         const rows = labels.map(l => `<tr><td>${l}</td><td>${data[l]||'N/A'}</td></tr>`).join('');
         return `<div class="summary-card"><div class="card-header ${cls}">${title}</div><table class="card-table">${rows}</table></div>`;
     }
-    let trailerSortDesc = false;
-    let trailerSortUnitsDesc = false;
+    let trailerSortField = null; // null = default status sort, or field name to sort desc
     function buildTrailerTable(trailers, fc, aftPerTrailer) {
         if (!trailers.length) return '<div class="no-trailers">No trailer data found — try refreshing.</div>';
         const aftMap = aftPerTrailer || {};
         const order = { 'CHECKED_IN':0,'ARRIVED':1,'ARRIVAL_SCHEDULED':2,'DEPARTED':3 };
         let sorted;
-        if (trailerSortDesc) {
+        if (trailerSortField) {
             sorted = [...trailers].sort((a,b) => {
-                const av = parseInt((a.totalCartons||'0').replace(/,/g,''),10)||0;
-                const bv = parseInt((b.totalCartons||'0').replace(/,/g,''),10)||0;
-                return bv - av;
-            });
-        } else if (trailerSortUnitsDesc) {
-            sorted = [...trailers].sort((a,b) => {
-                const av = parseInt((a.totalUnits||'0').replace(/,/g,''),10)||0;
-                const bv = parseInt((b.totalUnits||'0').replace(/,/g,''),10)||0;
+                const av = parseInt((a[trailerSortField]||'0').replace(/,/g,''),10)||0;
+                const bv = parseInt((b[trailerSortField]||'0').replace(/,/g,''),10)||0;
                 return bv - av;
             });
         } else {
             sorted = [...trailers].sort((a,b) => (order[a.apptStatus]??9) - (order[b.apptStatus]??9));
         }
+        const sortableColumns = {
+            'SA Pallets': 'singleASINPallets',
+            'SA Pallet Cases': 'palletizedSACases',
+            'Mixed Pallets': 'mixedASINPallets',
+            'FL Cases': 'flCases',
+            'Total Cartons': 'totalCartons',
+            'Total Units': 'totalUnits',
+        };
         const hdrs = ['VRID','ISA','Appt Status','Trailer Location','Load Config','FL Type','Priority','Source','Arrival Time','SA Pallets','SA Pallet Cases','Mixed Pallets','FL Cases','Total Cartons','Total Units'];
         const head = hdrs.map(h => {
-            if (h === 'Total Cartons') {
-                const arrow = trailerSortDesc ? ' ▼' : ' ⇅';
-                return `<th style="cursor:pointer;user-select:none;" id="oc-sort-cartons">${h}${arrow}</th>`;
-            }
-            if (h === 'Total Units') {
-                const arrow = trailerSortUnitsDesc ? ' ▼' : ' ⇅';
-                return `<th style="cursor:pointer;user-select:none;" id="oc-sort-units">${h}${arrow}</th>`;
+            if (sortableColumns[h]) {
+                const field = sortableColumns[h];
+                const arrow = trailerSortField === field ? ' ▼' : ' ⇅';
+                return `<th style="cursor:pointer;user-select:none;" class="oc-sortable" data-field="${field}">${h}${arrow}</th>`;
             }
             return `<th>${h}</th>`;
         }).join('');
@@ -1703,39 +1701,22 @@
         };
         document.getElementById('oc-refresh').onclick = () => location.reload();
 
-        // Sort Total Cartons column on click
-        const sortBtn = document.getElementById('oc-sort-cartons');
-        if (sortBtn) {
-            sortBtn.onclick = (e) => {
-                e.stopPropagation();
-                trailerSortDesc = !trailerSortDesc;
-                trailerSortUnitsDesc = false;
-                const body = document.getElementById('oc-trailer-body');
-                if (body) body.innerHTML = buildTrailerTable(trailers, fc);
-                // Re-attach sort handlers after re-render
-                const newBtn = document.getElementById('oc-sort-cartons');
-                if (newBtn) newBtn.onclick = sortBtn.onclick;
-                const newUnitsBtn = document.getElementById('oc-sort-units');
-                if (newUnitsBtn) newUnitsBtn.onclick = unitsSortBtn.onclick;
-            };
+        // Sort columns on click (generic handler for all sortable columns)
+        function attachSortHandlers(trailersRef, fcRef, aftRef) {
+            document.querySelectorAll('#oc-trailer-body .trailer-tbl .oc-sortable, .trailer-wrap .oc-sortable').forEach(th => {
+                th.onclick = (e) => {
+                    e.stopPropagation();
+                    const field = th.dataset.field;
+                    trailerSortField = trailerSortField === field ? null : field;
+                    const body = document.getElementById('oc-trailer-body');
+                    if (body) {
+                        body.innerHTML = buildTrailerTable(trailersRef, fcRef, aftRef);
+                        attachSortHandlers(trailersRef, fcRef, aftRef);
+                    }
+                };
+            });
         }
-
-        // Sort Total Units column on click
-        const unitsSortBtn = document.getElementById('oc-sort-units');
-        if (unitsSortBtn) {
-            unitsSortBtn.onclick = (e) => {
-                e.stopPropagation();
-                trailerSortUnitsDesc = !trailerSortUnitsDesc;
-                trailerSortDesc = false;
-                const body = document.getElementById('oc-trailer-body');
-                if (body) body.innerHTML = buildTrailerTable(trailers, fc);
-                // Re-attach sort handlers after re-render
-                const newBtn = document.getElementById('oc-sort-cartons');
-                if (newBtn) newBtn.onclick = sortBtn.onclick;
-                const newUnitsBtn = document.getElementById('oc-sort-units');
-                if (newUnitsBtn) newUnitsBtn.onclick = unitsSortBtn.onclick;
-            };
-        }
+        attachSortHandlers(trailers, fc, undefined);
 
         // ─── Async: Update IN YARD card with AFT data ───────────────────────
         const inYardVrids = arrived.map(t => t.trailerNum);
@@ -1796,34 +1777,7 @@
                 if (body) {
                     body.innerHTML = buildTrailerTable(trailers, fc, aftPerTrailer);
                     // Re-attach sort handlers
-                    const sortBtn = document.getElementById('oc-sort-cartons');
-                    if (sortBtn) {
-                        sortBtn.onclick = (e) => {
-                            e.stopPropagation();
-                            trailerSortDesc = !trailerSortDesc;
-                            trailerSortUnitsDesc = false;
-                            const b = document.getElementById('oc-trailer-body');
-                            if (b) b.innerHTML = buildTrailerTable(trailers, fc, aftPerTrailer);
-                            const newBtn = document.getElementById('oc-sort-cartons');
-                            if (newBtn) newBtn.onclick = sortBtn.onclick;
-                            const newUnitsBtn = document.getElementById('oc-sort-units');
-                            if (newUnitsBtn) newUnitsBtn.onclick = unitsSortBtn2.onclick;
-                        };
-                    }
-                    const unitsSortBtn2 = document.getElementById('oc-sort-units');
-                    if (unitsSortBtn2) {
-                        unitsSortBtn2.onclick = (e) => {
-                            e.stopPropagation();
-                            trailerSortUnitsDesc = !trailerSortUnitsDesc;
-                            trailerSortDesc = false;
-                            const b = document.getElementById('oc-trailer-body');
-                            if (b) b.innerHTML = buildTrailerTable(trailers, fc, aftPerTrailer);
-                            const newBtn = document.getElementById('oc-sort-cartons');
-                            if (newBtn) newBtn.onclick = sortBtn.onclick;
-                            const newUnitsBtn = document.getElementById('oc-sort-units');
-                            if (newUnitsBtn) newUnitsBtn.onclick = unitsSortBtn2.onclick;
-                        };
-                    }
+                    attachSortHandlers(trailers, fc, aftPerTrailer);
                 }
             }
         } catch (err) {
