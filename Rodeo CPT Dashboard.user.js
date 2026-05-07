@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rodeo CPT Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      2.9
+// @version      3.0
 // @description  Overlays a CPT breakdown dashboard on Rodeo ExSD pages — current shift & next shift (switches 30 min before SOS)
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/RodeoCPTDashboard.user.js
@@ -1724,6 +1724,22 @@
     }
 
     function mount() {
+        // Only run on the main ExSD overview page, not on detail/drill-down pages
+        const url = window.location.href;
+        const path = window.location.pathname;
+        const params = new URLSearchParams(window.location.search);
+
+        // Main page has /ExSD path with yAxis or zAxis params and multiple workPool selections
+        // Detail pages typically have shipmentId, or a single WorkPool with no yAxis/zAxis
+        const isExSD = path.includes('/ExSD');
+        const hasAxisParams = params.has('yAxis') || params.has('zAxis');
+        const hasMultipleWorkPools = url.split('workPool=').length > 3;
+
+        if (!isExSD || (!hasAxisParams && !hasMultipleWorkPools)) {
+            console.log('[RodeoCPT] Skipping — not the main ExSD page');
+            return;
+        }
+
         const style = document.createElement('style');
         style.textContent = CSS;
         document.head.appendChild(style);
