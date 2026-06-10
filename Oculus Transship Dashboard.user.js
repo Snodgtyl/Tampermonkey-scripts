@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Oculus Transship Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      6.7
+// @version      6.9
 // @description  Adds a formatted summary dashboard to Oculus transship pages with AFT pending cases, items, and case density — VRIDs link to YMS
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
@@ -27,58 +27,43 @@
 (function () {
     'use strict';
 
-    // ─── YMS Ship Clerk: Auto-fill warehouse & search from URL hash ─────────
+    // ─── YMS Ship Clerk: Auto-fill search from URL hash ────────────────────
+    // YMS natively handles nodeId (site selection) from the URL hash,
+    // but does NOT auto-fill the searchQuery into the filter box.
     if (window.location.hostname === 'trans-logistics.amazon.com' && window.location.pathname.includes('/yms/shipclerk')) {
         const hash = window.location.hash || '';
-        const params = new URLSearchParams(hash.replace(/^#\/yard\??/, ''));
-        const nodeId = params.get('nodeId');
-        const searchQuery = params.get('searchQuery');
-        if (!nodeId && !searchQuery) return; // Nothing to auto-fill
+        const hashParams = new URLSearchParams(hash.replace(/^#\/yard\??/, ''));
+        const searchQuery = hashParams.get('searchQuery');
+        if (!searchQuery) return; // Nothing to fill
 
-        console.log('[OculusDash-YMS] Auto-fill: nodeId=' + nodeId + ', searchQuery=' + searchQuery);
+        console.log('[OculusDash-YMS] Auto-fill search:', searchQuery);
 
-        let warehouseSelected = !nodeId; // skip if no nodeId
-        let searchDone = !searchQuery;   // skip if no searchQuery
         let attempts = 0;
-        const maxAttempts = 60; // 30 seconds
+        const maxAttempts = 40; // 20 seconds
 
         const interval = setInterval(() => {
             attempts++;
 
-            // Step 1: Select the warehouse first
-            if (!warehouseSelected) {
-                const sel = document.querySelector('select[ng-model="$root.selectedYardSite"]') || document.querySelector('select[ng-change="refreshFunction()"]');
-                if (sel && sel.options.length > 1) {
-                    const opts = Array.from(sel.options);
-                    const match = opts.find(o => o.text.trim().toUpperCase() === nodeId.toUpperCase() || o.value.toUpperCase().includes(nodeId.toUpperCase()));
-                    if (match) {
-                        sel.value = match.value;
-                        sel.dispatchEvent(new Event('change', { bubbles: true }));
-                        try {
-                            const scope = angular.element(sel).scope();
-                            if (scope) {
-                                const rootScope = scope.$root || scope;
-                                scope.$apply(() => { rootScope.selectedYardSite = match.text.trim(); });
-                                const fn = scope.refreshFunction || rootScope.refreshFunction;
-                                if (typeof fn === 'function') fn();
-                            }
-                        } catch(e) { console.log('[OculusDash-YMS] Warehouse scope error:', e); }
-                        console.log('[OculusDash-YMS] Selected warehouse:', match.text.trim());
-                        warehouseSelected = true;
-                        // Give the yard data time to load before searching
-                        if (searchQuery) return;
-                    }
-                }
-            }
+            // Find the search/filter input
+            const searchInput = document.querySelector('input[placeholder*="Search"]')
+                || document.querySelector('input[ng-model*="search"]')
+                || document.querySelector('input[ng-model*="Search"]')
+                || document.getElementById('searchInput')
+                || document.querySelector('.search-bar input')
+                || document.querySelector('input[type="search"]')
+                || document.querySelector('input[type="text"][placeholder]');
 
-            // Step 2: Fill search box (only after warehouse is selected)
-            if (warehouseSelected && !searchDone) {
-                const searchInput = document.getElementById('searchInput') || document.querySelector('input[placeholder*="Search"]');
-                if (searchInput) {
-                    searchInput.value = searchQuery;
-                    searchInput.dispatchEvent(new Event('input', { bubbles: true }));
-                    searchInput.dispatchEvent(new Event('change', { bubbles: true }));
-                    try {
+            if (searchInput) {
+                searchInput.value = searchQuery;
+                searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+                searchInput.dispatchEvent(new Event('change', { bubbles: true }));
+                // Press Enter to trigger the search
+                searchInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+                searchInput.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+                searchInput.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+                // Try Angular scope update if available
+                try {
+                    if (typeof angular !== 'undefined') {
                         const scope = angular.element(searchInput).scope();
                         if (scope) {
                             scope.$apply(() => {
@@ -90,14 +75,15 @@
                                 scope.topbar.textSearch(scope.topbar.filters.searchQuery);
                             }
                         }
-                    } catch(e) { console.log('[OculusDash-YMS] Search scope error:', e); }
-                    console.log('[OculusDash-YMS] Filled search:', searchQuery);
-                    searchDone = true;
-                }
+                    }
+                } catch(e) { /* ignore */ }
+                console.log('[OculusDash-YMS] ✓ Filled search:', searchQuery);
+                clearInterval(interval);
+                return;
             }
 
-            if ((warehouseSelected && searchDone) || attempts >= maxAttempts) {
-                if (attempts >= maxAttempts) console.warn('[OculusDash-YMS] Timed out');
+            if (attempts >= maxAttempts) {
+                console.warn('[OculusDash-YMS] Timed out waiting for search input');
                 clearInterval(interval);
             }
         }, 500);
@@ -1580,7 +1566,11 @@
         }).join('');
         const body = sorted.map(t => {
             const isInYard = t.apptStatus === 'ARRIVED' || t.apptStatus === 'CHECKED_IN';
-            const ymsUrl = `https://trans-logistics.amazon.com/yms/shipclerk#/yard?nodeId=${encodeURIComponent(fc)}&searchQuery=${encodeURIComponent(t.trailerNum)}`;
+            // CHECKED_IN trailers search by dock door location; ARRIVED trailers search by VRID
+            const ymsSearchTerm = t.apptStatus === 'CHECKED_IN' && t.trailerLocation
+                ? t.trailerLocation
+                : t.trailerNum;
+            const ymsUrl = `https://trans-logistics.amazon.com/yms/shipclerk#/yard?nodeId=${encodeURIComponent(fc)}&searchQuery=${encodeURIComponent(ymsSearchTerm)}`;
             const vridCell = isInYard
                 ? `<a href="${ymsUrl}" target="_blank" style="color:#cba6f7;text-decoration:underline dotted;">${t.trailerNum}</a>`
                 : t.trailerNum;
