@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rodeo CPT Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      3.2
+// @version      3.3
 // @description  Overlays a CPT breakdown dashboard on Rodeo ExSD pages — current shift & next shift (switches 30 min before SOS)
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/RodeoCPTDashboard.user.js
@@ -12,7 +12,10 @@
 // @match        https://rodeo-nrt.amazon.com/*
 // @match        https://rodeo-sin.amazon.com/*
 // @include      https://rodeo-*.amazon.com/*
+// @match        https://trans-logistics.amazon.com/ssp/dock/hrz/ob*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_setValue
+// @grant        GM_getValue
 // @connect      rodeo-iad.amazon.com
 // @connect      rodeo-pdx.amazon.com
 // @connect      rodeo-dub.amazon.com
@@ -20,10 +23,194 @@
 // @connect      rodeo-sin.amazon.com
 // @connect      picking-console.na.picking.aft.a2z.com
 // @connect      fclm-portal.amazon.com
+// @connect      trans-logistics.amazon.com
 // ==/UserScript==
 
 (function () {
     'use strict';
+
+    // ─── SSP Dock Collector: scrape trailer data when on the SSP page ───────
+    if (window.location.hostname === 'trans-logistics.amazon.com' && window.location.pathname.includes('/ssp/dock/hrz/ob')) {
+        console.log('[RCD-SSP] Collector running on SSP dock page');
+
+        // Check if we need to auto-search a VRID (from hyperlink click)
+        const urlParams = new URLSearchParams(window.location.search);
+        const searchVrid = urlParams.get('searchLoad') || '';
+        if (searchVrid) {
+            console.log('[RCD-SSP] Auto-searching for:', searchVrid);
+            let searchAttempts = 0;
+            const searchInterval = setInterval(() => {
+                searchAttempts++;
+                const searchInput = document.querySelector('input[placeholder*="Search"]')
+                    || document.querySelector('input[type="text"]');
+                if (searchInput) {
+                    searchInput.value = searchVrid;
+                    searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+                    searchInput.dispatchEvent(new Event('change', { bubbles: true }));
+                    searchInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+                    searchInput.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+                    console.log('[RCD-SSP] ✓ Filled search:', searchVrid);
+                    clearInterval(searchInterval);
+                }
+                if (searchAttempts >= 30) clearInterval(searchInterval);
+            }, 500);
+            return; // Don't scrape when in search mode — keep existing cached data
+        }
+
+        // Wait for the table to render (it's a JS SPA)
+        let attempts = 0;
+        const maxAttempts = 80; // 40 seconds — wait longer for P column to render
+        const interval = setInterval(() => {
+            attempts++;
+            // Look for table rows with trailer data
+            const rows = document.querySelectorAll('table tbody tr, table tr');
+            // Check if we have actual data rows (not just headers)
+            let dataRows = 0;
+            rows.forEach(r => { if (r.querySelectorAll('td').length >= 5) dataRows++; });
+
+            // Also check if P column data has loaded (look for containerHierarchy or numeric P values)
+            const hasContainerData = document.querySelectorAll('a[data-vrid]').length > 0
+                || document.querySelectorAll('.loadedPCell').length > 0
+                || document.querySelectorAll('[class*="containerHierarchy"]').length > 0;
+
+            if ((dataRows > 2 && (hasContainerData || attempts >= 40)) || attempts >= maxAttempts) {
+                clearInterval(interval);
+                if (dataRows < 2) {
+                    console.log('[RCD-SSP] Timed out waiting for table data');
+                    return;
+                }
+                console.log(`[RCD-SSP] Found ${dataRows} data rows, scraping...`);
+
+                const trailers = [];
+                const tables = document.querySelectorAll('table');
+                for (const tbl of tables) {
+                    const headers = Array.from(tbl.querySelectorAll('th')).map(h => h.textContent.trim());
+                    if (headers.length < 5) continue;
+
+                    console.log('[RCD-SSP] Table headers:', headers);
+                    const statusCol = headers.findIndex(h => /^Status$/i.test(h));
+                    const locationCol = headers.findIndex(h => /^Location$/i.test(h));
+                    const vridCol = headers.findIndex(h => /VR\s*Id/i.test(h));
+                    const cptCol = headers.indexOf('CPT');
+                    const sortRouteCol = headers.findIndex(h => /SortRoute|Sort/i.test(h));
+
+                    console.log(`[RCD-SSP] Columns: status=${statusCol}, location=${locationCol}, vrid=${vridCol}, cpt=${cptCol}, sortRoute=${sortRouteCol}`);
+                    if (vridCol < 0) continue;
+
+                    // Build a map of VRID → container count
+                    const containerMap = {};
+                    // Method 1: <a> tags with data-vrid whose text is purely numeric
+                    document.querySelectorAll('a[data-vrid]').forEach(a => {
+                        const vr = a.getAttribute('data-vrid') || '';
+                        const text = a.textContent.trim();
+                        if (vr && /^\d+$/.test(text)) {
+                            containerMap[vr] = text;
+                        }
+                    });
+                    // Method 2: Find the P column header index and read from cells directly
+                    if (Object.keys(containerMap).length === 0) {
+                        // The "P" header in the SSP table - find its exact index
+                        const allThs = Array.from(tbl.querySelectorAll('thead th, th'));
+                        let pColIdx = -1;
+                        allThs.forEach((th, i) => {
+                            if (th.textContent.trim() === 'P') pColIdx = i;
+                        });
+                        console.log('[RCD-SSP] P column index from th scan:', pColIdx, 'total ths:', allThs.length);
+                        if (pColIdx >= 0) {
+                            tbl.querySelectorAll('tr').forEach(row => {
+                                if (row.textContent.includes('Scheduled Departure Window')) return;
+                                const tds = row.querySelectorAll('td');
+                                if (tds.length < 5) return;
+                                const vr = vridCol >= 0 && tds[vridCol] ? tds[vridCol].textContent.trim() : '';
+                                // P column index from headers maps to td index (subtract header-only columns if any)
+                                // Since headers include checkbox/alert columns that are also td in data rows,
+                                // the index should be the same
+                                const pCell = tds[pColIdx] || null;
+                                const pText = pCell ? pCell.textContent.trim().replace(/[^0-9]/g, '') : '';
+                                if (vr && vr.length > 3 && pText && parseInt(pText) > 0) {
+                                    containerMap[vr] = pText;
+                                }
+                            });
+                        }
+                    }
+                    console.log('[RCD-SSP] Container map:', Object.keys(containerMap).length, 'sample:', JSON.stringify(Object.entries(containerMap).slice(0, 5)));
+
+                    let firstRowLogged = false;
+                    let rowIdx = 0;
+                    tbl.querySelectorAll('tr').forEach(row => {
+                        const cells = row.querySelectorAll('td');
+                        if (cells.length < 5) { rowIdx++; return; }
+                        if (row.textContent.includes('Scheduled Departure Window')) { rowIdx++; return; }
+
+                        const vrid = vridCol >= 0 && cells[vridCol] ? cells[vridCol].textContent.trim() : '';
+                        const location = locationCol >= 0 && cells[locationCol] ? cells[locationCol].textContent.trim() : '';
+                        const status = statusCol >= 0 && cells[statusCol] ? cells[statusCol].textContent.trim().replace(/\s+/g, ' ') : '';
+                        const cpt = cptCol >= 0 && cells[cptCol] ? cells[cptCol].textContent.trim() : '';
+
+                        // Get container count from the VRID map
+                        let containers = containerMap[vrid] || '';
+                        if (!containers) {
+                            // Fallback: look for element with data-vrid matching in this row
+                            const el = row.querySelector(`[data-vrid="${vrid}"]`);
+                            if (el) {
+                                const txt = el.textContent.trim();
+                                const numMatch = txt.match(/\b(\d{2,5})\b/);
+                                if (numMatch) containers = numMatch[1];
+                            }
+                        }
+
+                        // Get destination from SortRoute column (format: "WT KRB3->SMF1" or "KRB3->SAN3")
+                        let destination = '';
+                        if (sortRouteCol >= 0 && cells[sortRouteCol]) {
+                            const sr = cells[sortRouteCol].textContent.trim();
+                            // Match "->DEST" pattern (destination is after the arrow)
+                            const destMatch = sr.match(/->\s*([A-Z]{2,5}\d{1,2})/i);
+                            if (destMatch) destination = destMatch[1].toUpperCase();
+                        }
+
+                        if (!firstRowLogged && vrid) {
+                            console.log(`[RCD-SSP] First data row: vrid=${vrid}, loc=${location}, containers=${containers}, dest=${destination}, cpt=${cpt}`);
+                            firstRowLogged = true;
+                        }
+
+                        if (vrid && vrid.length > 3) {
+                            trailers.push({ vrid, location, status, containers, cpt, destination });
+                        }
+                        rowIdx++;
+                    });
+
+                    if (trailers.length > 0) break;
+                }
+
+                console.log(`[RCD-SSP] Scraped ${trailers.length} trailers`);
+                if (trailers.length > 0) {
+                    console.log('[RCD-SSP] First trailer:', trailers[0]);
+                    // Extract FC from the page — try URL param, then page content
+                    const urlParams = new URLSearchParams(window.location.search);
+                    let nodeId = urlParams.get('nodeId') || urlParams.get('nodeid') || '';
+                    // If no nodeId in URL, try to find it from the sort route or page text
+                    if (!nodeId) {
+                        const pageText = document.body.textContent || '';
+                        const fcMatch = pageText.match(/\b(KRB[1-9]|QXX\d|ATL\d|AVP\d|HGR\d|SAV\d)\b/i);
+                        if (fcMatch) nodeId = fcMatch[1].toUpperCase();
+                    }
+                    // Also try from sort route column in first trailer
+                    if (!nodeId && trailers[0].location) {
+                        const locMatch = document.body.textContent.match(/\b([A-Z]{3}\d)-/);
+                        if (locMatch) nodeId = locMatch[1];
+                    }
+                    console.log('[RCD-SSP] Detected FC:', nodeId);
+                    const data = { trailers, timestamp: Date.now(), fc: nodeId };
+                    // Clear old data and store fresh
+                    GM_setValue('sspDock_' + nodeId, JSON.stringify(data));
+                    GM_setValue('sspDock_', JSON.stringify(data));
+                    console.log(`[RCD-SSP] ✓ Stored ${trailers.length} trailers for ${nodeId || '(all)'}`);
+                }
+            }
+        }, 500);
+
+        return; // Don't run the rest of the Rodeo dashboard on SSP pages
+    }
 
     // ─── Auto-clear stale cache on version update ───────────────────────────
     const SCRIPT_VERSION = '2.4';
@@ -989,10 +1176,10 @@
         box-sizing: border-box;
         transform-origin: top right;
         transition: border-color 0.2s, box-shadow 0.2s, border-radius 0.2s;
-        --rcd-font-title: 38px;
-        --rcd-font-meta: 28px;
-        --rcd-font-section: 56px;
-        --rcd-font-table: 24px;
+        --rcd-font-title: 18px;
+        --rcd-font-meta: 13px;
+        --rcd-font-section: 26px;
+        --rcd-font-table: 13px;
         --rcd-font-btn: 14px;
         --rcd-font-subrow: 1em;
         --rcd-pad-cell: 4px 8px;
@@ -1477,6 +1664,64 @@
         return `<div class="rcd-section-title" style="color:#e3b341">📦 Upcoming Ready to Pick Drop (${bestCPT}) — ${linked}</div>`;
     }
 
+    // ─── Fetch Trailer Status from SSP Dock (reads cached data from SSP collector) ──
+    function fetchTrailerStatus(fc) {
+        return new Promise((resolve) => {
+            // Try FC-specific key first, then fallback to generic key
+            let stored = GM_getValue('sspDock_' + fc, null);
+            if (!stored) stored = GM_getValue('sspDock_', null);
+            if (!stored) {
+                console.log('[RCD] No cached SSP dock data — open the SSP dock page to collect data');
+                resolve([]);
+                return;
+            }
+            try {
+                const data = JSON.parse(stored);
+                if (!data || !data.trailers || data.trailers.length === 0) {
+                    resolve([]);
+                    return;
+                }
+                const ageMin = ((Date.now() - data.timestamp) / 60000).toFixed(1);
+                console.log(`[RCD] SSP dock data found (${ageMin} min old): ${data.trailers.length} trailers`);
+                resolve(data.trailers);
+            } catch (e) {
+                console.log('[RCD] SSP dock data parse error:', e);
+                resolve([]);
+            }
+        });
+    }
+
+    function buildTrailerStatusSection(trailers) {
+        if (!trailers || trailers.length === 0) return '';
+        const rows = trailers.map(t => {
+            const statusColor = /finish/i.test(t.status) ? '#a6e3a1' : /loading.*progress/i.test(t.status) ? '#89b4fa' : /loading/i.test(t.status) ? '#f9e2af' : /cancel/i.test(t.status) ? '#f38ba8' : /scheduled/i.test(t.status) ? '#ffffff' : '#ffffff';
+            const sspLink = `https://trans-logistics.amazon.com/ssp/dock/hrz/ob?searchLoad=${encodeURIComponent(t.vrid)}`;
+            return `<tr>
+                <td style="color:#89b4fa;padding:4px 10px;"><a href="${sspLink}" target="_blank" style="color:#89b4fa;text-decoration:underline dotted;">${t.vrid}</a></td>
+                <td style="color:#ffffff;padding:4px 10px;">${t.location}</td>
+                <td style="color:#ffffff;padding:4px 10px;">${t.destination || '—'}</td>
+                <td style="color:#ffffff;padding:4px 10px;text-align:center;">${t.containers || '—'}</td>
+                <td style="color:${statusColor};padding:4px 10px;">${t.status}</td>
+                <td style="color:#ffffff;padding:4px 10px;">${t.cpt}</td>
+            </tr>`;
+        }).join('');
+
+        const table = `<div class="rcd-wrap" style="border-color:#89b4fa;"><table class="rcd-tbl">
+            <thead><tr>
+                <th style="text-align:left;">VRID</th>
+                <th style="text-align:left;">Location</th>
+                <th style="text-align:left;">Destination</th>
+                <th style="text-align:center;">Containers</th>
+                <th style="text-align:left;">Status</th>
+                <th style="text-align:left;">CPT</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+        </table></div>`;
+
+        return `<div class="rcd-section-title next" style="cursor:pointer;" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'':'none'; this.querySelector('.rcd-chevron').textContent=this.nextElementSibling.style.display==='none'?'▶':'▼'"><span class="rcd-chevron">▶</span> 🚛 Trailer Status — ${trailers.length} trailers</div>
+        <div class="rcd-collapsible" style="display:none;">${table}</div>`;
+    }
+
     // ─── Render ───────────────────────────────────────────────────────────────────
     let stylePanelOpen = false; // persists across re-renders
 
@@ -1531,23 +1776,24 @@
             </div>
             <div class="rcd-body">
                 ${!hasCPTs ? `<div class="rcd-no-data">⚠️ No CPT data found. Wait for page to load then click ↻ Refresh.</div>` : ''}
-                <div class="rcd-section-title summary" style="cursor:pointer;" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'':'none'; this.dataset.collapsed=this.nextElementSibling.style.display==='none'?'1':''; this.querySelector('.rcd-chevron').textContent=this.nextElementSibling.style.display==='none'?'▶':'▼'"><span class="rcd-chevron">▶</span> Picking Summary — All CPTs</div>
+                <div class="rcd-section-title summary" style="cursor:pointer;" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'':'none'; this.dataset.collapsed=this.nextElementSibling.style.display==='none'?'1':''; this.querySelector('.rcd-chevron').textContent=this.nextElementSibling.style.display==='none'?'▶':'▼'"><span class="rcd-chevron">▶</span> Picking Summary — All CPTs${!loading ? ` — <span style="font-weight:bold;text-decoration:underline;">${(() => { const cutoff = shiftStart || new Date(Date.now() - 12*3600000); let total = 0; Object.entries(cases).forEach(([cpt, groups]) => { const d = parseCPTDate(cpt); if (d && d.getHours() === 11 && d.getMinutes() === 0) return; if (d && d < cutoff) return; const pnyp = groups['Picking Not Yet Picked']; const pp = groups['Picking Picked']; total += (pnyp ? (pnyp.count !== undefined ? pnyp.count : pnyp) : 0) + (pp ? (pp.count !== undefined ? pp.count : pp) : 0); }); return total.toLocaleString(); })()} cases</span>` : ''}</div>
                 <div class="rcd-collapsible" style="display:none;">${buildTotalsTable(cases, loading, shiftStart)}</div>
-                <div class="rcd-section-title" style="cursor:pointer;" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'':'none'; this.querySelector('.rcd-chevron').textContent=this.nextElementSibling.style.display==='none'?'▶':'▼'"><span class="rcd-chevron">▶</span> Current — ${shiftLabel} <span style="color:#ffffff;font-weight:normal;font-size:0.8em;opacity:0.7">${fmtTime(shiftStart)} → ${fmtTime(shiftEnd)}</span></div>
+                <div class="rcd-section-title" style="cursor:pointer;" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'':'none'; this.querySelector('.rcd-chevron').textContent=this.nextElementSibling.style.display==='none'?'▶':'▼'"><span class="rcd-chevron">▶</span> Current — ${shiftLabel} <span style="color:#ffffff;font-weight:normal;font-size:0.8em;opacity:0.7">${fmtTime(shiftStart)} → ${fmtTime(shiftEnd)}</span>${!loading ? ` — <span style="font-weight:bold;text-decoration:underline;">${(() => { let t = 0; Object.entries(cases).forEach(([cpt, groups]) => { const d = parseCPTDate(cpt); if (!d || d < shiftStart || d >= shiftEnd) return; if (d.getHours() === 11 && d.getMinutes() === 0) return; GROUP_ORDER.forEach(g => { const e = groups[g]; t += e ? (e.count !== undefined ? e.count : (typeof e === 'number' ? e : 0)) : 0; }); }); return t.toLocaleString(); })()} cases</span>` : ''}</div>
                 <div class="rcd-collapsible" style="display:none;">${buildCPTTable(cases, shiftStart, shiftEnd, loading, false, ppData, pickerData, fc, mpResult)}</div>
-                <div class="rcd-section-title next" style="cursor:pointer;" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'':'none'; this.querySelector('.rcd-chevron').textContent=this.nextElementSibling.style.display==='none'?'▶':'▼'"><span class="rcd-chevron">▶</span> Next — ${nextShiftLabel} <span style="color:#ffffff;font-weight:normal;font-size:0.8em;opacity:0.7">${fmtTime(nextShiftStart)} → ${fmtTime(nextShiftEnd)}</span></div>
+                <div class="rcd-section-title next" style="cursor:pointer;" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'':'none'; this.querySelector('.rcd-chevron').textContent=this.nextElementSibling.style.display==='none'?'▶':'▼'"><span class="rcd-chevron">▶</span> Next — ${nextShiftLabel} <span style="color:#ffffff;font-weight:normal;font-size:0.8em;opacity:0.7">${fmtTime(nextShiftStart)} → ${fmtTime(nextShiftEnd)}</span>${!loading ? ` — <span style="font-weight:bold;text-decoration:underline;">${(() => { let t = 0; Object.entries(cases).forEach(([cpt, groups]) => { const d = parseCPTDate(cpt); if (!d || d < nextShiftStart || d >= nextShiftEnd) return; if (d.getHours() === 11 && d.getMinutes() === 0) return; GROUP_ORDER.forEach(g => { const e = groups[g]; t += e ? (e.count !== undefined ? e.count : (typeof e === 'number' ? e : 0)) : 0; }); }); return t.toLocaleString(); })()} cases</span>` : ''}</div>
                 <div class="rcd-collapsible" style="display:none;">${buildCPTTable(cases, nextShiftStart, nextShiftEnd, loading, true, ppData, pickerData, fc, null)}</div>
                 ${buildNextDayDrop(cases, new Date(), loading)}
+                <div id="rcd-trailer-status"></div>
             </div>`;
 
             applyStyle(dashEl);
 
             // Dynamic font scaling based on data density
             const { scale: fontScale, totalRows } = calcDashScale(ppData, cptLinks, cptCounts);
-            dashEl.style.setProperty('--rcd-font-title', Math.round(38 * fontScale) + 'px');
-            dashEl.style.setProperty('--rcd-font-meta', Math.round(28 * fontScale) + 'px');
-            dashEl.style.setProperty('--rcd-font-section', Math.round(56 * fontScale) + 'px');
-            dashEl.style.setProperty('--rcd-font-table', Math.round(24 * fontScale) + 'px');
+            dashEl.style.setProperty('--rcd-font-title', Math.round(18 * fontScale) + 'px');
+            dashEl.style.setProperty('--rcd-font-meta', Math.round(13 * fontScale) + 'px');
+            dashEl.style.setProperty('--rcd-font-section', Math.round(26 * fontScale) + 'px');
+            dashEl.style.setProperty('--rcd-font-table', Math.round(13 * fontScale) + 'px');
             dashEl.style.setProperty('--rcd-font-btn', Math.round(14 * fontScale) + 'px');
             const padV = Math.round(6 * fontScale), padH = Math.round(12 * fontScale);
             const padThV = Math.round(8 * fontScale), padThH = Math.round(12 * fontScale);
@@ -1572,19 +1818,28 @@
                 const cdEl = document.getElementById('rcd-cpt-countdown');
                 if (!cdEl) return;
                 const now = new Date();
-                // Find all CPT times from the table headers
-                const ths = document.querySelectorAll('#rodeo-cpt-dash table.rcd-tbl th');
+                // Find all CPT times from the current shift table headers (first rcd-tbl with data)
+                const tables = document.querySelectorAll('#rodeo-cpt-dash table.rcd-tbl');
                 let nextCPT = null;
-                ths.forEach(th => {
-                    const text = th.textContent.trim().replace(/ ◀| ⚠| PAST DUE/g, '');
-                    const m = text.match(/^(\d{2}):(\d{2})$/);
-                    if (m) {
+                tables.forEach(tbl => {
+                    // Only look at tables that have actual data rows
+                    const totalRow = tbl.querySelector('tr.total-row');
+                    if (!totalRow) return;
+                    tbl.querySelectorAll('thead th').forEach(th => {
+                        const text = th.textContent.trim().replace(/ ◀| ⚠| PAST DUE/g, '');
+                        const m = text.match(/^(\d{2}):(\d{2})$/);
+                        if (!m) return;
+                        const h = +m[1], min = +m[2];
+                        // Skip midnight and 23:58 (likely not real CPTs or end-of-day markers)
+                        if (h === 0 && min === 0) return;
+                        if (h === 23 && min >= 55) return;
+
                         const d = new Date(now);
-                        d.setHours(+m[1], +m[2], 0, 0);
-                        // If time is earlier than now, it might be tomorrow
+                        d.setHours(h, min, 0, 0);
+                        // If time is earlier than now, it's tomorrow
                         if (d <= now) d.setDate(d.getDate() + 1);
                         if (!nextCPT || d < nextCPT) nextCPT = d;
-                    }
+                    });
                 });
                 if (nextCPT) {
                     const diff = nextCPT - now;
@@ -1764,6 +2019,14 @@
         daysBacklog = calculateDaysBacklog();
 
         renderHTML(cases, false);
+
+        // ── Fetch trailer status from SSP dock (async, renders into placeholder) ──
+        fetchTrailerStatus(fc).then(trailers => {
+            const el = document.getElementById('rcd-trailer-status');
+            if (el && trailers.length > 0) {
+                el.innerHTML = buildTrailerStatusSection(trailers);
+            }
+        });
     }
 
     // ─── Wait for table data then mount ──────────────────────────────────────────
