@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Oculus Transship Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      7.0
+// @version      7.1
 // @description  Adds a formatted summary dashboard to Oculus transship pages with AFT pending cases, items, and case density — VRIDs link to YMS
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
@@ -12,6 +12,7 @@
 // @match        https://afttransshipmenthub-fe.aka.amazon.com/*/view-transfers/inbound*
 // @match        https://afttransshipmenthub.aka.amazon.com/*/view-transfers/inbound*
 // @match        https://trans-logistics.amazon.com/yms/shipclerk*
+// @match        https://track.relay.amazon.dev/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -22,6 +23,7 @@
 // @connect      afttransshipmenthub-fe.aka.amazon.com
 // @connect      afttransshipmenthub.aka.amazon.com
 // @connect      fclm-portal.amazon.com
+// @connect      maple-syrup.corp.amazon.com
 // ==/UserScript==
 
 (function () {
@@ -89,6 +91,94 @@
         }, 500);
 
         return; // Don't run the rest of the script on YMS
+    }
+
+    // ─── Relay Track & Trace: Auto-fill search from URL hash ───────────────
+    if (window.location.hostname === 'track.relay.amazon.dev') {
+        const hash = window.location.hash;
+        const searchVrid = hash ? hash.replace('#search=', '') : '';
+        if (!searchVrid) return; // Nothing to search
+
+        console.log('[OculusDash-RTT] Auto-fill search:', searchVrid);
+
+        // Wait for the page to fully settle before interacting
+        let attempts = 0;
+        const maxAttempts = 60; // 30 seconds
+
+        const interval = setInterval(() => {
+            attempts++;
+
+            // Find the search input inside the rtt-analytics-primary-search container
+            const searchInput = document.querySelector('.rtt-analytics-primary-search input[role="combobox"]')
+                || document.querySelector('input[placeholder="Search"][role="combobox"]')
+                || document.querySelector('input[placeholder="Search"]');
+
+            if (searchInput) {
+                // Wait a bit longer for the app to fully initialize
+                clearInterval(interval);
+                setTimeout(() => {
+                    // Focus the input
+                    searchInput.focus();
+                    searchInput.click();
+
+                    // Use native setter to bypass React controlled component
+                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    nativeInputValueSetter.call(searchInput, searchVrid);
+                    searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+                    searchInput.dispatchEvent(new Event('change', { bubbles: true }));
+
+                    // Wait for the suggestions dropdown to appear, then click "Search Trips"
+                    setTimeout(() => {
+                        const clickSearchTrips = () => {
+                            // Look for "Search Trips" option in the dropdown
+                            const allOptions = document.querySelectorAll('[role="option"], [role="listbox"] li, [class*="popover"] li, [class*="suggestion"] li, [class*="menu"] li');
+                            for (const opt of allOptions) {
+                                if (opt.textContent.trim().includes('Search Trips')) {
+                                    opt.click();
+                                    console.log('[OculusDash-RTT] ✓ Clicked "Search Trips"');
+                                    // Clean up the hash
+                                    history.replaceState(null, '', window.location.pathname + window.location.search);
+                                    return true;
+                                }
+                            }
+                            // Fallback: look for any element containing "Search Trips" text
+                            const allElements = document.querySelectorAll('div, span, li, a, button, p');
+                            for (const el of allElements) {
+                                if (el.textContent.trim() === 'Search Trips' && el.offsetParent !== null) {
+                                    el.click();
+                                    console.log('[OculusDash-RTT] ✓ Clicked "Search Trips" (fallback)');
+                                    history.replaceState(null, '', window.location.pathname + window.location.search);
+                                    return true;
+                                }
+                            }
+                            return false;
+                        };
+
+                        // Try clicking immediately, retry a few times if dropdown hasn't appeared
+                        let retries = 0;
+                        const retryInterval = setInterval(() => {
+                            if (clickSearchTrips() || retries >= 10) {
+                                clearInterval(retryInterval);
+                                if (retries >= 10) {
+                                    console.warn('[OculusDash-RTT] Could not find "Search Trips" option');
+                                }
+                            }
+                            retries++;
+                        }, 300);
+                    }, 800);
+
+                    console.log('[OculusDash-RTT] ✓ Filled search:', searchVrid);
+                }, 2000); // 2 second delay after input found for app to settle
+                return;
+            }
+
+            if (attempts >= maxAttempts) {
+                console.warn('[OculusDash-RTT] Timed out waiting for search input');
+                clearInterval(interval);
+            }
+        }, 500);
+
+        return; // Don't run the rest of the script on Track & Trace
     }
 
     // ─── Auto-clear stale cache on version update ───────────────────────────
@@ -1368,6 +1458,50 @@
         return Promise.all(promises);
     }
 
+    // ─── Fetch KIPS trailer count from Maple Syrup ─────────────────────────────
+    function fetchKipsCount(fc) {
+        const url = `https://maple-syrup.corp.amazon.com/${fc.toUpperCase()}/kips/thermometer`;
+        GM_xmlhttpRequest({
+            method: 'GET',
+            url: url,
+            onload: function(response) {
+                try {
+                    const kipsEl = document.getElementById('oc-kips-count');
+                    if (!kipsEl) return;
+                    // Parse the HTML and count rows in the kips-gantt table tbody
+                    const parser = new DOMParser();
+                    const doc = parser.parseFromString(response.responseText, 'text/html');
+                    const tbody = doc.querySelector('#kips-gantt tbody') || doc.querySelector('table.kips-table tbody');
+                    if (tbody) {
+                        const rows = tbody.querySelectorAll('tr[role="row"], tr[data-ste-time]');
+                        const count = rows.length > 0 ? rows.length : tbody.querySelectorAll('tr').length;
+                        kipsEl.textContent = count;
+                        console.log('[OculusDash] KIPS count (rows):', count);
+                    } else {
+                        // Fallback: count all table rows that have data-ste-time attribute
+                        const allRows = doc.querySelectorAll('tr[data-ste-time]');
+                        if (allRows.length > 0) {
+                            kipsEl.textContent = allRows.length;
+                            console.log('[OculusDash] KIPS count (fallback rows):', allRows.length);
+                        } else {
+                            kipsEl.textContent = '—';
+                            console.warn('[OculusDash] KIPS: could not find trailer rows');
+                        }
+                    }
+                } catch(e) {
+                    const kipsEl = document.getElementById('oc-kips-count');
+                    if (kipsEl) kipsEl.textContent = '—';
+                    console.warn('[OculusDash] KIPS fetch parse error:', e);
+                }
+            },
+            onerror: function() {
+                const kipsEl = document.getElementById('oc-kips-count');
+                if (kipsEl) kipsEl.textContent = '—';
+                console.warn('[OculusDash] KIPS fetch failed');
+            }
+        });
+    }
+
     // ─── Wait for page to fully render ──────────────────────────────────────────
     function waitForContent(callback, maxWait = 30000) {
         const start = Date.now();
@@ -1555,6 +1689,8 @@
     #oc-header .title { font-weight:bold;font-size:22px;color:#cba6f7; }
     #oc-header .meta { font-size:16px;color:#a6adc8; }
     .oc-btns { display:flex;flex-direction:column;gap:4px;position:absolute;right:12px; }
+    .oc-kips-btn { position:absolute;left:12px;top:50%;transform:translateY(-50%);background:#f38ba8;color:#1e1e2e;border:none;border-radius:8px;padding:14px 24px;font-size:24px;font-weight:bold;cursor:pointer;text-decoration:none;display:inline-block;transition:background 0.2s; }
+    .oc-kips-btn:hover { background:#f9e2af;color:#1e1e2e; }
     .oc-btn { cursor:pointer;background:#45475a;color:#cdd6f4;border:none;border-radius:4px;padding:3px 10px;font-size:11px; }
     .oc-btn:hover { background:#585b70; }
     .oc-btn.refresh { background:#1e66f5; }
@@ -1621,7 +1757,7 @@
             'Total Cartons': 'totalCartons',
             'Total Units': 'totalUnits',
         };
-        const hdrs = ['VRID','ISA','Appt Status','Trailer Location','Load Config','FL Type','Priority','Source','Arrival Time','SA Pallets','SA Pallet Cases','Mixed Pallets','FL Cases','Total Cartons','Total Units'];
+        const hdrs = ['VRID','Map Location','Appt Status','Trailer Location','Load Config','FL Type','Priority','Source','Arrival Time','SA Pallets','SA Pallet Cases','Mixed Pallets','FL Cases','Total Cartons','Total Units'];
         const head = hdrs.map(h => {
             if (sortableColumns[h]) {
                 const field = sortableColumns[h];
@@ -1632,6 +1768,7 @@
         }).join('');
         const body = sorted.map(t => {
             const isInYard = t.apptStatus === 'ARRIVED' || t.apptStatus === 'CHECKED_IN';
+            const isScheduled = t.apptStatus === 'ARRIVAL_SCHEDULED';
             // CHECKED_IN trailers search by dock door location; ARRIVED trailers search by VRID
             const ymsSearchTerm = t.apptStatus === 'CHECKED_IN' && t.trailerLocation
                 ? t.trailerLocation
@@ -1640,8 +1777,16 @@
             const vridCell = isInYard
                 ? `<a href="${ymsUrl}" target="_blank" style="color:#cba6f7;text-decoration:underline dotted;">${t.trailerNum}</a>`
                 : t.trailerNum;
+            // Map Location column: map icon linking to Relay Track & Trace for ARRIVAL_SCHEDULED, checkmark for in-yard
+            const trackUrl = `https://track.relay.amazon.dev/#search=${encodeURIComponent(t.trailerNum)}`;
+            let mapLocationCell;
+            if (isScheduled) {
+                mapLocationCell = `<a href="${trackUrl}" target="_blank" title="Track ${t.trailerNum} on Relay Track & Trace" style="font-size:1.2em;text-decoration:none;">🗺️</a>`;
+            } else {
+                mapLocationCell = `<span title="Trailer on site" style="font-size:1.1em;">✅</span>`;
+            }
             return `<tr>
-            <td>${vridCell}</td><td>${t.isa}</td>
+            <td>${vridCell}</td><td style="text-align:center;">${mapLocationCell}</td>
             <td class="${statusClass(t.apptStatus)}">${t.apptStatus}</td>
             <td>${t.trailerLocation}</td>
             <td>${t.loadConfig}</td><td>${t.flType}</td>
@@ -1729,6 +1874,7 @@
                 <button class="oc-btn refresh" id="oc-refresh">↻ Refresh</button>
                 <button class="oc-btn" id="oc-toggle">▲ Collapse</button>
             </div>
+            <a class="oc-kips-btn" id="oc-kips-link" href="https://maple-syrup.corp.amazon.com/${fc.toUpperCase()}/kips/thermometer" target="_blank">🚛 Trailers in KIPS = <span id="oc-kips-count">⏳</span></a>
         </div>
         <div class="oc-body">
             <div class="summary-grid">
@@ -1839,6 +1985,9 @@
         } catch (err) {
             console.error('[OculusDash] AFT per-trailer re-render error:', err);
         }
+
+        // ─── Fetch KIPS count ──────────────────────────────────────────────────
+        fetchKipsCount(fc);
 
         // ─── Fetch Stow Rate JPH and Inbound CPLH from FCLM ──────────────────
         try {
