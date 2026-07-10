@@ -336,9 +336,7 @@
             byDay[day][shift].push(opp);
         }
 
-        // Grand totals
-        let grandTotalHours = 0;
-        activeOpportunities.forEach(o => { grandTotalHours += o.totalHours; });
+
 
         // Build HTML
         let bodyHTML = '';
@@ -365,6 +363,7 @@
             for (const shift of sortedShifts) {
                 const shiftOpps = dayShifts[shift];
                 const shiftTotalHours = shiftOpps.reduce((s, e) => s + e.totalHours, 0);
+                const shiftOppCount = shiftOpps.length;
                 const shiftIcon = shift.includes('Day') ? '\u2600\uFE0F' : '\u{1F319}';
                 const shiftId = `svd-shift-${day}-${shift}`.replace(/[^a-zA-Z0-9]/g, '_');
 
@@ -372,7 +371,7 @@
                     <div class="svd-shift-header">
                         <span class="svd-shift-name">${shiftIcon} ${shift}</span>
                         <button class="svd-copy-logins-btn" data-shift-id="${shiftId}">Copy Logins</button>
-                        <span class="svd-shift-totals">${shiftTotalHours.toFixed(1)} hrs</span>
+                        <span class="svd-shift-totals">${shiftOppCount} opps | ${shiftTotalHours.toFixed(1)} hrs</span>
                     </div>
                     <table class="svd-tbl">
                         <thead><tr><th>Type</th><th>Work Group</th><th>Time</th><th>HC</th><th>Duration</th><th>Total Hours</th></tr></thead>
@@ -424,10 +423,6 @@
             <div class="svd-header">
                 <div class="svd-title">\u{1F4CB} ${getSiteName()} Scheduling Opportunities</div>
                 <div class="svd-subtitle">Updated: ${timeStr}</div>
-                <div class="svd-grand-totals">
-                    <span class="svd-stat"><span class="svd-stat-label">Opportunities:</span> ${activeOpportunities.length}</span>
-                    <span class="svd-stat"><span class="svd-stat-label">Total Hours:</span> ${grandTotalHours.toFixed(1)}</span>
-                </div>
                 <button id="svd-toggle" title="Minimize/Expand">\u25BC</button>
                 <button id="svd-refresh" title="Refresh data">\u{1F504}</button>
             </div>
