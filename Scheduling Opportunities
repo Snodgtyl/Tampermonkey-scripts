@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Scheduling Opportunities
+// @name         SchedulingVETVTODashboard.user.js
 // @namespace    http://tampermonkey.net/
 // @version      2.0
 // @description  Overlay dashboard for scheduling.amazon.com that summarizes VET/VTO/READY opportunities by day and shift
