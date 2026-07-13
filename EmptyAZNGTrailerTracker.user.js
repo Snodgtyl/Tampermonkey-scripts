@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         EmptyAZNGTrailerTracker.user.js
+// @name         Empty AZNG Trailer Tracker
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  Monitors YMS Yard Management for empty AZNG trailers at PS locations with no load identifiers — notifies when available to move to DD
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/EmptyAZNGTrailerTracker.user.js
@@ -22,7 +22,7 @@
         TARGET_LOCATION_PREFIX: 'PS', // Only look at PS locations
         TARGET_OWNER: 'AZNG', // Owner/Operator must be AZNG
         DD_DOORS: ['DD215', 'DD216', 'DD217', 'DD218', 'DD219', 'DD220'], // DD doors to monitor
-        MAINTENANCE_KEYWORDS: ['yellow tag', 'yellow tagged', 'red tag', 'red tagged', 'totes', 'upp', 'maintenance', 'refused', 'damage', 'damaged', 'ni carts'],
+        MAINTENANCE_KEYWORDS: ['yellow tag', 'yellow tagged', 'red tag', 'red tagged', 'totes', 'upp', 'maintenance', 'refused', 'damage', 'damaged', 'ni carts', 'hole'],
     };
 
     // ─── State ──────────────────────────────────────────────────────────────
@@ -67,8 +67,8 @@
                     📍 Available at PS — Ready to Move
                 </div>
                 <div id="azng-tracker-list" style="max-height:300px;overflow-y:auto;"></div>
-                <div id="azng-tracker-footer" style="padding:6px 10px;font-size:10px;color:#666;border-top:1px solid #333;">
-                    Auto-refreshes every 30s | Filters: PS + AZNG + Empty | DD215-220 ✓
+                <div id="azng-tracker-footer" style="padding:6px 10px;overflow:hidden;position:relative;height:20px;border-top:1px solid #333;">
+                    <div id="azng-truck-animation">��🚛</div>
                 </div>
             </div>
         `;
@@ -186,6 +186,17 @@
                 border-radius: 3px;
                 font-size: 10px;
                 margin-left: 6px;
+            }
+            #azng-truck-animation {
+                position: absolute;
+                font-size: 14px;
+                white-space: nowrap;
+                transform: scaleX(-1);
+                animation: azng-drive 8s linear infinite;
+            }
+            @keyframes azng-drive {
+                0% { left: -40px; }
+                100% { left: 100%; }
             }
         `;
         document.head.appendChild(style);
