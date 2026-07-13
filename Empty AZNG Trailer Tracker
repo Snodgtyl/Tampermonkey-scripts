@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Empty AZNG Trailer Tracker
+// @name         EmptyAZNGTrailerTracker.user.js
 // @namespace    http://tampermonkey.net/
 // @version      1.0
 // @description  Monitors YMS Yard Management for empty AZNG trailers at PS locations with no load identifiers — notifies when available to move to DD
