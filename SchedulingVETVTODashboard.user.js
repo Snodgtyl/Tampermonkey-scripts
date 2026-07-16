@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         SchedulingVETVTODashboard.user.js
+// @name         Scheduling Opportunities
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.2
 // @description  Overlay dashboard for scheduling.amazon.com that summarizes VET/VTO/READY opportunities by day and shift
 // @author       You
 // @match        https://scheduling.amazon.com/*
@@ -17,6 +17,387 @@
     // ─── Shift Config ───────────────────────────────────────────────────────────
     const DAY_SHIFT_START = 6.5;   // 06:30
     const DAY_SHIFT_END = 18.5;    // 18:30
+
+    // ─── VTO Monitoring Shift Assignment ────────────────────────────────────────
+    const VTO_NIGHT_SHIFT_MANAGERS = ['jos', 'snodgtyl', 'timmtris'];
+    const VTO_DAY_SHIFT_MANAGERS = ['lakenys', 'philart'];
+
+    function getVTOShift(managerLogin) {
+        const login = managerLogin.trim().toLowerCase();
+        if (VTO_NIGHT_SHIFT_MANAGERS.includes(login)) return 'Night';
+        if (VTO_DAY_SHIFT_MANAGERS.includes(login)) return 'Day';
+        return 'Unknown';
+    }
+
+    // ─── VTO Monitoring Feature ─────────────────────────────────────────────────
+    function isVTOMonitoringPage() {
+        // Only match the VTO Monitoring reporting page (has the manager login summary table)
+        // NOT the Instant VTO Tool page (which has "Enter New Opportunity")
+        if (document.body.textContent.includes('Enter New Opportunity')) return false;
+        return window.location.href.includes('instantVtoReporting') ||
+               (document.body.textContent.includes('Instant VTOs Applied') && document.body.textContent.includes('Manager Login'));
+    }
+
+    function runVTOMonitoring() {
+        console.log('[SVD] VTO Monitoring mode detected');
+
+        // Wait for the table to load
+        let attempts = 0;
+        const waitForTable = setInterval(() => {
+            attempts++;
+            const table = document.querySelector('table.table');
+            const rows = table ? table.querySelectorAll('tbody tr[ng-repeat], tbody tr.ng-scope, tbody tr') : [];
+
+            if (rows.length > 0 || attempts > 20) {
+                clearInterval(waitForTable);
+                if (rows.length > 0) {
+                    buildVTOPanel(table, rows);
+                } else {
+                    console.log('[SVD] VTO Monitoring: No data rows found after waiting');
+                }
+            }
+        }, 500);
+    }
+
+    function buildVTOPanel(table, rows) {
+        const managers = [];
+
+        for (const row of rows) {
+            const cells = row.querySelectorAll('td');
+            if (cells.length < 3) continue;
+
+            const login = cells[0].textContent.trim();
+            if (!login || login.toLowerCase() === 'total') continue;
+
+            const countCell = cells[1];
+            const countLink = countCell.querySelector('a');
+            const count = parseInt(countLink ? countLink.textContent.trim() : countCell.textContent.trim(), 10) || 0;
+            const duration = cells[2].textContent.trim();
+            const shift = getVTOShift(login);
+
+            managers.push({ login, count, duration, shift, countLink });
+        }
+
+        console.log('[SVD] VTO Monitoring managers found:', managers.length);
+
+        const nightManagers = managers.filter(m => m.shift === 'Night');
+        const dayManagers = managers.filter(m => m.shift === 'Day');
+        const unknownManagers = managers.filter(m => m.shift === 'Unknown');
+
+        const nightTotal = nightManagers.reduce((s, m) => s + m.count, 0);
+        const dayTotal = dayManagers.reduce((s, m) => s + m.count, 0);
+
+        // Build floating panel
+        let panel = document.getElementById('svd-vto-panel');
+        if (panel) panel.remove();
+
+        panel = document.createElement('div');
+        panel.id = 'svd-vto-panel';
+
+        const buildShiftSection = (title, icon, mgrs, total, shiftClass) => {
+            if (mgrs.length === 0) return '';
+            let html = `<div class="svd-vto-shift-section">
+                <div class="svd-vto-shift-header ${shiftClass}">
+                    <span>${icon} ${title}</span>
+                    <span class="svd-vto-shift-total">${total} VTOs</span>
+                </div>
+                <div class="svd-vto-manager-list">`;
+            for (const m of mgrs) {
+                html += `<div class="svd-vto-manager-row" data-login="${m.login}">
+                    <span class="svd-vto-login">${m.login}</span>
+                    <span class="svd-vto-count">${m.count}</span>
+                    <span class="svd-vto-duration">${m.duration}</span>
+                    <button class="svd-vto-fetch-btn" data-login="${m.login}">Get Logins</button>
+                </div>`;
+            }
+            html += `</div>
+                <button class="svd-vto-fetch-all-btn" data-shift="${title}">Get All ${title} Logins (${total})</button>
+            </div>`;
+            return html;
+        };
+
+        panel.innerHTML = `
+            <div class="svd-vto-header">
+                <span class="svd-vto-title">📋 Instant VTO Summary</span>
+                <button id="svd-vto-toggle" title="Minimize">▼</button>
+            </div>
+            <div class="svd-vto-body">
+                ${buildShiftSection('Night Shift', '🌙', nightManagers, nightTotal, 'svd-vto-night')}
+                ${buildShiftSection('Day Shift', '☀️', dayManagers, dayTotal, 'svd-vto-day')}
+                ${unknownManagers.length > 0 ? buildShiftSection('Unassigned', '❓', unknownManagers, unknownManagers.reduce((s, m) => s + m.count, 0), 'svd-vto-unknown') : ''}
+            </div>
+        `;
+
+        document.body.appendChild(panel);
+        injectVTOStyles();
+
+        // Toggle
+        document.getElementById('svd-vto-toggle').addEventListener('click', function () {
+            const body = panel.querySelector('.svd-vto-body');
+            if (body.style.display === 'none') { body.style.display = ''; this.textContent = '▼'; }
+            else { body.style.display = 'none'; this.textContent = '▶'; }
+        });
+
+        // Individual "Get Logins" buttons
+        panel.querySelectorAll('.svd-vto-fetch-btn').forEach(btn => {
+            btn.addEventListener('click', async function () {
+                const login = this.dataset.login;
+                const mgr = managers.find(m => m.login === login);
+                if (!mgr || !mgr.countLink) return;
+
+                this.textContent = 'Fetching...';
+                this.disabled = true;
+
+                const logins = await fetchVTOLogins(mgr.countLink);
+                if (logins.length > 0) {
+                    showVTOCopyPopup(logins, login);
+                    this.textContent = `${logins.length} found`;
+                } else {
+                    this.textContent = 'None found';
+                }
+                this.disabled = false;
+                setTimeout(() => { this.textContent = 'Get Logins'; }, 3000);
+            });
+        });
+
+        // "Get All Shift Logins" buttons
+        panel.querySelectorAll('.svd-vto-fetch-all-btn').forEach(btn => {
+            btn.addEventListener('click', async function () {
+                const shift = this.dataset.shift;
+                const shiftMgrs = shift === 'Night Shift' ? nightManagers :
+                                   shift === 'Day Shift' ? dayManagers : unknownManagers;
+
+                this.textContent = 'Fetching all...';
+                this.disabled = true;
+
+                const allLogins = [];
+                for (const mgr of shiftMgrs) {
+                    if (!mgr.countLink || mgr.count === 0) continue;
+                    const logins = await fetchVTOLogins(mgr.countLink);
+                    allLogins.push(...logins);
+                }
+
+                // Deduplicate by login
+                const seen = new Set();
+                const unique = [];
+                for (const entry of allLogins) {
+                    if (!seen.has(entry.login)) {
+                        seen.add(entry.login);
+                        unique.push(entry);
+                    }
+                }
+
+                if (unique.length > 0) {
+                    showVTOCopyPopup(unique, `${shift} (All Managers)`);
+                    this.textContent = `${unique.length} total`;
+                } else {
+                    this.textContent = 'None found';
+                }
+                this.disabled = false;
+                setTimeout(() => { this.textContent = `Get All ${shift} Logins`; }, 3000);
+            });
+        });
+    }
+
+    async function fetchVTOLogins(linkElement) {
+        const logins = [];
+
+        try {
+            // Click the link to open the detail view
+            linkElement.click();
+            console.log('[SVD] Clicked VTO count link');
+
+            // Wait for the detail table to appear
+            await sleep(1500);
+
+            // The detail page shows a table with Employee Name, Employee Login, Employee ID, Time Scanned
+            // Look for the detail table — it might be a new page load or inline expansion
+            let detailTable = null;
+            let attempts = 0;
+
+            while (!detailTable && attempts < 10) {
+                attempts++;
+                // Look for a table with Employee Login column
+                const tables = document.querySelectorAll('table');
+                for (const t of tables) {
+                    const headerText = t.textContent.toLowerCase();
+                    if (headerText.includes('employee login') || headerText.includes('employee name')) {
+                        // Make sure it's the detail table, not the summary table
+                        const headerRow = t.querySelector('thead tr, tr:first-child');
+                        if (headerRow && headerRow.textContent.includes('Employee Login')) {
+                            detailTable = t;
+                            break;
+                        }
+                    }
+                }
+                if (!detailTable) await sleep(500);
+            }
+
+            if (!detailTable) {
+                console.log('[SVD] VTO detail table not found');
+                // Try going back if we navigated
+                window.history.back();
+                await sleep(500);
+                return logins;
+            }
+
+            // Parse the detail table
+            const rows = detailTable.querySelectorAll('tbody tr, tr');
+            for (const row of rows) {
+                if (row.querySelector('th')) continue;
+                const cells = row.querySelectorAll('td');
+                if (cells.length < 2) continue;
+
+                const name = cells[0].textContent.trim();
+                // Employee Login is in the second column, often as a link
+                let login = '';
+                const linkEl = cells[1].querySelector('a');
+                if (linkEl) {
+                    login = linkEl.textContent.trim();
+                } else {
+                    login = cells[1].textContent.trim();
+                }
+
+                if (login && name && !name.toLowerCase().includes('employee name')) {
+                    logins.push({ name, login });
+                }
+            }
+
+            console.log('[SVD] VTO detail logins found:', logins.length);
+
+            // Navigate back to the summary page
+            window.history.back();
+            await sleep(1000);
+
+        } catch (err) {
+            console.error('[SVD] Error fetching VTO logins:', err);
+            window.history.back();
+            await sleep(500);
+        }
+
+        return logins;
+    }
+
+    function showVTOCopyPopup(logins, source) {
+        const existing = document.getElementById('svd-vto-popup');
+        if (existing) existing.remove();
+
+        const loginText = logins.map(e => e.login).join('\n');
+        const fullText = logins.map(e => `${e.name}\t${e.login}`).join('\n');
+
+        const popup = document.createElement('div');
+        popup.id = 'svd-vto-popup';
+        popup.innerHTML = `
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                <span style="font-weight:bold;color:#89dceb;">VTO Logins — ${source} (${logins.length})</span>
+                <button id="svd-vto-popup-close" style="background:none;border:none;color:#f38ba8;font-size:18px;cursor:pointer;">✕</button>
+            </div>
+            <div style="display:flex;gap:8px;margin-bottom:8px;">
+                <button id="svd-vto-copy-logins" style="flex:1;padding:6px;background:#89b4fa;color:#1e1e2e;border:none;border-radius:4px;cursor:pointer;font-weight:bold;">Copy Logins Only</button>
+                <button id="svd-vto-copy-full" style="flex:1;padding:6px;background:#a6e3a1;color:#1e1e2e;border:none;border-radius:4px;cursor:pointer;font-weight:bold;">Copy Name + Login</button>
+            </div>
+            <textarea id="svd-vto-popup-text" readonly style="width:100%;height:200px;background:#1e1e2e;color:#cdd6f4;border:1px solid #45475a;border-radius:4px;padding:6px;font-family:monospace;font-size:11px;resize:vertical;">${loginText}</textarea>
+            <div style="margin-top:6px;font-size:11px;color:#a6adc8;">Count: ${logins.length} associates</div>
+        `;
+        popup.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:2147483647;background:#313244;border:2px solid #89dceb;border-radius:12px;padding:16px;min-width:400px;max-width:600px;box-shadow:0 8px 32px rgba(0,0,0,0.8);font-family:Segoe UI,Arial,sans-serif;';
+        document.body.appendChild(popup);
+
+        document.getElementById('svd-vto-popup-close').addEventListener('click', () => popup.remove());
+
+        document.getElementById('svd-vto-copy-logins').addEventListener('click', function () {
+            const ta = document.getElementById('svd-vto-popup-text');
+            ta.value = loginText;
+            ta.select();
+            document.execCommand('copy');
+            this.textContent = 'Copied!';
+            this.style.background = '#a6e3a1';
+            setTimeout(() => { this.textContent = 'Copy Logins Only'; this.style.background = '#89b4fa'; }, 2000);
+        });
+
+        document.getElementById('svd-vto-copy-full').addEventListener('click', function () {
+            const ta = document.getElementById('svd-vto-popup-text');
+            ta.value = fullText;
+            ta.select();
+            document.execCommand('copy');
+            this.textContent = 'Copied!';
+            this.style.background = '#89dceb';
+            setTimeout(() => { this.textContent = 'Copy Name + Login'; this.style.background = '#a6e3a1'; }, 2000);
+        });
+    }
+
+    function injectVTOStyles() {
+        if (document.getElementById('svd-vto-styles')) return;
+        const style = document.createElement('style');
+        style.id = 'svd-vto-styles';
+        style.textContent = `
+            #svd-vto-panel {
+                position: fixed;
+                top: 10px;
+                right: 10px;
+                z-index: 2147483647;
+                background: #1e1e2e;
+                border: 2px solid #89dceb;
+                border-radius: 12px;
+                box-shadow: 0 4px 24px rgba(0,0,0,0.7);
+                font-family: 'Segoe UI', Arial, sans-serif;
+                font-size: 13px;
+                color: #cdd6f4;
+                min-width: 340px;
+                max-width: 450px;
+                max-height: 80vh;
+                overflow: hidden;
+                display: flex;
+                flex-direction: column;
+            }
+            .svd-vto-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 10px 14px;
+                background: #313244;
+                border-bottom: 2px solid #89dceb;
+            }
+            .svd-vto-title { font-size: 15px; font-weight: bold; color: #89dceb; }
+            #svd-vto-toggle {
+                background: none; border: 1px solid #89dceb; color: #89dceb;
+                border-radius: 4px; cursor: pointer; font-size: 12px; padding: 2px 6px;
+            }
+            #svd-vto-toggle:hover { background: #45475a; }
+            .svd-vto-body { overflow-y: auto; padding: 8px; max-height: 65vh; }
+            .svd-vto-shift-section { margin-bottom: 10px; border: 1px solid #45475a; border-radius: 8px; overflow: hidden; }
+            .svd-vto-shift-header {
+                display: flex; justify-content: space-between; align-items: center;
+                padding: 6px 10px; font-weight: bold; font-size: 13px;
+            }
+            .svd-vto-night { background: #1e1e3e; color: #cba6f7; }
+            .svd-vto-day { background: #2e2e1e; color: #f9e2af; }
+            .svd-vto-unknown { background: #2e2e2e; color: #a6adc8; }
+            .svd-vto-shift-total { font-size: 12px; color: #89dceb; }
+            .svd-vto-manager-list { padding: 4px 8px; }
+            .svd-vto-manager-row {
+                display: flex; align-items: center; gap: 8px;
+                padding: 4px 6px; border-bottom: 1px solid #313244; font-size: 12px;
+            }
+            .svd-vto-manager-row:last-child { border-bottom: none; }
+            .svd-vto-login { font-weight: bold; color: #89b4fa; min-width: 80px; }
+            .svd-vto-count { background: #45475a; color: #f38ba8; padding: 1px 6px; border-radius: 10px; font-size: 11px; font-weight: bold; }
+            .svd-vto-duration { color: #a6adc8; font-size: 11px; flex: 1; }
+            .svd-vto-fetch-btn {
+                padding: 2px 6px; background: #45475a; border: 1px solid #89b4fa;
+                color: #89b4fa; border-radius: 4px; cursor: pointer; font-size: 10px;
+            }
+            .svd-vto-fetch-btn:hover { background: #585b70; }
+            .svd-vto-fetch-btn:disabled { opacity: 0.6; cursor: wait; }
+            .svd-vto-fetch-all-btn {
+                display: block; width: calc(100% - 16px); margin: 6px 8px;
+                padding: 6px; background: #313244; border: 1px solid #a6e3a1;
+                color: #a6e3a1; border-radius: 4px; cursor: pointer; font-size: 11px; font-weight: bold;
+            }
+            .svd-vto-fetch-all-btn:hover { background: #45475a; }
+            .svd-vto-fetch-all-btn:disabled { opacity: 0.6; cursor: wait; }
+        `;
+        document.head.appendChild(style);
+    }
 
     // ─── Get Site Name from Page ───────────────────────────────────────────────
     function getSiteName() {
@@ -310,20 +691,19 @@
     function renderDashboard() {
         const opportunities = scrapeOpportunities();
 
-        // Filter out opportunities that have already ended
+        // Filter out opportunities that have already ended (only for today)
         const now = new Date();
         const todayISO = formatDateISO(now);
         const currentTime = now.getHours() + now.getMinutes() / 60;
 
         const activeOpportunities = opportunities.filter(opp => {
-            // If the date is in the future, always show
-            if (opp.date > todayISO) return true;
-            // If the date is in the past, don't show
-            if (opp.date < todayISO) return false;
-            // If it's today, only show if start time hasn't passed yet
-            const startTime = parseTime(opp.startTime);
-            if (startTime === null) return true;
-            return startTime > currentTime;
+            // Only filter out today's opportunities if their start time has passed
+            if (opp.date === todayISO) {
+                const startTime = parseTime(opp.startTime);
+                if (startTime !== null && startTime <= currentTime) return false;
+            }
+            // Show all past and future dates — user intentionally searched for them
+            return true;
         });
 
         // Group: Day → Shift → opportunities
@@ -513,7 +893,7 @@
                                 }
                                 if (login && employeeName) {
                                     const timeSlot = `${opp.startTime} - ${opp.endTime}`;
-                                    allEntries.push({ name: employeeName, login, timeSlot, workGroup: opp.workGroup });
+                                    allEntries.push({ name: employeeName, login, timeSlot, workGroup: opp.workGroup, type: opp.type });
                                 }
                             }
                         }
@@ -554,7 +934,7 @@
 
             console.log('[SVD] Total unique entries found:', uniqueEntries.length);
             if (uniqueEntries.length > 0) {
-                const text = uniqueEntries.map(e => `${e.name}\t${e.login}\t${e.timeSlot}`).join('\n');
+                const text = uniqueEntries.map(e => `${e.name}\t${e.login}\t${e.type}\t${e.workGroup}\t${e.timeSlot}`).join('\n');
                 showCopyPopup(text, uniqueEntries.length);
                 btn.textContent = `Found ${uniqueEntries.length}!`;
             } else {
@@ -585,6 +965,7 @@
                 <span style="font-weight:bold;color:#89dceb;">${count} Associates Found</span>
                 <button id="svd-popup-close" style="background:none;border:none;color:#f38ba8;font-size:18px;cursor:pointer;">\u2715</button>
             </div>
+            <div style="font-size:10px;color:#a6adc8;margin-bottom:4px;font-family:monospace;">Name | Login | Type | Work Group | Time</div>
             <textarea id="svd-popup-text" readonly style="width:100%;height:200px;background:#1e1e2e;color:#cdd6f4;border:1px solid #45475a;border-radius:4px;padding:6px;font-family:monospace;font-size:11px;resize:vertical;">${text}</textarea>
             <div style="display:flex;gap:8px;margin-top:8px;">
                 <button id="svd-popup-copy" style="flex:1;padding:6px;background:#89b4fa;color:#1e1e2e;border:none;border-radius:4px;cursor:pointer;font-weight:bold;">Copy to Clipboard</button>
@@ -745,16 +1126,39 @@
     function tryStart() {
         if (started) return;
         started = true;
-        startDashboard();
+
+        // Check if we're on the VTO Monitoring page
+        if (isVTOMonitoringPage()) {
+            runVTOMonitoring();
+        } else {
+            startDashboard();
+        }
     }
 
-    tryStart();
+    // Also check after a short delay (Angular route might not be reflected in URL immediately)
+    function tryStartWithDetection() {
+        if (started) return;
+        // Check page content for VTO Monitoring indicators (but NOT the VTO Tool page)
+        const pageText = document.body ? document.body.textContent : '';
+        if (!pageText.includes('Enter New Opportunity') &&
+            (pageText.includes('Instant VTOs Applied') && pageText.includes('Manager Login'))) {
+            started = true;
+            runVTOMonitoring();
+        } else {
+            tryStart();
+        }
+    }
+
+    // Initial start — wait briefly then detect which page we're on
+    setTimeout(tryStartWithDetection, 2000);
 
     window.addEventListener('hashchange', () => {
         started = false;
         const existing = document.getElementById('svd-dash');
         if (existing) existing.remove();
-        tryStart();
+        const vtoPanel = document.getElementById('svd-vto-panel');
+        if (vtoPanel) vtoPanel.remove();
+        setTimeout(tryStartWithDetection, 1000);
     });
 
 })();
