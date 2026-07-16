@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Oculus Transship Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      7.1
-// @description  Adds a formatted summary dashboard to Oculus transship pages with AFT pending cases, items, and case density — VRIDs link to YMS
+// @version      8.1.0
+// @description  Adds a formatted summary dashboard to Oculus transship pages with AFT pending cases, items, and case density — VRIDs link to YMS — AI-powered anomaly detection and smart trailer prioritization
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
 // @downloadURL  https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
@@ -13,17 +13,21 @@
 // @match        https://afttransshipmenthub.aka.amazon.com/*/view-transfers/inbound*
 // @match        https://trans-logistics.amazon.com/yms/shipclerk*
 // @match        https://track.relay.amazon.dev/*
+// @match        https://stowmap-na.amazon.com/stowmap/*
+// @match        https://us-east-1.quicksight.aws.amazon.com/sn/account/amazonbi/apps/e679414f-e0a0-466e-9053-c97d5d81174f*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_listValues
 // @grant        GM_deleteValue
+// @grant        GM_notification
 // @connect      afttransshipmenthub-na.aka.amazon.com
 // @connect      afttransshipmenthub-eu.aka.amazon.com
 // @connect      afttransshipmenthub-fe.aka.amazon.com
 // @connect      afttransshipmenthub.aka.amazon.com
 // @connect      fclm-portal.amazon.com
 // @connect      maple-syrup.corp.amazon.com
+// @connect      stowmap-na.amazon.com
 // ==/UserScript==
 
 (function () {
@@ -179,6 +183,119 @@
         }, 500);
 
         return; // Don't run the rest of the script on Track & Trace
+    }
+
+    // ─── Stow Map Automation: Auto-fill and download on stowmap page ────────
+    if (window.location.hostname === 'stowmap-na.amazon.com') {
+        const isPending = GM_getValue('stowmap_pending', 'false');
+        if (isPending !== 'true') return; // Only run if triggered from Oculus button
+
+        console.log('[OculusDash-StowMap] Automation started');
+
+        let attempts = 0;
+        const maxAttempts = 40; // 20 seconds
+
+        const interval = setInterval(() => {
+            attempts++;
+
+            // Step 1: Click "Bins Report" tab
+            const binsBtn = document.getElementById('binStatus-button');
+            if (binsBtn) {
+                clearInterval(interval);
+                binsBtn.click();
+                console.log('[OculusDash-StowMap] Clicked Bins Report');
+
+                // Step 2: Wait for form to appear, then fill Floor and Mod
+                setTimeout(() => {
+                    // Find Floor input (first number input in the bins report form)
+                    const binForm = document.querySelector('#binLevelReport .inner-options form') ||
+                                    document.querySelector('.binStatusOptionFilter form') ||
+                                    document.querySelector('#binLevelReport form');
+                    const inputs = binForm ? binForm.querySelectorAll('input') : document.querySelectorAll('#binLevelReport input');
+
+                    let floorInput = null, modInput = null;
+                    for (const inp of inputs) {
+                        const label = inp.closest('div')?.querySelector('label, b, strong')?.textContent || '';
+                        const placeholder = inp.placeholder || '';
+                        if (/floor/i.test(label) || /floor/i.test(placeholder) || inp.name === 'floor') {
+                            floorInput = inp;
+                        } else if (/mod/i.test(label) || /mod/i.test(placeholder) || inp.name === 'mod') {
+                            modInput = inp;
+                        }
+                    }
+
+                    // Fallback: first two inputs in the form
+                    if (!floorInput && inputs.length >= 1) floorInput = inputs[0];
+                    if (!modInput && inputs.length >= 2) modInput = inputs[1];
+
+                    if (floorInput) {
+                        floorInput.value = '1';
+                        floorInput.dispatchEvent(new Event('input', { bubbles: true }));
+                        floorInput.dispatchEvent(new Event('change', { bubbles: true }));
+                        console.log('[OculusDash-StowMap] Filled Floor = 1');
+                    }
+                    if (modInput) {
+                        modInput.value = 'V';
+                        modInput.dispatchEvent(new Event('input', { bubbles: true }));
+                        modInput.dispatchEvent(new Event('change', { bubbles: true }));
+                        console.log('[OculusDash-StowMap] Filled Mod = V');
+                    }
+
+                    // Step 3: Click Download button
+                    setTimeout(() => {
+                        const downloadBtn = document.getElementById('download') ||
+                                            document.querySelector('.buttonDownload') ||
+                                            document.querySelector('button#download');
+                        if (downloadBtn) {
+                            downloadBtn.click();
+                            console.log('[OculusDash-StowMap] Clicked Download');
+
+                            // Step 4: Wait for download to start, then navigate to QuickSight
+                            GM_setValue('stowmap_pending', 'false');
+                            setTimeout(() => {
+                                const quicksightUrl = 'https://us-east-1.quicksight.aws.amazon.com/sn/account/amazonbi/apps/e679414f-e0a0-466e-9053-c97d5d81174f/view/Stow-Map-Generator?sso_login=true#';
+                                window.location.href = quicksightUrl;
+                            }, 3000); // Wait 3s for download to start
+                        } else {
+                            console.warn('[OculusDash-StowMap] Download button not found');
+                            GM_setValue('stowmap_pending', 'false');
+                        }
+                    }, 1500);
+                }, 2000); // Wait for Bins Report tab to render
+            }
+
+            if (attempts >= maxAttempts) {
+                clearInterval(interval);
+                console.warn('[OculusDash-StowMap] Timed out waiting for Bins Report button');
+                GM_setValue('stowmap_pending', 'false');
+            }
+        }, 500);
+
+        return; // Don't run the rest of the script on stowmap
+    }
+
+    // ─── QuickSight Stow Map: Highlight upload area ─────────────────────────
+    if (window.location.hostname.includes('quicksight.aws.amazon.com')) {
+        console.log('[OculusDash-QS] On QuickSight Stow Map Generator page');
+        // Show a helper overlay reminding the user to upload the downloaded file
+        setTimeout(() => {
+            const overlay = document.createElement('div');
+            overlay.id = 'oc-qs-helper';
+            overlay.innerHTML = `
+                <div style="position:fixed;top:20px;right:20px;z-index:999999;background:#313244;border:2px solid #a6e3a1;border-radius:12px;padding:16px 20px;box-shadow:0 8px 32px rgba(0,0,0,0.6);font-family:'Segoe UI',Arial,sans-serif;max-width:350px;">
+                    <div style="font-weight:bold;font-size:16px;color:#a6e3a1;margin-bottom:8px;">✅ Bin data downloaded!</div>
+                    <div style="color:#cdd6f4;font-size:13px;line-height:1.5;">
+                        Upload the file that just downloaded (most recent file in your Downloads folder) to the upload area on this page.
+                    </div>
+                    <button id="oc-qs-dismiss" style="margin-top:10px;background:#45475a;color:#cdd6f4;border:none;border-radius:4px;padding:6px 12px;cursor:pointer;font-size:12px;">Dismiss</button>
+                </div>`;
+            document.body.appendChild(overlay);
+            document.getElementById('oc-qs-dismiss').onclick = () => overlay.remove();
+            // Auto-dismiss after 30s
+            setTimeout(() => { if (overlay.parentElement) overlay.remove(); }, 30000);
+        }, 2000);
+
+        return; // Don't run the rest of the script on QuickSight
     }
 
     // ─── Auto-clear stale cache on version update ───────────────────────────
@@ -1688,13 +1805,20 @@
     #oc-header .oc-header-center { text-align:center; }
     #oc-header .title { font-weight:bold;font-size:22px;color:#cba6f7; }
     #oc-header .meta { font-size:16px;color:#a6adc8; }
-    .oc-btns { display:flex;flex-direction:column;gap:4px;position:absolute;right:12px; }
-    .oc-kips-btn { position:absolute;left:12px;top:50%;transform:translateY(-50%);background:#f38ba8;color:#1e1e2e;border:none;border-radius:8px;padding:14px 24px;font-size:24px;font-weight:bold;cursor:pointer;text-decoration:none;display:inline-block;transition:background 0.2s; }
+    .oc-btns { display:flex;gap:6px;align-items:center;position:absolute;right:12px;top:50%;transform:translateY(-50%); }
+    .oc-left-btns { position:absolute;left:12px;top:50%;transform:translateY(-50%);display:flex;gap:10px;align-items:center;max-width:40%;overflow:hidden; }
+    .oc-kips-btn { background:#f38ba8;color:#1e1e2e;border:none;border-radius:8px;padding:10px 18px;font-size:16px;font-weight:bold;cursor:pointer;text-decoration:none;display:inline-block;transition:background 0.2s;white-space:nowrap;flex-shrink:0; }
     .oc-kips-btn:hover { background:#f9e2af;color:#1e1e2e; }
-    .oc-btn { cursor:pointer;background:#45475a;color:#cdd6f4;border:none;border-radius:4px;padding:3px 10px;font-size:11px; }
+    .oc-stowmap-btn { background:#89b4fa;color:#1e1e2e;border:none;border-radius:8px;padding:10px 18px;font-size:16px;font-weight:bold;cursor:pointer;transition:background 0.2s;text-decoration:none;white-space:nowrap;flex-shrink:0; }
+    .oc-stowmap-btn:hover { background:#a6e3a1;color:#1e1e2e; }
+    .oc-recs-btn { background:#cba6f7;color:#1e1e2e;border:none;border-radius:8px;padding:10px 18px;font-size:16px;font-weight:bold;cursor:pointer;transition:background 0.2s;text-decoration:none;white-space:nowrap; }
+    .oc-recs-btn:hover { background:#f5c2e7;color:#1e1e2e; }
+    .oc-recs-btn.active { background:#a6e3a1;color:#1e1e2e; }
+    .oc-btn { cursor:pointer;background:#45475a;color:#cdd6f4;border:none;border-radius:8px;padding:10px 18px;font-size:14px;font-weight:bold; }
     .oc-btn:hover { background:#585b70; }
-    .oc-btn.refresh { background:#1e66f5; }
+    .oc-btn.refresh { background:#1e66f5;color:#fff; }
     .oc-btn.refresh:hover { background:#3d7ef7; }
+    .oc-recs-overlay { padding:10px;overflow-y:auto;max-height:calc(100vh - 120px); }
     .oc-body { padding:10px; }
     .summary-grid { display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:10px; }
     .summary-card { background:#313244;border-radius:6px;overflow:hidden; }
@@ -1705,10 +1829,10 @@
     .card-table td { padding:8px 12px;border-bottom:1px solid #45475a; }
     .card-table td:last-child { text-align:right;color:#a6e3a1;font-weight:bold;font-size:20px; }
     .card-table tr:last-child td { border-bottom:none; }
-    .trailer-wrap { overflow-x:auto; }
-    table.trailer-tbl { width:100%;border-collapse:collapse;font-size:16px;min-width:900px; }
-    table.trailer-tbl th { background:#45475a;color:#cdd6f4;padding:6px 10px;text-align:left;white-space:nowrap;position:sticky;top:0; }
-    table.trailer-tbl td { padding:5px 10px;border-bottom:1px solid #313244;white-space:nowrap; }
+    .trailer-wrap { overflow-x:hidden; }
+    table.trailer-tbl { width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed; }
+    table.trailer-tbl th { background:#45475a;color:#cdd6f4;padding:4px 6px;text-align:left;white-space:nowrap;position:sticky;top:0;overflow:hidden;text-overflow:ellipsis; }
+    table.trailer-tbl td { padding:4px 6px;border-bottom:1px solid #313244;white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }
     table.trailer-tbl tr:hover td { background:#313244; }
     .status-arrived { color:#a6e3a1; } .status-checked_in { color:#89dceb; }
     .status-arrival_sched { color:#f9e2af; } .status-departed { color:#f38ba8; }
@@ -1757,7 +1881,7 @@
             'Total Cartons': 'totalCartons',
             'Total Units': 'totalUnits',
         };
-        const hdrs = ['VRID','Map Location','Appt Status','Trailer Location','Load Config','FL Type','Priority','Source','Arrival Time','SA Pallets','SA Pallet Cases','Mixed Pallets','FL Cases','Total Cartons','Total Units'];
+        const hdrs = ['VRID','Map Location','Appt Status','Trailer Location','Load Config','FL Type','Priority','Source','Arrival Time','SA Pallets','SA Pallet Cases','Mixed Pallets','FL Cases','Total Cartons','Total Units','Density'];
         const head = hdrs.map(h => {
             if (sortableColumns[h]) {
                 const field = sortableColumns[h];
@@ -1798,12 +1922,302 @@
             <td style="text-align:right;color:#89dceb">${t.flCases}</td>
             <td style="text-align:right;color:#cba6f7;font-weight:bold">${isInYard && aftMap[t.trailerNum] ? aftMap[t.trailerNum].cases.toLocaleString() : t.totalCartons}</td>
             <td style="text-align:right;color:#a6e3a1;font-weight:bold">${isInYard && aftMap[t.trailerNum] ? aftMap[t.trailerNum].items.toLocaleString() : t.totalUnits}</td>
+            <td style="text-align:right;color:#f9e2af;font-weight:bold">${(() => {
+                const cases = isInYard && aftMap[t.trailerNum] ? aftMap[t.trailerNum].cases : parseInt((t.totalCartons||'0').replace(/,/g,''),10)||0;
+                const units = isInYard && aftMap[t.trailerNum] ? aftMap[t.trailerNum].items : parseInt((t.totalUnits||'0').replace(/,/g,''),10)||0;
+                return cases > 0 ? (units / cases).toFixed(2) : '—';
+            })()}</td>
         </tr>`;
         }).join('');
         return `<div class="trailer-wrap"><table class="trailer-tbl"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
     }
     function sum(trailers, field) {
         return trailers.reduce((a, t) => a + (parseInt((t[field]||'0').replace(/,/g,''),10)||0), 0).toLocaleString();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ═══ AI MODULE: Anomaly Detection + Smart Prioritization ════════════════
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    const AI_HISTORY_KEY_PREFIX = 'ai_history_';
+    const AI_MAX_HISTORY = 50; // Keep last 50 data points per FC
+
+    // ─── Store a snapshot of current metrics for trend analysis ──────────────
+    function recordMetricSnapshot(fc, metrics) {
+        const key = AI_HISTORY_KEY_PREFIX + fc;
+        let history = [];
+        try { history = JSON.parse(GM_getValue(key, '[]')); } catch(e) { history = []; }
+        history.push({ ...metrics, ts: Date.now() });
+        // Keep only last N entries
+        if (history.length > AI_MAX_HISTORY) history = history.slice(-AI_MAX_HISTORY);
+        GM_setValue(key, JSON.stringify(history));
+        return history;
+    }
+
+    function getMetricHistory(fc) {
+        const key = AI_HISTORY_KEY_PREFIX + fc;
+        try { return JSON.parse(GM_getValue(key, '[]')); } catch(e) { return []; }
+    }
+
+    // ─── Statistical helpers ────────────────────────────────────────────────
+    function mean(arr) { return arr.length === 0 ? 0 : arr.reduce((a, b) => a + b, 0) / arr.length; }
+    function stdDev(arr) {
+        if (arr.length < 2) return 0;
+        const m = mean(arr);
+        return Math.sqrt(arr.reduce((s, v) => s + (v - m) ** 2, 0) / (arr.length - 1));
+    }
+
+    // ─── Anomaly Detection Engine ───────────────────────────────────────────
+    function detectAnomalies(fc, currentMetrics) {
+        const history = getMetricHistory(fc);
+        const alerts = [];
+
+        if (history.length < 5) {
+            // Not enough data yet
+            return [{ type: 'info', icon: '📊', msg: `Building baseline… (${history.length}/5 snapshots collected)` }];
+        }
+
+        // Pending cases growth rate — is it accelerating?
+        if (currentMetrics.pendingCases > 0 && history.length >= 3) {
+            const recentPending = history.slice(-5).map(h => h.pendingCases).filter(v => v > 0);
+            if (recentPending.length >= 2) {
+                const prevAvg = mean(recentPending);
+                const growthPct = ((currentMetrics.pendingCases - prevAvg) / prevAvg * 100).toFixed(0);
+                if (growthPct > 50) {
+                    alerts.push({ type: 'critical', icon: '🔴', msg: `Pending cases spiked ${growthPct}% (${currentMetrics.pendingCases.toLocaleString()} vs recent avg ${Math.round(prevAvg).toLocaleString()}) — inbound outpacing stow capacity` });
+                } else if (growthPct < -30) {
+                    alerts.push({ type: 'good', icon: '✅', msg: `Pending cases down ${Math.abs(growthPct)}% — clearing backlog well` });
+                }
+            }
+        }
+
+        // KIPS queue alert
+        if (currentMetrics.kipsCount > 5) {
+            alerts.push({ type: 'warning', icon: '🚛', msg: `${currentMetrics.kipsCount} trailers queued in KIPS — yard may be backed up` });
+        }
+
+        if (alerts.length === 0) {
+            alerts.push({ type: 'good', icon: '✅', msg: 'All metrics within normal range' });
+        }
+
+        return alerts;
+    }
+
+    // ─── Smart Trailer Prioritization ───────────────────────────────────────
+    function scoreTrailers(trailers, aftPerTrailer) {
+        const now = new Date();
+        const pureCase = [];    // Floor loaded / pure case trailers
+        const palletized = [];  // Palletized trailers
+        const sapTrailers = []; // Single ASIN Pallet trailers (high indirect labor impact)
+        const longestInYard = []; // All trailers sorted by time in yard
+
+        for (const t of trailers) {
+            if (t.apptStatus !== 'ARRIVED' && t.apptStatus !== 'CHECKED_IN') continue;
+
+            // Get case count
+            const aftData = aftPerTrailer ? aftPerTrailer[t.trailerNum] : null;
+            const cases = aftData ? aftData.cases : parseInt((t.totalCartons||'0').replace(/,/g,''),10) || 0;
+
+            // Calculate time in yard
+            let hoursInYard = 0;
+            if (t.arrivalTime) {
+                const arrival = parseArrivalTime(t.arrivalTime);
+                if (arrival) hoursInYard = (now - arrival) / (1000 * 60 * 60);
+            }
+
+            // Determine load type
+            const loadConfig = (t.loadConfig || '').toUpperCase();
+            const isPureCase = loadConfig.includes('FLOOR') || loadConfig.includes('CASE');
+            const isPalletized = loadConfig.includes('PALLET');
+
+            // Check for SAP (Single ASIN Pallets) — only significant if 2+ SAP with 100+ combined cases
+            const sapCount = parseInt((t.singleASINPallets||'0').replace(/,/g,''), 10) || 0;
+            const hasSAP = sapCount >= 2 && cases >= 100;
+
+            // Build trailer entry
+            const entry = {
+                trailer: t,
+                cases,
+                hoursInYard: hoursInYard,
+                sapCount,
+                loadType: isPureCase ? 'Pure Case' : isPalletized ? 'Palletized' : 'Other',
+                reasons: [],
+            };
+
+            // Classify volume label for pure case (500-1800 range)
+            if (isPureCase) {
+                if (cases >= 1500) entry.reasons.push(`${cases.toLocaleString()} cases (heavy)`);
+                else if (cases >= 1000) entry.reasons.push(`${cases.toLocaleString()} cases (medium-heavy)`);
+                else if (cases >= 500) entry.reasons.push(`${cases.toLocaleString()} cases (standard)`);
+                else if (cases > 0) entry.reasons.push(`${cases.toLocaleString()} cases (light)`);
+                pureCase.push(entry);
+            } else if (isPalletized) {
+                if (cases >= 1500) entry.reasons.push(`${cases.toLocaleString()} cases (heavy)`);
+                else if (cases >= 1000) entry.reasons.push(`${cases.toLocaleString()} cases (medium)`);
+                else if (cases > 0) entry.reasons.push(`${cases.toLocaleString()} cases`);
+                palletized.push(entry);
+            } else {
+                // Unknown/other type — put with palletized
+                if (cases > 0) entry.reasons.push(`${cases.toLocaleString()} cases`);
+                palletized.push(entry);
+            }
+
+            // SAP tracking (can overlap with palletized)
+            if (hasSAP) {
+                entry.reasons.push(`${sapCount} SA Pallets ⭐`);
+                sapTrailers.push(entry);
+            }
+
+            // Time in yard tracking
+            if (hoursInYard >= 2) {
+                longestInYard.push(entry);
+            }
+        }
+
+        // Sort each group by case volume descending (highest first)
+        pureCase.sort((a, b) => b.cases - a.cases);
+        palletized.sort((a, b) => b.cases - a.cases);
+        sapTrailers.sort((a, b) => b.cases - a.cases);
+        longestInYard.sort((a, b) => b.hoursInYard - a.hoursInYard);
+
+        return { pureCase, palletized, sapTrailers, longestInYard };
+    }
+
+    function parseArrivalTime(arrStr) {
+        if (!arrStr) return null;
+        try {
+            // Try ISO format or common date formats
+            const d = new Date(arrStr);
+            if (!isNaN(d.getTime())) return d;
+            // Try "MM/DD HH:MM" or "HH:MM" format
+            const timeMatch = arrStr.match(/(\d{1,2}):(\d{2})/);
+            if (timeMatch) {
+                const now = new Date();
+                const h = parseInt(timeMatch[1], 10);
+                const m = parseInt(timeMatch[2], 10);
+                const d = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m);
+                // If time is in future, assume it was yesterday
+                if (d > now) d.setDate(d.getDate() - 1);
+                return d;
+            }
+        } catch(e) {}
+        return null;
+    }
+
+    // ─── Build AI Insights Panel HTML ───────────────────────────────────────
+    function buildAIInsightsHTML(alerts, priorityData, fc) {
+        const { pureCase, palletized, sapTrailers, longestInYard } = priorityData;
+        const siteName = (fc || 'Unknown').toUpperCase();
+
+        const alertTypeStyles = {
+            critical: 'background:#f38ba8;color:#1e1e2e;',
+            warning: 'background:#f9e2af;color:#1e1e2e;',
+            good: 'background:#a6e3a1;color:#1e1e2e;',
+            info: 'background:#89b4fa;color:#1e1e2e;',
+        };
+
+        let alertsHTML = alerts.map(a => {
+            const style = alertTypeStyles[a.type] || alertTypeStyles.info;
+            return `<div style="${style}border-radius:6px;padding:10px 14px;margin:4px 0;font-size:16px;font-weight:bold;">${a.icon} ${a.msg}</div>`;
+        }).join('');
+
+        // ─── SAP Impact Callout ─────────────────────────────────────────────
+        let sapHTML = '';
+        if (sapTrailers.length > 0) {
+            const totalSAP = sapTrailers.reduce((s, e) => s + e.sapCount, 0);
+            const sapRows = sapTrailers.map(e => {
+                return `<tr style="border-bottom:1px solid #45475a;">
+                    <td style="padding:10px 12px;color:#cba6f7;font-weight:bold;font-size:16px;">${e.trailer.trailerNum}</td>
+                    <td style="padding:10px 12px;text-align:right;color:#89dceb;font-weight:bold;font-size:18px;">${e.sapCount} SAP</td>
+                    <td style="padding:10px 12px;text-align:right;color:#a6e3a1;font-weight:bold;font-size:16px;">${e.cases.toLocaleString()} cases</td>
+                    <td style="padding:10px 12px;color:#cdd6f4;font-size:14px;">${e.hoursInYard > 0 ? e.hoursInYard.toFixed(1) + 'h in yard' : ''}</td>
+                </tr>`;
+            }).join('');
+            sapHTML = `
+                <div style="margin-top:14px;border:2px solid #f9e2af;border-radius:8px;padding:14px;background:#2e2e1e;">
+                    <div style="font-weight:bold;font-size:18px;color:#f9e2af;margin-bottom:4px;">⭐ SAP Trailers — High Indirect Labor Impact (${totalSAP} total SA Pallets)</div>
+                    <div style="font-size:14px;color:#cdd6f4;margin-bottom:10px;">2+ SA Pallets with 100+ cases — stowing these brings CPLH up and improves cost.</div>
+                    <table style="width:100%;border-collapse:collapse;">
+                        <tbody>${sapRows}</tbody>
+                    </table>
+                </div>`;
+        }
+
+        // ─── Action Order: Pure Case first, then Palletized ─────────────────
+        function buildActionTable(items, label, icon, accentColor) {
+            if (items.length === 0) return '';
+            const rows = items.map((item, idx) => {
+                const volumeColor = item.cases >= 1500 ? '#f38ba8' : item.cases >= 1000 ? '#f9e2af' : '#a6e3a1';
+                const reasonStr = item.reasons.join(' · ');
+                const yardStr = item.hoursInYard >= 2 ? `<span style="color:#f9e2af;font-weight:bold;"> · ${item.hoursInYard.toFixed(1)}h in yard</span>` : '';
+                return `<tr style="border-bottom:1px solid #45475a;">
+                    <td style="padding:10px 12px;color:${accentColor};font-weight:bold;font-size:18px;">#${idx + 1}</td>
+                    <td style="padding:10px 12px;color:#cba6f7;font-weight:bold;font-size:16px;">${item.trailer.trailerNum}</td>
+                    <td style="padding:10px 12px;text-align:right;"><span style="color:${volumeColor};font-weight:bold;font-size:18px;">${item.cases.toLocaleString()}</span></td>
+                    <td style="padding:10px 12px;font-size:14px;color:#cdd6f4;">${reasonStr}${yardStr}</td>
+                </tr>`;
+            }).join('');
+            return `
+                <div style="margin-top:14px;">
+                    <div style="font-weight:bold;font-size:18px;color:${accentColor};margin-bottom:8px;padding-bottom:6px;border-bottom:2px solid ${accentColor};">${icon} ${label} (${items.length})</div>
+                    <table style="width:100%;border-collapse:collapse;">
+                        <thead><tr style="color:#a6adc8;border-bottom:2px solid #45475a;">
+                            <th style="padding:6px 12px;text-align:left;font-size:14px;">#</th>
+                            <th style="padding:6px 12px;text-align:left;font-size:14px;">Trailer</th>
+                            <th style="padding:6px 12px;text-align:right;font-size:14px;">Cases</th>
+                            <th style="padding:6px 12px;text-align:left;font-size:14px;">Details</th>
+                        </tr></thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                </div>`;
+        }
+
+        const pureCaseHTML = buildActionTable(pureCase, 'Process First — Pure Case / Floor Load', '📦', '#89b4fa');
+        // If no pure case trailers, palletized becomes "Process First"
+        const palletLabel = pureCase.length > 0 ? 'Process Second — Palletized' : 'Process First — Palletized';
+        const palletizedHTML = buildActionTable(palletized, palletLabel, '🔲', '#89dceb');
+
+        // ─── Longest in Yard Section ────────────────────────────────────────
+        let yardHTML = '';
+        if (longestInYard.length > 0) {
+            const yardRows = longestInYard.slice(0, 5).map(e => {
+                const timeColor = e.hoursInYard >= 8 ? '#f38ba8' : e.hoursInYard >= 4 ? '#f9e2af' : '#a6adc8';
+                return `<tr style="border-bottom:1px solid #45475a;">
+                    <td style="padding:10px 12px;color:#cba6f7;font-weight:bold;font-size:16px;">${e.trailer.trailerNum}</td>
+                    <td style="padding:10px 12px;color:${timeColor};font-weight:bold;font-size:18px;">${e.hoursInYard.toFixed(1)}h</td>
+                    <td style="padding:10px 12px;color:#cdd6f4;font-size:15px;">${e.loadType}</td>
+                    <td style="padding:10px 12px;color:#cdd6f4;font-size:15px;font-weight:bold;">${e.cases.toLocaleString()} cases</td>
+                    <td style="padding:10px 12px;color:#a6adc8;font-size:14px;">${e.trailer.trailerLocation || ''}</td>
+                </tr>`;
+            }).join('');
+            yardHTML = `
+                <div style="margin-top:14px;border:2px solid #f38ba8;border-radius:8px;padding:14px;background:#2e1e1e;">
+                    <div style="font-weight:bold;font-size:18px;color:#f38ba8;margin-bottom:8px;">🕐 Longest in Yard — Needs Processing</div>
+                    <table style="width:100%;border-collapse:collapse;">
+                        <thead><tr style="color:#a6adc8;border-bottom:2px solid #45475a;">
+                            <th style="padding:6px 12px;text-align:left;font-size:14px;">Trailer</th>
+                            <th style="padding:6px 12px;text-align:left;font-size:14px;">Time</th>
+                            <th style="padding:6px 12px;text-align:left;font-size:14px;">Type</th>
+                            <th style="padding:6px 12px;text-align:left;font-size:14px;">Cases</th>
+                            <th style="padding:6px 12px;text-align:left;font-size:14px;">Location</th>
+                        </tr></thead>
+                        <tbody>${yardRows}</tbody>
+                    </table>
+                </div>`;
+        }
+
+        return `
+            <div id="oc-ai-section" style="background:#1e1e2e;border:2px solid #cba6f7;border-radius:10px;padding:16px 18px;margin:10px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;padding-bottom:8px;border-bottom:2px solid #45475a;">
+                    <span style="font-weight:bold;font-size:24px;color:#cba6f7;">📋 Recommendations — ${siteName}</span>
+                    <span style="font-size:13px;color:#6c7086;">Updated ${new Date().toLocaleTimeString()}</span>
+                </div>
+                <div id="oc-ai-alerts">${alertsHTML}</div>
+                ${sapHTML}
+                ${pureCaseHTML}
+                ${palletizedHTML}
+                ${yardHTML}
+            </div>`;
     }
 
     async function render(container) {
@@ -1871,10 +2285,14 @@
                 <div id="oc-stow-line" style="margin-top:6px;font-size:22px;font-weight:bold;color:#89b4fa;"><span id="oc-active-stowers" style="color:#89b4fa;">Stowers: ⏳</span> &nbsp;|&nbsp; <span id="oc-ib-cplh" style="color:#89b4fa;"></span><span id="oc-total-stows" style="color:#89b4fa;">Total Stows: ⏳</span> &nbsp;|&nbsp; <span id="oc-stow-rate" style="color:#89b4fa;">Stow Rate: ⏳ JPH</span></div>
             </div>
             <div class="oc-btns">
+                <button class="oc-recs-btn" id="oc-recs-toggle">📋 Recommendations</button>
                 <button class="oc-btn refresh" id="oc-refresh">↻ Refresh</button>
                 <button class="oc-btn" id="oc-toggle">▲ Collapse</button>
             </div>
-            <a class="oc-kips-btn" id="oc-kips-link" href="https://maple-syrup.corp.amazon.com/${fc.toUpperCase()}/kips/thermometer" target="_blank">🚛 Trailers in KIPS = <span id="oc-kips-count">⏳</span></a>
+            <div class="oc-left-btns">
+                <a class="oc-kips-btn" id="oc-kips-link" href="https://maple-syrup.corp.amazon.com/${fc.toUpperCase()}/kips/thermometer" target="_blank">🚛 Trailers in KIPS = <span id="oc-kips-count">⏳</span></a>
+                <button class="oc-stowmap-btn" id="oc-stowmap-btn">🗺️ Generate Stow Map</button>
+            </div>
         </div>
         <div class="oc-body">
             <div class="summary-grid">
@@ -1882,6 +2300,7 @@
                 ${buildSummaryCard('TOMORROW — FORECAST', 'tmrw', tmrwData, cardLabels)}
             </div>
             ${sapBanner}
+            <div id="oc-longest-yard"></div>
             <div class="trailer-section-header" id="oc-trailer-header">
                 <span>Trailer Detail (${trailers.length} trailers)</span>
                 <button class="trailer-toggle-btn" id="oc-trailer-toggle">▲ Collapse</button>
@@ -1889,12 +2308,34 @@
             <div class="trailer-section-body" id="oc-trailer-body">
                 ${buildTrailerTable(trailers, fc)}
             </div>
-        </div>`;
+        </div>
+        <div id="oc-recs-overlay" class="oc-recs-overlay" style="display:none;"></div>`;
 
         document.getElementById('oc-toggle').onclick = () => {
             const c = container.classList.toggle('collapsed');
             document.getElementById('oc-toggle').textContent = c ? '▼ Expand' : '▲ Collapse';
         };
+
+        // Recommendations toggle — overlays on the body content
+        document.getElementById('oc-recs-toggle').onclick = () => {
+            const overlay = document.getElementById('oc-recs-overlay');
+            const body = container.querySelector('.oc-body');
+            const btn = document.getElementById('oc-recs-toggle');
+            if (overlay.style.display === 'none') {
+                // Show recommendations, hide body
+                overlay.style.display = 'block';
+                if (body) body.style.display = 'none';
+                btn.textContent = '← Back to Dashboard';
+                btn.classList.add('active');
+            } else {
+                // Hide recommendations, show body
+                overlay.style.display = 'none';
+                if (body) body.style.display = '';
+                btn.textContent = '📋 Recommendations';
+                btn.classList.remove('active');
+            }
+        };
+
         document.getElementById('oc-trailer-header').onclick = () => {
             const b = document.getElementById('oc-trailer-body');
             const btn = document.getElementById('oc-trailer-toggle');
@@ -1902,6 +2343,23 @@
             btn.textContent = h ? '▼ Expand' : '▲ Collapse';
         };
         document.getElementById('oc-refresh').onclick = () => location.reload();
+
+        // ─── Stow Map Generator Button ──────────────────────────────────────
+        document.getElementById('oc-stowmap-btn').onclick = (e) => {
+            e.preventDefault();
+            const stowmapUrl = `https://stowmap-na.amazon.com/stowmap/loadFCAreaMap.htm?warehouseId=${fc.toUpperCase()}`;
+            // Store FC and target QuickSight URL for the stowmap automation script
+            GM_setValue('stowmap_fc', fc.toUpperCase());
+            GM_setValue('stowmap_pending', 'true');
+            // Use a dynamically created link click to avoid popup blocker
+            const a = document.createElement('a');
+            a.href = stowmapUrl;
+            a.target = '_blank';
+            a.rel = 'noopener';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+        };
 
         // Sort columns on click (generic handler for all sortable columns)
         function attachSortHandlers(trailersRef, fcRef, aftRef) {
@@ -1919,6 +2377,50 @@
             });
         }
         attachSortHandlers(trailers, fc, undefined);
+
+        // ─── Browser Notifications for Newly Arrived Trailers ───────────────
+        try {
+            const notifKey = 'notified_arrivals_' + fc;
+            let previouslyNotified = [];
+            try { previouslyNotified = JSON.parse(GM_getValue(notifKey, '[]')); } catch(e) { previouslyNotified = []; }
+
+            // Find trailers with ARRIVED status (just arrived, not yet checked in)
+            const justArrived = trailers.filter(t => t.apptStatus === 'ARRIVED');
+            const newArrivals = justArrived.filter(t => !previouslyNotified.includes(t.trailerNum));
+
+            if (newArrivals.length > 0) {
+                // Send browser notification for each new arrival
+                for (const t of newArrivals) {
+                    const cases = parseInt((t.totalCartons||'0').replace(/,/g,''),10) || 0;
+                    const sapCount = parseInt((t.singleASINPallets||'0').replace(/,/g,''), 10) || 0;
+                    const loadType = (t.loadConfig||'').toUpperCase().includes('FLOOR') ? 'Pure Case' :
+                                     (t.loadConfig||'').toUpperCase().includes('PALLET') ? 'Palletized' : t.loadConfig || 'Unknown';
+                    const sapNote = sapCount > 0 ? ` | ${sapCount} SA Pallets ⭐` : '';
+
+                    GM_notification({
+                        title: `🚛 New Trailer Arrived — ${fc.toUpperCase()}`,
+                        text: `${t.trailerNum} from ${t.source || 'Unknown'}\n${loadType} | ${cases.toLocaleString()} cases${sapNote}\nLocation: ${t.trailerLocation || 'TBD'}`,
+                        timeout: 10000,
+                        onclick: () => { window.focus(); }
+                    });
+                    console.log(`[OculusDash] 🔔 Notification: New arrival ${t.trailerNum} (${loadType}, ${cases} cases)`);
+                }
+
+                // Update the notified list (keep current ARRIVED + CHECKED_IN to avoid re-notifying)
+                const allInYardVrids = trailers
+                    .filter(t => t.apptStatus === 'ARRIVED' || t.apptStatus === 'CHECKED_IN')
+                    .map(t => t.trailerNum);
+                GM_setValue(notifKey, JSON.stringify(allInYardVrids));
+            } else {
+                // Still update the list to prune departed trailers
+                const allInYardVrids = trailers
+                    .filter(t => t.apptStatus === 'ARRIVED' || t.apptStatus === 'CHECKED_IN')
+                    .map(t => t.trailerNum);
+                GM_setValue(notifKey, JSON.stringify(allInYardVrids));
+            }
+        } catch (err) {
+            console.warn('[OculusDash] Notification error:', err);
+        }
 
         // ─── Async: Update IN YARD card with AFT data ───────────────────────
         const inYardVrids = arrived.map(t => t.trailerNum);
@@ -1984,6 +2486,57 @@
             }
         } catch (err) {
             console.error('[OculusDash] AFT per-trailer re-render error:', err);
+        }
+
+        // ─── Longest in Yard (top 5) — inline on main dashboard ─────────────
+        try {
+            const now = new Date();
+            const yardEntries = [];
+            for (const t of arrived) {
+                let hoursInYard = 0;
+                if (t.arrivalTime) {
+                    const arrival = parseArrivalTime(t.arrivalTime);
+                    if (arrival) hoursInYard = (now - arrival) / (1000 * 60 * 60);
+                }
+                if (hoursInYard >= 2) {
+                    const loadConfig = (t.loadConfig || '').toUpperCase();
+                    const loadType = loadConfig.includes('FLOOR') ? 'Pure Case' : loadConfig.includes('PALLET') ? 'Palletized' : t.loadConfig || 'Other';
+                    const cases = parseInt((t.totalCartons||'0').replace(/,/g,''),10) || 0;
+                    yardEntries.push({ trailer: t, hoursInYard, loadType, cases });
+                }
+            }
+            yardEntries.sort((a, b) => b.hoursInYard - a.hoursInYard);
+            const top5 = yardEntries.slice(0, 5);
+
+            const yardContainer = document.getElementById('oc-longest-yard');
+            if (yardContainer && top5.length > 0) {
+                const yardRows = top5.map(e => {
+                    const timeColor = e.hoursInYard >= 8 ? '#f38ba8' : e.hoursInYard >= 4 ? '#f9e2af' : '#a6adc8';
+                    return `<tr style="border-bottom:1px solid #45475a;">
+                        <td style="padding:10px 12px;color:#cba6f7;font-weight:bold;font-size:16px;">${e.trailer.trailerNum}</td>
+                        <td style="padding:10px 12px;color:${timeColor};font-weight:bold;font-size:18px;">${e.hoursInYard.toFixed(1)}h</td>
+                        <td style="padding:10px 12px;color:#cdd6f4;font-size:15px;">${e.loadType}</td>
+                        <td style="padding:10px 12px;color:#cdd6f4;font-size:15px;font-weight:bold;">${e.cases.toLocaleString()} cases</td>
+                        <td style="padding:10px 12px;color:#a6adc8;font-size:14px;">${e.trailer.trailerLocation || ''}</td>
+                    </tr>`;
+                }).join('');
+                yardContainer.innerHTML = `
+                    <div style="background:#2e1e1e;border:2px solid #f38ba8;border-radius:8px;padding:14px;margin-bottom:10px;">
+                        <div style="font-weight:bold;font-size:18px;color:#f38ba8;margin-bottom:8px;">🕐 Longest in Yard — Needs Processing</div>
+                        <table style="width:100%;border-collapse:collapse;">
+                            <thead><tr style="color:#a6adc8;border-bottom:2px solid #45475a;">
+                                <th style="padding:6px 12px;text-align:left;font-size:14px;">Trailer</th>
+                                <th style="padding:6px 12px;text-align:left;font-size:14px;">Time</th>
+                                <th style="padding:6px 12px;text-align:left;font-size:14px;">Type</th>
+                                <th style="padding:6px 12px;text-align:left;font-size:14px;">Cases</th>
+                                <th style="padding:6px 12px;text-align:left;font-size:14px;">Location</th>
+                            </tr></thead>
+                            <tbody>${yardRows}</tbody>
+                        </table>
+                    </div>`;
+            }
+        } catch (err) {
+            console.error('[OculusDash] Longest in yard error:', err);
         }
 
         // ─── Fetch KIPS count ──────────────────────────────────────────────────
@@ -2074,6 +2627,55 @@
             console.error('[OculusDash] Backlog calc error:', err);
             const el = document.getElementById('oc-backlog');
             if (el) { el.textContent = '📊 -- Days Backlog'; el.style.color = '#a6adc8'; }
+        }
+
+        // ─── Recommendations: Anomaly Detection + Smart Prioritization (loads last) ──
+        try {
+            const aft = await fetchAFTData(inYardVrids);
+            const aftPerTrailer = (aft && aft.perTrailer) || {};
+
+            // Gather current metrics for anomaly detection
+            const stowRateEl = document.getElementById('oc-stow-rate');
+            const stowRateMatch = stowRateEl ? stowRateEl.textContent.match(/([\d.]+)\s*JPH/) : null;
+            const currentStowRate = stowRateMatch ? parseFloat(stowRateMatch[1]) : 0;
+
+            const stowersEl = document.getElementById('oc-active-stowers');
+            const stowersMatch = stowersEl ? stowersEl.textContent.match(/Stowers:\s*(\d+)/) : null;
+            const currentStowers = stowersMatch ? parseInt(stowersMatch[1], 10) : 0;
+
+            const kipsEl = document.getElementById('oc-kips-count');
+            const kipsCount = kipsEl ? (parseInt(kipsEl.textContent, 10) || 0) : 0;
+
+            const pendingCases = aft && aft.totalCases ? aft.totalCases : parseInt(sum(arrived, 'totalCartons').replace(/,/g,''),10) || 0;
+
+            const currentMetrics = {
+                stowRate: currentStowRate,
+                activeStowers: currentStowers,
+                pendingCases: pendingCases,
+                kipsCount: kipsCount,
+                trailerCount: arrived.length,
+            };
+
+            // Record snapshot and detect anomalies
+            const history = recordMetricSnapshot(fc, currentMetrics);
+            const alerts = detectAnomalies(fc, currentMetrics);
+
+            // Score and prioritize trailers
+            const prioritized = scoreTrailers(trailers, aftPerTrailer);
+
+            // Render Recommendations into the overlay panel
+            const recsOverlay = document.getElementById('oc-recs-overlay');
+            if (recsOverlay) {
+                recsOverlay.innerHTML = buildAIInsightsHTML(alerts, prioritized, fc);
+            }
+
+            console.log('[OculusDash-AI] Insights rendered:', alerts.length, 'alerts,', prioritized.pureCase.length, 'pure case,', prioritized.palletized.length, 'palletized,', prioritized.sapTrailers.length, 'SAP, history:', history.length, 'snapshots');
+        } catch (err) {
+            console.error('[OculusDash-AI] Error:', err);
+            const recsOverlay = document.getElementById('oc-recs-overlay');
+            if (recsOverlay) {
+                recsOverlay.innerHTML = `<div style="background:#313244;border:1px solid #45475a;border-radius:6px;padding:10px;margin:10px;color:#a6adc8;font-size:13px;">📋 Recommendations: Error loading — ${err.message}</div>`;
+            }
         }
     }
 
