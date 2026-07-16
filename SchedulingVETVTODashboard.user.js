@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Scheduling Opportunities
 // @namespace    http://tampermonkey.net/
-// @version      2.2
+// @version      2.3
 // @description  Overlay dashboard for scheduling.amazon.com that summarizes VET/VTO/READY opportunities by day and shift
 // @author       You
 // @match        https://scheduling.amazon.com/*
@@ -15,8 +15,8 @@
     console.log('[SVD] KRB3 Scheduling Opportunities script loaded');
 
     // ─── Shift Config ───────────────────────────────────────────────────────────
-    const DAY_SHIFT_START = 6.5;   // 06:30
-    const DAY_SHIFT_END = 18.5;    // 18:30
+    const DAY_SHIFT_START = 6.25; // 06:15
+    const DAY_SHIFT_END = 18.25; // 18:15
 
     // ─── VTO Monitoring Shift Assignment ────────────────────────────────────────
     const VTO_NIGHT_SHIFT_MANAGERS = ['jos', 'snodgtyl', 'timmtris'];
@@ -602,7 +602,7 @@
                 // Time columns: bare HH:MM (not followed by extra text like "Jul 03")
                 else if (/^\d{1,2}:\d{2}$/.test(txt)) {
                     if (startCol === -1) startCol = i;
-                    else if (endCol === -1 && i === startCol + 1) endCol = i;
+                    else if (endCol === -1 && i > startCol) endCol = i;
                 }
                 // Work group: text that's not a type, not a number, not a time
                 else if (workGroupCol === -1 && txt.length > 1 && txt.length < 30
