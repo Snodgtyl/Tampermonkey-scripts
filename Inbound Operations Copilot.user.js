@@ -1823,8 +1823,8 @@
     .summary-grid { display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:14px; }
     .summary-card { background:#2A2D3E;border-radius:8px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.06); }
     .card-header { padding:10px 14px;font-weight:bold;font-size:18px;text-align:center;border-radius:8px 8px 0 0; }
-    .card-header.yard { background:#4A72C9;color:#F2F5FA; }
-    .card-header.tmrw { background:#4A72C9;color:#F2F5FA; }
+    .card-header.yard { background:#4F73C9;color:#F2F5FA; }
+    .card-header.tmrw { background:#009688;color:#F2F5FA; }
     .card-table { width:100%;border-collapse:collapse;font-size:16px;background:#323547; }
     .card-table td { padding:10px 14px;border-bottom:1px solid #3a3d4e; }
     .card-table td:first-child { color:#C3CAD7; }
