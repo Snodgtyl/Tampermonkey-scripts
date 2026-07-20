@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Inbound Operations Copilot
 // @namespace    http://tampermonkey.net/
-// @version      8.4.0
+// @version      8.5.0
 // @description  Adds a formatted summary dashboard to Oculus transship pages with AFT pending cases, items, and case density — VRIDs link to YMS — AI-powered anomaly detection and smart trailer prioritization
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
@@ -1407,6 +1407,7 @@
                 onload: (resp) => {
                     const text = resp.responseText || '';
                     let totalHours = 0;
+                    console.log('[OculusDash] IB hours fetch, response length:', text.length, 'url:', url.substring(0, 100));
                     try {
                         const doc = new DOMParser().parseFromString(text, 'text/html');
                         const rows = doc.querySelectorAll('tr');
@@ -1417,24 +1418,93 @@
                             const idx = ths.findIndex(th => th.textContent.trim() === 'Hrs');
                             if (idx >= 0) { hrsColIdx = idx; break; }
                         }
-                        // Find the IB Total row (TOTAL cell + "IB Total" in line items)
+                        if (hrsColIdx < 0) {
+                            console.warn('[OculusDash] IB hours: "Hrs" column not found in PPR headers');
+                        }
+                        // Debug: find any row containing "Total" text
+                        let debugTotalSamples = [];
                         for (const row of rows) {
-                            const cells = row.querySelectorAll('td');
-                            if (cells.length >= 2 && cells[0].textContent.trim() === 'TOTAL' &&
-                                row.textContent.includes('IB Total')) {
-                                if (hrsColIdx >= 1 && cells[hrsColIdx - 1]) {
-                                    const origDiv = cells[hrsColIdx - 1].querySelector('div[class*="original"]');
-                                    totalHours = parseFloat((origDiv || cells[hrsColIdx - 1]).textContent.trim().replace(/,/g, '')) || 0;
+                            if (row.textContent.includes('Total') || row.textContent.includes('TOTAL')) {
+                                const cells = row.querySelectorAll('td, th');
+                                if (cells.length > 0) {
+                                    debugTotalSamples.push(Array.from(cells).slice(0, 6).map(c => c.textContent.trim().substring(0, 40)));
                                 }
-                                console.log('[OculusDash] IB Total hours:', totalHours);
-                                break;
                             }
+                            if (debugTotalSamples.length >= 5) break;
+                        }
+                        if (debugTotalSamples.length > 0) {
+                            console.log('[OculusDash] IB hours debug - rows with Total:', JSON.stringify(debugTotalSamples));
+                        } else {
+                            console.warn('[OculusDash] IB hours debug - NO rows containing Total/TOTAL text found!');
+                        }
+                        // Find IB Total hours and Case Stow to Reserve hours from PPR
+                        // Row format varies due to rowspans. Strategy: find the row, then look for
+                        // the Hrs value which sits between Vol (large int) and Rate (larger decimal)
+                        let ibTotalHrs = 0;
+                        let caseStowReserveHrs = 0;
+
+                        function extractHrsFromRow(row) {
+                            const cells = row.querySelectorAll('td, th');
+                            // Collect all numeric values from cells
+                            const nums = [];
+                            for (let i = 0; i < cells.length; i++) {
+                                const txt = cells[i].textContent.trim().replace(/,/g, '');
+                                const val = parseFloat(txt);
+                                if (!isNaN(val)) nums.push({ val, idx: i });
+                            }
+                            // Pattern: Vol (large) | Hrs (small-medium) | Rate (large)
+                            // Hrs is typically the smallest positive decimal among the last 3 numeric cells
+                            // Or: find sequence where nums[i] > nums[i+1] < nums[i+2]
+                            for (let i = 0; i < nums.length - 2; i++) {
+                                if (nums[i].val > nums[i+1].val && nums[i+2].val > nums[i+1].val && nums[i+1].val > 0) {
+                                    return nums[i+1].val; // This is Hrs (valley between Vol and Rate)
+                                }
+                            }
+                            // Fallback: second numeric value if first is Vol
+                            if (nums.length >= 3 && nums[0].val > 100 && nums[1].val < nums[0].val && nums[1].val > 0) {
+                                return nums[1].val;
+                            }
+                            return 0;
+                        }
+
+                        for (const row of rows) {
+                            const rowText = row.textContent;
+                            if (rowText.includes('IB Total') && !rowText.includes('IB Lead')) {
+                                const cells = row.querySelectorAll('td, th');
+                                for (let ci = 0; ci < cells.length; ci++) {
+                                    if (cells[ci].textContent.trim() === 'IB Total') {
+                                        ibTotalHrs = extractHrsFromRow(row);
+                                        break;
+                                    }
+                                }
+                            }
+                            if (rowText.includes('Case Stow to Reserve')) {
+                                const cells = row.querySelectorAll('td, th');
+                                for (let ci = 0; ci < cells.length; ci++) {
+                                    if (cells[ci].textContent.trim() === 'Case Stow to Reserve') {
+                                        caseStowReserveHrs = extractHrsFromRow(row);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (ibTotalHrs > 0) {
+                            totalHours = ibTotalHrs - caseStowReserveHrs;
+                            console.log('[OculusDash] IB Total hrs:', ibTotalHrs, '- Case Stow Reserve:', caseStowReserveHrs, '= CPLH hours:', totalHours);
+                        } else {
+                            console.warn('[OculusDash] IB hours: Could not find IB Total row');
+                        }
+                        // Use fallback if IB Total wasn't found
+                        if (totalHours === 0 && fallbackHours > 0) {
+                            totalHours = fallbackHours;
+                            console.log('[OculusDash] IB hours (fallback TOTAL row):', totalHours);
                         }
                     } catch (e) { console.log('[OculusDash] IB hours parse error:', e); }
                     resolve(totalHours);
                 },
-                onerror: () => resolve(0),
-                ontimeout: () => resolve(0),
+                onerror: () => { console.warn('[OculusDash] IB hours fetch error'); resolve(0); },
+                ontimeout: () => { console.warn('[OculusDash] IB hours fetch timeout'); resolve(0); },
                 timeout: 20000
             });
         });
@@ -2825,23 +2895,24 @@
                 // Calculate and display CPLH
                 if (cplhEl && grandTotal > 0 && ibHours > 0) {
                     const ibCplh = (grandTotal / ibHours).toFixed(2);
-                    cplhEl.innerHTML = `CPLH: ${ibCplh} &nbsp;|&nbsp; `;
+                    cplhEl.innerHTML = `<span style="color:#89b4fa;">CPLH: ${ibCplh}</span> &nbsp;|&nbsp; `;
                 }
                 if (grandTotal > 0) {
                     const caseUrl = result ? result.url : '#';
                     const palletUrl = palletResult ? palletResult.url : '#';
                     stowsEl.innerHTML = `<span style="position:relative;display:inline-block;cursor:pointer;" id="oc-cases-hover">
                         <span style="color:#89b4fa;text-decoration:underline dotted;">Total Stows: ${grandTotal.toLocaleString()}</span>
-                        <div id="oc-cases-dropdown" style="display:none;position:absolute;top:100%;left:0;background:#313244;border:1px solid #89b4fa;border-radius:6px;padding:6px 0;z-index:100;white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,0.4);margin-top:4px;">
-                            <a href="${caseUrl}" target="_blank" style="display:block;padding:6px 14px;color:#89b4fa;text-decoration:none;font-size:16px;">📦 Case Transfer In: ${caseTransferIn.toLocaleString()}</a>
-                            <a href="${palletUrl}" target="_blank" style="display:block;padding:6px 14px;color:#89b4fa;text-decoration:none;font-size:16px;">🔲 Pallet Transfer In: ${palletCases.toLocaleString()}</a>
+                        <div id="oc-cases-dropdown" style="display:none;position:absolute;top:100%;left:0;background:#313244;border:1px solid #89b4fa;border-radius:6px;padding:6px 0;z-index:100;white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,0.4);margin-top:0px;">
+                            <a href="${caseUrl}" target="_blank" style="display:block;padding:6px 14px;color:#89b4fa;text-decoration:none;font-size:16px;" onmouseenter="this.style.background='#45475a'" onmouseleave="this.style.background=''">📦 Case Transfer In: ${caseTransferIn.toLocaleString()}</a>
+                            <a href="${palletUrl}" target="_blank" style="display:block;padding:6px 14px;color:#89b4fa;text-decoration:none;font-size:16px;" onmouseenter="this.style.background='#45475a'" onmouseleave="this.style.background=''">🔲 Pallet Transfer In: ${palletCases.toLocaleString()}</a>
                         </div>
                     </span>`;
                     const hoverEl = document.getElementById('oc-cases-hover');
                     const dropdown = document.getElementById('oc-cases-dropdown');
                     if (hoverEl && dropdown) {
-                        hoverEl.onmouseenter = () => dropdown.style.display = 'block';
-                        hoverEl.onmouseleave = () => dropdown.style.display = 'none';
+                        let hideTimeout = null;
+                        hoverEl.onmouseenter = () => { clearTimeout(hideTimeout); dropdown.style.display = 'block'; };
+                        hoverEl.onmouseleave = () => { hideTimeout = setTimeout(() => { dropdown.style.display = 'none'; }, 200); };
                     }
                 } else {
                     stowsEl.textContent = 'Total Stows: —';
