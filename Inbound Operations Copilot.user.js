@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Inbound Operations Copilot
 // @namespace    http://tampermonkey.net/
-// @version      8.5.0
+// @version      8.6.0
 // @description  Adds a formatted summary dashboard to Oculus transship pages with AFT pending cases, items, and case density — VRIDs link to YMS — AI-powered anomaly detection and smart trailer prioritization
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
@@ -1275,8 +1275,8 @@
             const dayStart   = shift.dayStartH * 60 + shift.dayStartM;
             const dayEnd     = shift.dayEndH * 60 + shift.dayEndM;
 
-            // 30-minute grace period after shift ends
-            const grace = 30;
+            // 1-hour grace period after shift ends
+            const grace = 60;
             const dayEndGrace = dayEnd + grace;
             const nightEndGrace = nightEnd + grace;
 
@@ -1364,8 +1364,8 @@
             const dayStart   = shift.dayStartH * 60 + shift.dayStartM;
             const dayEnd     = shift.dayEndH * 60 + shift.dayEndM;
 
-            // 30-minute grace period after shift ends
-            const grace = 30;
+            // 1-hour grace period after shift ends
+            const grace = 60;
             const dayEndGrace = dayEnd + grace;
             const nightEndGrace = nightEnd + grace;
 
@@ -1525,8 +1525,8 @@
             const dayStart   = shift.dayStartH * 60 + shift.dayStartM;
             const dayEnd     = shift.dayEndH * 60 + shift.dayEndM;
 
-            // 30-minute grace period after shift ends
-            const grace = 30;
+            // 1-hour grace period after shift ends
+            const grace = 60;
             const dayEndGrace = dayEnd + grace;
             const nightEndGrace = nightEnd + grace;
 
