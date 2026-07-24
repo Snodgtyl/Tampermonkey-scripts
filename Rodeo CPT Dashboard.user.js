@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rodeo CPT Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      4.0
+// @version      5.0.0
 // @description  Overlays a CPT breakdown dashboard on Rodeo ExSD pages — current shift & next shift (switches 30 min before SOS)
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/RodeoCPTDashboard.user.js
@@ -671,7 +671,7 @@
         });
     }
 
-    // ─── Fetch Total Jobs from FCLM functionRollup (processId=1003021) for CPLH ─
+    // ─── Fetch Total Jobs AND Hours from FCLM functionRollup (processId=1003021) for CPLH ─
     function fetchCPLHJobs(fc, shiftStart, shiftEnd) {
         return new Promise((resolve) => {
             const startDate = `${shiftStart.getFullYear()}/${String(shiftStart.getMonth()+1).padStart(2,'0')}/${String(shiftStart.getDate()).padStart(2,'0')}`;
@@ -691,43 +691,41 @@
                 onload: (resp) => {
                     const text = resp.responseText || '';
                     let totalJobs = 0;
+                    let totalHoursFromFR = 0;
                     try {
                         const doc = new DOMParser().parseFromString(text, 'text/html');
-                        // Find the Total row's Jobs cell: <td class="numeric size-total highlighted">
-                        const rows = doc.querySelectorAll('tr');
-                        for (const row of rows) {
-                            const cells = row.querySelectorAll('td');
-                            if (cells.length >= 3) {
-                                const cellTexts = Array.from(cells).map(c => c.textContent.trim());
-                                if (cellTexts.includes('Total')) {
-                                    // Find the highlighted total cell
-                                    const highlightedCell = row.querySelector('td.size-total.highlighted, td.numeric.size-total');
-                                    if (highlightedCell) {
-                                        totalJobs = parseInt(highlightedCell.textContent.trim().replace(/,/g, ''), 10) || 0;
-                                        if (totalJobs > 0) {
-                                            console.log('[CPLH DEBUG] Found Total Jobs:', totalJobs);
-                                            break;
-                                        }
+                        // Find the tfoot Total row (class="total empl-all")
+                        const totalRow = doc.querySelector('tfoot tr.total.empl-all') || doc.querySelector('tr.total.empl-all');
+                        if (totalRow) {
+                            const numericCells = totalRow.querySelectorAll('td.numeric');
+                            // Layout: [0]=Total Paid Hours, [1]=Jobs, [2]=JPH, [3]=EACH UNIT, ...
+                            if (numericCells.length >= 2) {
+                                totalHoursFromFR = parseFloat(numericCells[0].textContent.trim().replace(/,/g, '')) || 0;
+                                totalJobs = parseInt(numericCells[1].textContent.trim().replace(/,/g, ''), 10) || 0;
+                                console.log('[CPLH DEBUG] functionRollup Total row — Hours:', totalHoursFromFR, 'Jobs:', totalJobs);
+                            }
+                        } else {
+                            console.warn('[CPLH DEBUG] Could not find tfoot tr.total.empl-all row');
+                            // Fallback: find any row with "Total" text
+                            const rows = doc.querySelectorAll('tr');
+                            for (const row of rows) {
+                                const th = row.querySelector('th');
+                                if (th && th.textContent.trim() === 'Total') {
+                                    const numericCells = row.querySelectorAll('td.numeric');
+                                    if (numericCells.length >= 2) {
+                                        totalHoursFromFR = parseFloat(numericCells[0].textContent.trim().replace(/,/g, '')) || 0;
+                                        totalJobs = parseInt(numericCells[1].textContent.trim().replace(/,/g, ''), 10) || 0;
+                                        console.log('[CPLH DEBUG] Fallback Total row — Hours:', totalHoursFromFR, 'Jobs:', totalJobs);
                                     }
-                                    // Fallback: second numeric value in Total row is Jobs
-                                    const nums = [];
-                                    for (let i = 1; i < cellTexts.length; i++) {
-                                        const v = parseFloat(cellTexts[i].replace(/,/g, ''));
-                                        if (!isNaN(v) && v > 0) nums.push(v);
-                                    }
-                                    if (nums.length >= 2) {
-                                        totalJobs = Math.round(nums[1]); // Jobs is second numeric after Hours
-                                        console.log('[CPLH DEBUG] Fallback Total Jobs:', totalJobs);
-                                        break;
-                                    }
+                                    break;
                                 }
                             }
                         }
                     } catch (e) { console.log('[CPLH DEBUG] Jobs parse error:', e); }
-                    resolve(totalJobs);
+                    resolve({ jobs: totalJobs, hours: totalHoursFromFR });
                 },
-                onerror: () => resolve(0),
-                ontimeout: () => resolve(0),
+                onerror: () => resolve({ jobs: 0, hours: 0 }),
+                ontimeout: () => resolve({ jobs: 0, hours: 0 }),
                 timeout: 20000
             });
         });
@@ -738,7 +736,7 @@
         return new Promise((resolve) => {
             const startDate = `${shiftStart.getFullYear()}/${String(shiftStart.getMonth()+1).padStart(2,'0')}/${String(shiftStart.getDate()).padStart(2,'0')}`;
             const endDate = `${shiftEnd.getFullYear()}/${String(shiftEnd.getMonth()+1).padStart(2,'0')}/${String(shiftEnd.getDate()).padStart(2,'0')}`;
-            const startDayDate = endDate; // startDateDay matches the end date
+            const startDayDate = startDate;
             const sH = shiftStart.getHours(), sM = shiftStart.getMinutes();
             const eH = shiftEnd.getHours(), eM = shiftEnd.getMinutes();
             const url = `https://fclm-portal.amazon.com/reports/processPathRollup?reportFormat=HTML` +
@@ -750,7 +748,7 @@
                 `&endDateIntraday=${encodeURIComponent(endDate)}` +
                 `&endHourIntraday=${eH}&endMinuteIntraday=${String(eM).padStart(2,'0')}` +
                 `&_adjustPlanHours=on&_hideEmptyLineItems=on&_rememberViewForWarehouse=on&employmentType=AllEmployees`;
-            console.log('[CPLH DEBUG] Fetching URL:', url);
+            console.log('[CPLH DEBUG] Fetching processPathRollup URL:', url);
 
             GM_xmlhttpRequest({
                 method: 'GET',
@@ -762,29 +760,17 @@
                     let totalHours = 0;
                     try {
                         const doc = new DOMParser().parseFromString(text, 'text/html');
-                        // Find the "Hrs" column index from headers
                         const rows = doc.querySelectorAll('tr');
-                        let hrsColIdx = -1;
+
+                        // Find DA Bldg to Bldg Transfer TOTAL row and get hours from td.actualTimeSeconds
                         for (const row of rows) {
-                            const ths = Array.from(row.querySelectorAll('th'));
-                            const idx = ths.findIndex(th => th.textContent.trim() === 'Hrs');
-                            if (idx >= 0) { hrsColIdx = idx; break; }
-                        }
-                        console.log('[CPLH DEBUG] Hrs column index:', hrsColIdx);
-                        // Find the DA Transfer TOTAL row
-                        for (const row of rows) {
-                            const cells = row.querySelectorAll('td');
-                            if (cells.length >= 2 && cells[0].textContent.trim() === 'TOTAL' &&
-                                cells[1] && cells[1].textContent.includes('DA Bldg to Bldg Transfer TOTAL')) {
-                                if (hrsColIdx >= 0 && cells[hrsColIdx - 1]) {
-                                    const origDiv = cells[hrsColIdx - 1].querySelector('div[class*="original"]');
-                                    totalHours = parseFloat((origDiv || cells[hrsColIdx - 1]).textContent.trim().replace(/,/g, '')) || 0;
-                                } else {
-                                    // Fallback: second origDiv (index 1) is typically Hrs
-                                    const origDivs = row.querySelectorAll('div[class*="original"]');
-                                    if (origDivs.length >= 2) {
-                                        totalHours = parseFloat(origDivs[1].textContent.trim().replace(/,/g, '')) || 0;
-                                    }
+                            if (row.textContent.includes('DA Bldg to Bldg Transfer TOTAL')) {
+                                const hrsCell = row.querySelector('td.actualTimeSeconds');
+                                if (hrsCell) {
+                                    const div = hrsCell.querySelector('div.original');
+                                    const txt = (div ? div.textContent : hrsCell.textContent).trim().replace(/,/g, '');
+                                    const val = parseFloat(txt);
+                                    if (!isNaN(val) && val >= 0) totalHours = val;
                                 }
                                 console.log('[CPLH DEBUG] DA Transfer TOTAL hours:', totalHours);
                                 break;
@@ -1948,7 +1934,7 @@
                     <div class="title" style="margin-bottom:4px;">${daysBacklog ? `<span style="color:#89b4fa;font-size:16px;font-weight:bold;">📊 ${daysBacklog} Days Backlog</span> &nbsp; ` : ''}Rodeo CPT Dashboard — ${fc || ''} <span style="font-size:0.8em;color:#ffffff;font-weight:normal">(Cases)</span></div>
                     <div class="meta">${shiftLabel} &nbsp;|&nbsp; ${fmtDate(now)} &nbsp;|&nbsp; ${fmtTime(shiftStart)}–${fmtTime(shiftEnd)} &nbsp;|&nbsp; Now: <span id="rcd-clock">${fmtTime(now)}</span> &nbsp;|&nbsp; <span id="rcd-cpt-countdown" style="color:#89b4fa;font-weight:bold;"></span> &nbsp;|&nbsp; Last refresh: ${fmtTime(new Date())}${loading ? ' &nbsp;|&nbsp; <span style="color:#89b4fa">⟳ loading...</span>' : ''}</div>
                     <div id="rcd-perf-line" style="margin-top:6px;display:flex;gap:8px;justify-content:center;align-items:center;flex-wrap:wrap;">
-                        <div style="font-size:15px;font-weight:bold;color:#ffffff;padding:5px 12px;background:#1e2233;border:1px solid #3a4060;border-radius:6px;white-space:nowrap;"><span style="color:#888;font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-right:6px;">Performance</span>${(() => { const tp = Object.values(pickerData).reduce((s, v) => s + (v || 0), 0); return tp > 0 ? `<span style="color:#ffffff;">Pickers: ${tp}</span> <span style="color:#555;"> • </span> ` : ''; })()}${cplh ? `<span style="color:#ffffff;">CPLH: ${cplh}</span> <span style="color:#555;"> • </span> ` : ''}${totalPicks > 0 ? `<a href="${fclmUrl}" target="_blank" style="color:#89b4fa;text-decoration:underline dotted;">Total Picks: ${totalPicks.toLocaleString()}</a> <span style="color:#555;"> • </span> ` : ''}${pickRateJPH ? `<a href="${fclmUrl}" target="_blank" style="color:#89b4fa;text-decoration:underline dotted;">Pick Rate: ${pickRateJPH} JPH</a>` : ''}</div>
+                        <div style="font-size:15px;font-weight:bold;color:#ffffff;padding:5px 12px;background:#1e2233;border:1px solid #3a4060;border-radius:6px;white-space:nowrap;"><span style="color:#888;font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-right:6px;">Performance</span>${(() => { const tp = Object.values(pickerData).reduce((s, v) => s + (v || 0), 0); return tp > 0 ? `<span style="color:#89b4fa;">Pickers: ${tp}</span> <span style="color:#555;"> • </span> ` : ''; })()}${cplh ? `<span style="color:#89b4fa;">CPLH: ${cplh}</span> <span style="color:#555;"> • </span> ` : ''}${totalPicks > 0 ? `<a href="${fclmUrl}" target="_blank" style="color:#89b4fa;text-decoration:underline dotted;">Total Picks: ${totalPicks.toLocaleString()}</a> <span style="color:#555;"> • </span> ` : ''}${pickRateJPH ? `<a href="${fclmUrl}" target="_blank" style="color:#89b4fa;text-decoration:underline dotted;">Pick Rate: ${pickRateJPH} JPH</a>` : ''}</div>
                         <div style="font-size:14px;padding:5px 12px;background:#1e2233;border:1px solid #3a4060;border-radius:6px;white-space:nowrap;"><span id="rcd-lc-display" style="color:#C3CAD7;">Learning Curve Mix: ⏳</span></div>
                     </div>
                 </div>
@@ -2066,10 +2052,11 @@
         // Fetch total hours for CPLH in parallel (calculation happens after both resolve)
         let totalHours = 0;
         let cplhJobs = 0;
+        let frHours = 0; // fallback hours from functionRollup
         const cplhPromise = withinPickRateWindow
             ? Promise.all([
                 fetchTotalHours(fc, actualShiftStart, actualShiftEnd).then(hours => { totalHours = hours; }),
-                fetchCPLHJobs(fc, actualShiftStart, actualShiftEnd).then(jobs => { cplhJobs = jobs; })
+                fetchCPLHJobs(fc, actualShiftStart, actualShiftEnd).then(result => { cplhJobs = result.jobs; frHours = result.hours; })
             ])
             : Promise.resolve();
 
@@ -2164,10 +2151,12 @@
         // Wait for everything else to finish
         await Promise.all([...ppFetches, pickerPromise, pickRatePromise, cplhPromise, mpPromise]);
 
-        // Calculate CPLH after both cplhJobs and totalHours are available
-        console.log('[CPLH DEBUG] cplhJobs:', cplhJobs, 'totalHours:', totalHours);
-        if (totalHours > 0 && cplhJobs > 0) {
-            cplh = (cplhJobs / totalHours).toFixed(2);
+        // Calculate CPLH: Jobs (from functionRollup) / DA Bldg to Bldg Transfer TOTAL hours (from processPathRollup)
+        // Use processPathRollup hours if available, otherwise fall back to functionRollup hours
+        const effectiveHours = totalHours > 0 ? totalHours : frHours;
+        console.log('[CPLH DEBUG] cplhJobs:', cplhJobs, 'totalHours (processPath):', totalHours, 'frHours (functionRollup):', frHours, 'effectiveHours:', effectiveHours);
+        if (effectiveHours > 0 && cplhJobs > 0) {
+            cplh = (cplhJobs / effectiveHours).toFixed(2);
             console.log('[CPLH DEBUG] CPLH:', cplh);
         }
 
