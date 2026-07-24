@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Inbound Operations Copilot
 // @namespace    http://tampermonkey.net/
-// @version      8.6.0
+// @version      8.7.0
 // @description  Adds a formatted summary dashboard to Oculus transship pages with AFT pending cases, items, and case density — VRIDs link to YMS — AI-powered anomaly detection and smart trailer prioritization
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
@@ -1444,47 +1444,63 @@
                         let caseStowReserveHrs = 0;
 
                         function extractHrsFromRow(row) {
-                            const cells = row.querySelectorAll('td, th');
-                            // Collect all numeric values from cells
-                            const nums = [];
-                            for (let i = 0; i < cells.length; i++) {
-                                const txt = cells[i].textContent.trim().replace(/,/g, '');
+                            // Primary: use the actualTimeSeconds class which contains the Hrs value
+                            const hrsCell = row.querySelector('td.actualTimeSeconds');
+                            if (hrsCell) {
+                                const div = hrsCell.querySelector('div.original');
+                                const txt = (div ? div.textContent : hrsCell.textContent).trim().replace(/,/g, '');
                                 const val = parseFloat(txt);
-                                if (!isNaN(val)) nums.push({ val, idx: i });
+                                if (!isNaN(val) && val >= 0) return val;
                             }
-                            // Pattern: Vol (large) | Hrs (small-medium) | Rate (large)
-                            // Hrs is typically the smallest positive decimal among the last 3 numeric cells
-                            // Or: find sequence where nums[i] > nums[i+1] < nums[i+2]
-                            for (let i = 0; i < nums.length - 2; i++) {
-                                if (nums[i].val > nums[i+1].val && nums[i+2].val > nums[i+1].val && nums[i+1].val > 0) {
-                                    return nums[i+1].val; // This is Hrs (valley between Vol and Rate)
+                            // Secondary: use Hrs column index if found from headers
+                            if (hrsColIdx >= 0) {
+                                const cells = row.querySelectorAll('td, th');
+                                if (cells.length > hrsColIdx) {
+                                    const cell = cells[hrsColIdx];
+                                    const div = cell.querySelector('div.original');
+                                    const txt = (div ? div.textContent : cell.textContent).trim().replace(/,/g, '');
+                                    const val = parseFloat(txt);
+                                    if (!isNaN(val) && val >= 0) return val;
                                 }
-                            }
-                            // Fallback: second numeric value if first is Vol
-                            if (nums.length >= 3 && nums[0].val > 100 && nums[1].val < nums[0].val && nums[1].val > 0) {
-                                return nums[1].val;
                             }
                             return 0;
                         }
 
+                        // Find IB Total row by ID first
+                        const ibTotalRow = doc.querySelector('tr[id="ppr.detail.inbound.inbound.total"]');
+                        if (ibTotalRow) {
+                            ibTotalHrs = extractHrsFromRow(ibTotalRow);
+                            console.log('[OculusDash] Found IB Total row by ID, hrs:', ibTotalHrs);
+                        }
+
+                        // Find Case Stow to Reserve by text match only (IDs are unreliable for this row)
                         for (const row of rows) {
-                            const rowText = row.textContent;
-                            if (rowText.includes('IB Total') && !rowText.includes('IB Lead')) {
-                                const cells = row.querySelectorAll('td, th');
-                                for (let ci = 0; ci < cells.length; ci++) {
-                                    if (cells[ci].textContent.trim() === 'IB Total') {
-                                        ibTotalHrs = extractHrsFromRow(row);
-                                        break;
-                                    }
+                            const cells = row.querySelectorAll('td, th');
+                            for (let ci = 0; ci < cells.length; ci++) {
+                                const cellText = cells[ci].textContent.trim();
+                                if (cellText === 'Case Stow to Reserve' || cellText === 'Case Stow Reserve') {
+                                    caseStowReserveHrs = extractHrsFromRow(row);
+                                    console.log('[OculusDash] Found Case Stow to Reserve row by text, hrs:', caseStowReserveHrs);
+                                    break;
                                 }
                             }
-                            if (rowText.includes('Case Stow to Reserve')) {
-                                const cells = row.querySelectorAll('td, th');
-                                for (let ci = 0; ci < cells.length; ci++) {
-                                    if (cells[ci].textContent.trim() === 'Case Stow to Reserve') {
-                                        caseStowReserveHrs = extractHrsFromRow(row);
-                                        break;
+                            if (caseStowReserveHrs > 0) break;
+                        }
+
+                        // Fallback: text-based search for IB Total if ID lookup failed
+                        if (ibTotalHrs === 0) {
+                            for (const row of rows) {
+                                const rowText = row.textContent;
+                                if (rowText.includes('IB Total') && !rowText.includes('IB Lead')) {
+                                    const cells = row.querySelectorAll('td, th');
+                                    for (let ci = 0; ci < cells.length; ci++) {
+                                        if (cells[ci].textContent.trim() === 'IB Total') {
+                                            ibTotalHrs = extractHrsFromRow(row);
+                                            console.log('[OculusDash] Found IB Total row by text fallback, hrs:', ibTotalHrs);
+                                            break;
+                                        }
                                     }
+                                    if (ibTotalHrs > 0) break;
                                 }
                             }
                         }
