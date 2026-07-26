@@ -106,11 +106,15 @@ async function fetchPeriod(site,startDate,sched){
 
 async function fetchAllData(config){
     const site=config.site,sched=config.shiftType==='Nights'?config.nights:config.days,{startDate}=getShiftDates(config);
-    setStatus('Fetching Full Shift...');const full=await fetchPeriod(site,startDate,sched.full);
-    setStatus('Fetching P1...');const p1=await fetchPeriod(site,startDate,sched.p1);
-    setStatus('Fetching P2...');const p2=await fetchPeriod(site,startDate,sched.p2);
-    setStatus('Fetching P3...');const p3=await fetchPeriod(site,startDate,sched.p3);
-    setStatus('Fetching Fast Start...');const fastStart=await fetchFastStart(site,config.shiftType);
+    setStatus('Fetching all periods...');
+    // Fetch all periods in parallel for speed
+    const [full,p1,p2,p3,fastStart]=await Promise.all([
+        fetchPeriod(site,startDate,sched.full),
+        fetchPeriod(site,startDate,sched.p1),
+        fetchPeriod(site,startDate,sched.p2),
+        fetchPeriod(site,startDate,sched.p3),
+        fetchFastStart(site,config.shiftType)
+    ]);
     setStatus('\u2713 Updated '+new Date().toLocaleTimeString());
     return{full,p1,p2,p3,fastStart};
 }
