@@ -181,9 +181,19 @@ function processData(raw){
             pctToOP:daPlan>0?(daHrs/daPlan)*100:0};
         m.sort[p]={totalUnits:sort.totalUnits||0,directHours:sort.directHours||0,totalHours:sort.directHours||0,rate:sort.rate||0,headcount:sort.headcount||0,cplh:(sort.directHours||0)>0?sort.totalUnits/sort.directHours:0};
     });
-    // Cumulative
-    if(m.ib.p1&&m.ib.p2){m.ib.p2.totalStow=(m.ib.p1.totalStow||0)+((raw.p2?.stow?.totalUnits||0)+(raw.p2?.palletStow?.palletCases||0));m.ib.p2.stowUnits=(m.ib.p1.stowUnits||0)+(raw.p2?.stow?.totalUnits||0);m.ib.p2.palletUnits=(m.ib.p1.palletUnits||0)+(raw.p2?.palletStow?.totalUnits||0);m.ib.p2.palletCases=(m.ib.p1.palletCases||0)+(raw.p2?.palletStow?.palletCases||0);m.ob.p2.pickUnits=(m.ob.p1.pickUnits||0)+(raw.p2?.pick?.totalUnits||0);m.ob.p2.loadedUnits=(m.ob.p1.loadedUnits||0)+(raw.p2?.obDock?.totalUnits||0);m.sort.p2.totalUnits=(m.sort.p1.totalUnits||0)+(raw.p2?.sort?.totalUnits||0);}
-    if(m.ib.p2&&m.ib.p3){m.ib.p3.totalStow=(m.ib.p2.totalStow||0)+((raw.p3?.stow?.totalUnits||0)+(raw.p3?.palletStow?.palletCases||0));m.ib.p3.stowUnits=(m.ib.p2.stowUnits||0)+(raw.p3?.stow?.totalUnits||0);m.ib.p3.palletUnits=(m.ib.p2.palletUnits||0)+(raw.p3?.palletStow?.totalUnits||0);m.ib.p3.palletCases=(m.ib.p2.palletCases||0)+(raw.p3?.palletStow?.palletCases||0);m.ob.p3.pickUnits=(m.ob.p2.pickUnits||0)+(raw.p3?.pick?.totalUnits||0);m.ob.p3.loadedUnits=(m.ob.p2.loadedUnits||0)+(raw.p3?.obDock?.totalUnits||0);m.sort.p3.totalUnits=(m.sort.p2.totalUnits||0)+(raw.p3?.sort?.totalUnits||0);}
+    // Cumulative — only for totalStow (sync metrics). Everything else stays per-period raw.
+    if(m.ib.p1&&m.ib.p2&&(raw.p2?.stow?.totalUnits>0||raw.p2?.palletStow?.palletCases>0)){
+        m.ib.p2.totalStow=(m.ib.p1.totalStow||0)+((raw.p2?.stow?.totalUnits||0)+(raw.p2?.palletStow?.palletCases||0));
+        m.ob.p2.pickUnits=(m.ob.p1.pickUnits||0)+(raw.p2?.pick?.totalUnits||0);
+        m.ob.p2.loadedUnits=(m.ob.p1.loadedUnits||0)+(raw.p2?.obDock?.totalUnits||0);
+        m.sort.p2.totalUnits=(m.sort.p1.totalUnits||0)+(raw.p2?.sort?.totalUnits||0);
+    }
+    if(m.ib.p2&&m.ib.p3&&(raw.p3?.stow?.totalUnits>0||raw.p3?.palletStow?.palletCases>0||raw.p3?.pick?.totalUnits>0)){
+        m.ib.p3.totalStow=(m.ib.p2.totalStow||0)+((raw.p3?.stow?.totalUnits||0)+(raw.p3?.palletStow?.palletCases||0));
+        m.ob.p3.pickUnits=(m.ob.p2.pickUnits||0)+(raw.p3?.pick?.totalUnits||0);
+        m.ob.p3.loadedUnits=(m.ob.p2.loadedUnits||0)+(raw.p3?.obDock?.totalUnits||0);
+        m.sort.p3.totalUnits=(m.sort.p2.totalUnits||0)+(raw.p3?.sort?.totalUnits||0);
+    }
     return m;
 }
 
@@ -244,9 +254,9 @@ function renderIB(m){
     setEl('ib-thrs-p1',fmt(p1.totalHours,2));setEl('ib-thrs-p2',fmt(p2.totalHours,2));setEl('ib-thrs-p3',fmt(p3.totalHours,2));setEl('ib-thrs-total',fmt(f.totalHours,2));
     setEl('ib-cplh-p1',fmt(p1.cplh,2));setEl('ib-cplh-p2',fmt(p2.cplh,2));setEl('ib-cplh-p3',fmt(p3.cplh,2));setEl('ib-cplh-total',fmt(f.cplh,2));
     setEl('ib-op-p1',fmtPct(p1.pctToOP));setEl('ib-op-p2',fmtPct(p2.pctToOP));setEl('ib-op-p3',fmtPct(p3.pctToOP));const opEl=setEl('ib-op-total',fmtPct(f.pctToOP));setPctClass(opEl,f.pctToOP||0);
-    // Direct HC & Indirect HC
-    setEl('ib-dhc-p1',fmt(p1.directHC,1));setEl('ib-dhc-p2',fmt(p2.directHC,1));setEl('ib-dhc-p3',fmt(p3.directHC,1));setEl('ib-dhc-total',fmt(f.directHC,1));
-    setEl('ib-ihc-p1',fmt(p1.indirectHC,1));setEl('ib-ihc-p2',fmt(p2.indirectHC,1));setEl('ib-ihc-p3',fmt(p3.indirectHC,1));setEl('ib-ihc-total',fmt(f.indirectHC,1));
+    // Direct HC & Indirect HC (no total — HC doesn't sum across periods)
+    setEl('ib-dhc-p1',fmt(p1.directHC,1));setEl('ib-dhc-p2',fmt(p2.directHC,1));setEl('ib-dhc-p3',fmt(p3.directHC,1));setEl('ib-dhc-total','');
+    setEl('ib-ihc-p1',fmt(p1.indirectHC,1));setEl('ib-ihc-p2',fmt(p2.indirectHC,1));setEl('ib-ihc-p3',fmt(p3.indirectHC,1));setEl('ib-ihc-total','');
     setEl('ib-timestamp',new Date().toLocaleString()+' MST');
 }
 function renderOB(m){
@@ -263,8 +273,8 @@ function renderOB(m){
     setEl('ob-thrs-p1',fmt(p1.totalHours,2));setEl('ob-thrs-p2',fmt(p2.totalHours,2));setEl('ob-thrs-p3',fmt(p3.totalHours,2));setEl('ob-thrs-total',fmt(f.totalHours,2));
     setEl('ob-cplh-p1',fmt(p1.cplh,2));setEl('ob-cplh-p2',fmt(p2.cplh,2));setEl('ob-cplh-p3',fmt(p3.cplh,2));setEl('ob-cplh-total',fmt(f.cplh,2));
     setEl('ob-op-p1',fmtPct(p1.pctToOP));setEl('ob-op-p2',fmtPct(p2.pctToOP));setEl('ob-op-p3',fmtPct(p3.pctToOP));const opEl=setEl('ob-op-total',fmtPct(f.pctToOP));setPctClass(opEl,f.pctToOP||0);
-    setEl('ob-dhc-p1',fmt(p1.directHC,1));setEl('ob-dhc-p2',fmt(p2.directHC,1));setEl('ob-dhc-p3',fmt(p3.directHC,1));setEl('ob-dhc-total',fmt(f.directHC,1));
-    setEl('ob-ihc-p1',fmt(p1.indirectHC,1));setEl('ob-ihc-p2',fmt(p2.indirectHC,1));setEl('ob-ihc-p3',fmt(p3.indirectHC,1));setEl('ob-ihc-total',fmt(f.indirectHC,1));
+    setEl('ob-dhc-p1',fmt(p1.directHC,1));setEl('ob-dhc-p2',fmt(p2.directHC,1));setEl('ob-dhc-p3',fmt(p3.directHC,1));setEl('ob-dhc-total','');
+    setEl('ob-ihc-p1',fmt(p1.indirectHC,1));setEl('ob-ihc-p2',fmt(p2.indirectHC,1));setEl('ob-ihc-p3',fmt(p3.indirectHC,1));setEl('ob-ihc-total','');
     setEl('ob-timestamp',new Date().toLocaleString()+' MST');
 }
 function renderSort(m){
@@ -304,6 +314,11 @@ function renderTargets(m){
     if(ibRateT>0&&f.rate){const p=(f.rate/ibRateT)*100;const el=setEl('ib-rate-pct',fmtPct(p));setPctClass(el,p);}
     if(ibCplhT>0&&f.cplh){const p=(f.cplh/ibCplhT)*100;const el=setEl('ib-cplh-pct',fmtPct(p));setPctClass(el,p);}
     if(obG>0){const p=(ob.pickUnits||0)/obG*100;const el=setEl('ob-goal-pct',fmtPct(p));setPctClass(el,p);}
+    // OB Rate % to goal
+    const obRateT=parseFloat(document.getElementById('ob-rate-target')?.value)||0;
+    const obCplhT=parseFloat(document.getElementById('ob-cplh-target')?.value)||0;
+    if(obRateT>0&&ob.pickRate){const p=(ob.pickRate/obRateT)*100;const el=setEl('ob-rate-pct',fmtPct(p));setPctClass(el,p);}
+    if(obCplhT>0&&ob.cplh){const p=(ob.cplh/obCplhT)*100;const el=setEl('ob-cplh-pct',fmtPct(p));setPctClass(el,p);}
     // Summary cards (hero KPI) with pace-based coloring
     // Color logic: compare actual % vs expected % based on time elapsed in shift
     function getPaceColor(actualPct, config){
@@ -324,9 +339,15 @@ function renderTargets(m){
     setEl('sum-stow-goal',ibG>0?fmt(ibG):'—');setEl('sum-stow-rate',f.rate?fmt(f.rate,1):'—');setEl('sum-ib-cplh',f.cplh?fmt(f.cplh,2):'—');
     if(ibG>0&&f.totalStow){const p=(f.totalStow/ibG)*100;const el=setEl('sum-ib-pct',fmtPct(p));const pColor=getPaceColor(p,config);el.classList.remove('pct-good','pct-warn','pct-bad');el.classList.add(pColor==='green'?'pct-good':pColor==='amber'?'pct-warn':'pct-bad');setEl('sum-ib-actual',fmt(f.totalStow));setEl('sum-ib-remaining',fmt(ibG-f.totalStow));
         const bar=document.getElementById('ib-progress-bar');if(bar){bar.style.width=Math.min(p,100)+'%';bar.className='goal-progress-bar '+pColor;}}
+    // Position period markers on IB bar
+    const periods=config.schedType==='4Q'?4:3;
+    const ibM1=document.getElementById('ib-marker-p1');const ibM2=document.getElementById('ib-marker-p2');
+    if(ibM1)ibM1.style.left=(100/periods)+'%';if(ibM2)ibM2.style.left=(200/periods)+'%';
     setEl('sum-pick-goal',obG>0?fmt(obG):'—');setEl('sum-pick-rate',ob.pickRate?fmt(ob.pickRate,1):'—');setEl('sum-ob-cplh',ob.cplh?fmt(ob.cplh,2):'—');
     if(obG>0&&ob.pickUnits){const p=(ob.pickUnits/obG)*100;const el=setEl('sum-ob-pct',fmtPct(p));const pColor=getPaceColor(p,config);el.classList.remove('pct-good','pct-warn','pct-bad');el.classList.add(pColor==='green'?'pct-good':pColor==='amber'?'pct-warn':'pct-bad');setEl('sum-ob-actual',fmt(ob.pickUnits));setEl('sum-ob-remaining',fmt(obG-ob.pickUnits));
         const bar=document.getElementById('ob-progress-bar');if(bar){bar.style.width=Math.min(p,100)+'%';bar.className='goal-progress-bar '+pColor;}}
+    const obM1=document.getElementById('ob-marker-p1');const obM2=document.getElementById('ob-marker-p2');
+    if(obM1)obM1.style.left=(100/periods)+'%';if(obM2)obM2.style.left=(200/periods)+'%';
     setEl('sum-sort-goal',sortG>0?fmt(sortG):'—');setEl('sum-sort-rate',sf.rate?fmt(sf.rate,1):'—');setEl('sum-sort-cplh',sf.cplh?fmt(sf.cplh,2):'—');
     if(sortG>0&&sf.totalUnits){const p=(sf.totalUnits/sortG)*100;const el=setEl('sum-sort-pct',fmtPct(p));const pColor=getPaceColor(p,config);el.classList.remove('pct-good','pct-warn','pct-bad');el.classList.add(pColor==='green'?'pct-good':pColor==='amber'?'pct-warn':'pct-bad');setEl('sum-sort-actual',fmt(sf.totalUnits));setEl('sum-sort-remaining',fmt(sortG-sf.totalUnits));
         const bar=document.getElementById('sort-progress-bar');if(bar){bar.style.width=Math.min(p,100)+'%';bar.className='goal-progress-bar '+pColor;}}
@@ -507,8 +528,8 @@ function buildHTML(){return `
 
 <div class="sync-right">
 <div class="goal-summary-col">
-<div class="goal-card ib-card"><div class="goal-header"><span class="goal-title">Inbound</span><span class="goal-pct" id="sum-ib-pct">\u2014</span></div><div class="goal-progress"><div class="goal-progress-bar green" id="ib-progress-bar" style="width:0%"></div></div><div class="goal-stats"><span>Goal <strong id="sum-stow-goal">\u2014</strong></span><span>Actual <strong id="sum-ib-actual">\u2014</strong></span><span>Remaining <strong id="sum-ib-remaining">\u2014</strong></span></div><div class="goal-stats"><span>\u25B2 <strong id="sum-stow-rate">\u2014</strong> Rate</span><span>\u2713 <strong id="sum-ib-cplh">\u2014</strong> CPLH</span></div><div class="pace-insight" id="ib-pace-insight"></div></div>
-<div class="goal-card ob-card"><div class="goal-header"><span class="goal-title">Outbound</span><span class="goal-pct" id="sum-ob-pct">\u2014</span></div><div class="goal-progress"><div class="goal-progress-bar green" id="ob-progress-bar" style="width:0%"></div></div><div class="goal-stats"><span>Goal <strong id="sum-pick-goal">\u2014</strong></span><span>Actual <strong id="sum-ob-actual">\u2014</strong></span><span>Remaining <strong id="sum-ob-remaining">\u2014</strong></span></div><div class="goal-stats"><span>\u25B2 <strong id="sum-pick-rate">\u2014</strong> Rate</span><span>\u2713 <strong id="sum-ob-cplh">\u2014</strong> CPLH</span></div><div class="pace-insight" id="ob-pace-insight"></div></div>
+<div class="goal-card ib-card"><div class="goal-header"><span class="goal-title">Inbound</span><span class="goal-pct" id="sum-ib-pct">\u2014</span></div><div class="goal-progress" id="ib-progress-wrap"><div class="goal-progress-bar green" id="ib-progress-bar" style="width:0%"></div><div class="period-marker" id="ib-marker-p1" data-label="P1" style="left:33%"></div><div class="period-marker" id="ib-marker-p2" data-label="P2" style="left:66%"></div></div><div class="goal-stats"><span>Goal <strong id="sum-stow-goal">\u2014</strong></span><span>Actual <strong id="sum-ib-actual">\u2014</strong></span><span>Remaining <strong id="sum-ib-remaining">\u2014</strong></span></div><div class="goal-stats"><span>\u25B2 <strong id="sum-stow-rate">\u2014</strong> Rate</span><span>\u2713 <strong id="sum-ib-cplh">\u2014</strong> CPLH</span></div><div class="pace-insight" id="ib-pace-insight"></div></div>
+<div class="goal-card ob-card"><div class="goal-header"><span class="goal-title">Outbound</span><span class="goal-pct" id="sum-ob-pct">\u2014</span></div><div class="goal-progress" id="ob-progress-wrap"><div class="goal-progress-bar green" id="ob-progress-bar" style="width:0%"></div><div class="period-marker" id="ob-marker-p1" data-label="P1" style="left:33%"></div><div class="period-marker" id="ob-marker-p2" data-label="P2" style="left:66%"></div></div><div class="goal-stats"><span>Goal <strong id="sum-pick-goal">\u2014</strong></span><span>Actual <strong id="sum-ob-actual">\u2014</strong></span><span>Remaining <strong id="sum-ob-remaining">\u2014</strong></span></div><div class="goal-stats"><span>\u25B2 <strong id="sum-pick-rate">\u2014</strong> Rate</span><span>\u2713 <strong id="sum-ob-cplh">\u2014</strong> CPLH</span></div><div class="pace-insight" id="ob-pace-insight"></div></div>
 <div class="goal-card sort-card" id="sort-summary-card"><div class="goal-header"><span class="goal-title">Sort</span><span class="goal-pct" id="sum-sort-pct">\u2014</span></div><div class="goal-progress"><div class="goal-progress-bar green" id="sort-progress-bar" style="width:0%"></div></div><div class="goal-stats"><span>Goal <strong id="sum-sort-goal">\u2014</strong></span><span>Actual <strong id="sum-sort-actual">\u2014</strong></span><span>Remaining <strong id="sum-sort-remaining">\u2014</strong></span></div><div class="goal-stats"><span>\u25B2 <strong id="sum-sort-rate">\u2014</strong> Rate</span><span>\u2713 <strong id="sum-sort-cplh">\u2014</strong> CPLH</span></div></div>
 </div>
 <div class="targets-panel"><h3 class="panel-title">Shift Plan Targets</h3>
@@ -524,8 +545,8 @@ function buildHTML(){return `
 <div class="tg-compact"><h4>OUTBOUND</h4><table class="target-table"><thead><tr><th></th><th>Target</th><th>%</th></tr></thead><tbody>
 <tr><td>24 HR BB GOAL</td><td><input type="number" id="ob-bb-goal" class="target-input"></td><td></td></tr>
 <tr><td>DA GOAL</td><td><input type="number" id="ob-goal-input" class="target-input"></td><td><span id="ob-goal-pct">\u2014</span></td></tr>
-<tr><td>PICK RATE</td><td><input type="number" id="ob-rate-target" class="target-input"></td><td></td></tr>
-<tr><td>DA CPLH</td><td><input type="number" id="ob-cplh-target" class="target-input"></td><td></td></tr>
+<tr><td>PICK RATE</td><td><input type="number" id="ob-rate-target" class="target-input"></td><td><span id="ob-rate-pct">\u2014</span></td></tr>
+<tr><td>DA CPLH</td><td><input type="number" id="ob-cplh-target" class="target-input"></td><td><span id="ob-cplh-pct">\u2014</span></td></tr>
 <tr><td>SOS FAST START</td><td><input type="number" id="ob-fast-sos" class="target-input" value="13"></td><td><span id="ob-fast-sos-pct">\u2014</span></td></tr>
 <tr><td>EOL FAST START</td><td><input type="number" id="ob-fast-eol" class="target-input" value="18"></td><td><span id="ob-fast-eol-pct">\u2014</span></td></tr>
 </tbody></table></div>
@@ -623,9 +644,11 @@ function buildCSS(){return `
 .goal-header{display:flex;justify-content:space-between;align-items:center;}
 .goal-title{font-size:11px;font-weight:700;text-transform:uppercase;color:#9aa0a6;}
 .goal-pct{font-size:18px;font-weight:700;}
-.goal-progress{width:100%;height:6px;background:#363b44;border-radius:3px;overflow:hidden;margin:2px 0;}
+.goal-progress{width:100%;height:6px;background:#363b44;border-radius:3px;overflow:visible;margin:2px 0;position:relative;}
 .goal-progress-bar{height:100%;border-radius:3px;transition:width 0.3s;}
 .goal-progress-bar.green{background:#34c759;}.goal-progress-bar.amber{background:#ffcc00;}.goal-progress-bar.red{background:#ff453a;}
+.period-marker{position:absolute;top:-2px;width:2px;height:10px;background:#9aa0a6;border-radius:1px;}
+.period-marker::after{content:attr(data-label);position:absolute;top:-12px;left:-4px;font-size:8px;color:#9aa0a6;}
 .goal-stats{display:flex;gap:12px;font-size:11px;color:#9aa0a6;flex-wrap:wrap;}
 .goal-stats span{white-space:nowrap;}.goal-stats strong{color:#e8eaed;}
 .pace-insight{font-size:10px;color:#9aa0a6;margin-top:4px;padding-top:4px;border-top:1px solid #363b44;line-height:1.4;}
