@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      4.0.0
+// @version      5.0.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
 // @grant        GM_xmlhttpRequest
 // @connect      fc-benchmarking.amazon.com
+// @connect      adapt-iad.amazon.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -64,8 +65,11 @@ function buildPPRUrl(site,sd,sh,sm,ed,eh,em){return`/reports/processPathRollup?r
 function parseFnRollup(html){
     const doc=new DOMParser().parseFromString(html,'text/html');
     const tr=doc.querySelector('tfoot tr.total.empl-all')||doc.querySelector('tr.total.empl-all')||doc.querySelector('tfoot tr.total')||doc.querySelector('tfoot tr');
-    let units=0,hours=0,rate=0,hc=0;
-    if(tr){const cells=tr.querySelectorAll('td.numeric');if(cells.length>=3){hours=parseFloat(cells[0].textContent.replace(/,/g,''))||0;units=parseInt(cells[1].textContent.replace(/,/g,''),10)||0;rate=parseFloat(cells[2].textContent.replace(/,/g,''))||0;}}
+    let units=0,hours=0,rate=0,hc=0,eachUnits=0,caseUnits=0;
+    if(tr){const cells=tr.querySelectorAll('td.numeric');if(cells.length>=3){hours=parseFloat(cells[0].textContent.replace(/,/g,''))||0;units=parseInt(cells[1].textContent.replace(/,/g,''),10)||0;rate=parseFloat(cells[2].textContent.replace(/,/g,''))||0;}
+    // EACH UNIT is index 3, CASE UNIT is index 5 (if present)
+    if(cells.length>=4){eachUnits=parseInt(cells[3].textContent.replace(/,/g,''),10)||0;}
+    if(cells.length>=6){caseUnits=parseInt(cells[5].textContent.replace(/,/g,''),10)||0;}}
     const links=doc.querySelectorAll('a[href*="employeeId="]');const ids=new Set();links.forEach(l=>{const m=l.href.match(/employeeId=([^&]+)/);if(m)ids.add(m[1]);});hc=ids.size;
     // For palletStow: get CASE_UNIT from "Pallet Transfer In" Total row (6th numeric = index 5)
     let palletCases=0;
@@ -75,7 +79,7 @@ function parseFnRollup(html){
         if(foundPTI){const cellTexts=Array.from(row.querySelectorAll('td')).map(c=>c.textContent.trim());
             if(cellTexts.includes('Total')){const nums=[];cellTexts.forEach(c=>{const v=parseFloat(c.replace(/,/g,''));if(!isNaN(v))nums.push(v);});if(nums.length>=6)palletCases=Math.round(nums[5]);break;}}
     }
-    return{totalUnits:units,directHours:hours,rate,headcount:hc,palletCases};
+    return{totalUnits:units,directHours:hours,rate,headcount:hc,palletCases,eachUnits,caseUnits};
 }
 
 function parsePPR(html){
@@ -92,7 +96,11 @@ function parsePPR(html){
     // OB Total
     const obCB=doc.querySelector('input[value*="outbound.outbound.total"]')||doc.querySelector('input[value*="outbound.total"]');
     if(obCB){const row=obCB.closest('tr');if(row){const cells=row.querySelectorAll('td');const nums=[];cells.forEach(c=>{const t=c.textContent.trim().replace(/,/g,'');const v=parseFloat(t);if(!isNaN(v)&&t!=='')nums.push(v);});if(nums.length>=2)obAct=nums[1];if(nums.length>=7&&nums[6]>0)obPlan=obAct/(nums[6]/100);else if(nums.length>=10)obPlan=nums[9];}}
-    return{ibPlannedHrs:ibPlan,ibActualHrs:ibAct,obPlannedHrs:obPlan,obActualHrs:obAct,daTransferHrs,daTransferPlan,caseStowReserveHrs};
+    // THROUGHPUT row from FC Summary
+    let throughputVol=0,throughputHrs=0;
+    const tpRow=doc.querySelector('tr#ppr\\.fcSummary\\.throughput')||doc.querySelector('tr[id*="fcSummary.throughput"]');
+    if(tpRow){const cells=tpRow.querySelectorAll('td');cells.forEach(c=>{const cls=c.className;const div=c.querySelector('div.original');const txt=(div?div.textContent:c.textContent).trim().replace(/,/g,'');const v=parseFloat(txt);if(cls.includes('actualVolume')&&!isNaN(v))throughputVol=v;if(cls.includes('actualTimeSeconds')&&!isNaN(v))throughputHrs=v;});}
+    return{ibPlannedHrs:ibPlan,ibActualHrs:ibAct,obPlannedHrs:obPlan,obActualHrs:obAct,daTransferHrs,daTransferPlan,caseStowReserveHrs,throughputVol,throughputHrs};
 }
 
 async function fetchPeriod(site,startDate,sched){
@@ -100,7 +108,7 @@ async function fetchPeriod(site,startDate,sched){
     let eDate=new Date(startDate);if(eh<sh)eDate.setDate(eDate.getDate()+1);
     const urls={ppr:buildPPRUrl(site,startDate,sh,sm,eDate,eh,em),stow:buildFnUrl(site,PROCESS_IDS.stow,startDate,sh,sm,eDate,eh,em),palletStow:buildFnUrl(site,PROCESS_IDS.palletStow,startDate,sh,sm,eDate,eh,em),pick:buildFnUrl(site,PROCESS_IDS.pick,startDate,sh,sm,eDate,eh,em),sort:buildFnUrl(site,PROCESS_IDS.sort,startDate,sh,sm,eDate,eh,em),obDock:buildFnUrl(site,PROCESS_IDS.obDock,startDate,sh,sm,eDate,eh,em)};
     const res={};
-    await Promise.all(Object.entries(urls).map(async([k,u])=>{try{const h=await fetchHTML(u);res[k]=k==='ppr'?parsePPR(h):parseFnRollup(h);}catch(e){console.warn('[SB]',k,e.message);res[k]=k==='ppr'?{ibPlannedHrs:0,ibActualHrs:0,obPlannedHrs:0,obActualHrs:0,daTransferHrs:0,daTransferPlan:0}:{totalUnits:0,directHours:0,rate:0,headcount:0};}}));
+    await Promise.all(Object.entries(urls).map(async([k,u])=>{try{const h=await fetchHTML(u);res[k]=k==='ppr'?parsePPR(h):parseFnRollup(h);}catch(e){console.warn('[SB]',k,e.message);res[k]=k==='ppr'?{ibPlannedHrs:0,ibActualHrs:0,obPlannedHrs:0,obActualHrs:0,daTransferHrs:0,daTransferPlan:0,caseStowReserveHrs:0,throughputVol:0,throughputHrs:0}:{totalUnits:0,directHours:0,rate:0,headcount:0};}}));
     return res;
 }
 
@@ -133,6 +141,114 @@ function fetchFastStart(site,shiftType){
             onerror:function(){resolve({ibSOS:0,ibEOL:0,obSOS:0,obEOL:0});}
         });
     });
+}
+
+// === LEARNING CURVE from FCLM iframe (reads live DOM with LC + JPH) ===
+function fetchLearningCurve(site,processId,displayElId){
+    const config=loadConfig();
+    const sched=config.shiftType==='Nights'?config.nights:config.days;
+    const {startDate}=getShiftDates(config);
+    const fmtD=(d)=>`${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')}`;
+    const sh=sched.full.sh,sm=sched.full.sm,eh=sched.full.eh,em=sched.full.em;
+    let eDate=new Date(startDate);if(eh<sh)eDate.setDate(eDate.getDate()+1);
+    const url=`/reports/functionRollup?reportFormat=HTML&warehouseId=${site}&processId=${processId}&maxIntradayDays=1&spanType=Intraday&startDateIntraday=${encodeURIComponent(fmtD(startDate))}&startHourIntraday=${sh}&startMinuteIntraday=${sm}&endDateIntraday=${encodeURIComponent(fmtD(eDate))}&endHourIntraday=${eh}&endMinuteIntraday=${em}`;
+
+    // Load in hidden iframe so FCLM JS renders the detail rows
+    const iframe=document.createElement('iframe');
+    iframe.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
+    iframe.src=url;
+    document.body.appendChild(iframe);
+
+    let attempts=0;const maxAttempts=30; // 15 seconds max
+    const checkInterval=setInterval(()=>{
+        attempts++;
+        try{
+            const iDoc=iframe.contentDocument||iframe.contentWindow.document;
+            const rows=iDoc.querySelectorAll('tr[class*="empl-"]');
+            // Wait for employee rows with "Level" text to appear
+            let hasLC=false;
+            if(rows.length>5){for(const r of rows){if(r.textContent.includes('Level')){hasLC=true;break;}}}
+            if(hasLC||attempts>=maxAttempts){
+                clearInterval(checkInterval);
+                if(hasLC){
+                    const lcCounts={1:0,2:0,3:0,4:0,5:0,unknown:0};
+                    const lcRates={1:[],2:[],3:[],4:[],5:[],unknown:[]};
+                    rows.forEach(row=>{
+                        let lcLevel=0,jph=0;
+                        const cells=row.querySelectorAll('td');
+                        cells.forEach(cell=>{const m=cell.textContent.trim().match(/^Level\s*(\d)$/i);if(m)lcLevel=parseInt(m[1]);});
+                        if(lcLevel<1||lcLevel>5)return;
+                        // JPH = last cell value that's a reasonable rate (1-300)
+                        const allC=Array.from(cells);
+                        for(let i=allC.length-1;i>=0;i--){
+                            const v=parseFloat(allC[i].textContent.trim().replace(/,/g,''));
+                            if(!isNaN(v)&&v>=1&&v<=300){jph=v;break;}
+                        }
+                        lcCounts[lcLevel]++;
+                        if(jph>0)lcRates[lcLevel].push(jph);
+                    });
+                    console.log('[SB-LC] iframe parse success! counts=',JSON.stringify(lcCounts),'rate lens=',Object.keys(lcRates).map(k=>k+':'+lcRates[k].length).join(','));
+                    updateLCDisplay(displayElId,lcCounts,lcRates);
+                } else {
+                    console.log('[SB-LC] iframe timeout, falling back to ADAPT...');
+                    // Fallback: get employee IDs from iframe and use ADAPT for percentages
+                    const iDoc2=iframe.contentDocument||iframe.contentWindow.document;
+                    const text=iDoc2.body?iDoc2.body.innerHTML:'';
+                    const empMatches=text.match(/employeeId=(\d+)/g);
+                    const eidSet=new Set();
+                    if(empMatches)empMatches.forEach(m=>{const id=m.replace('employeeId=','');if(id.length>=5)eidSet.add(id);});
+                    const eidList=Array.from(eidSet);
+                    if(eidList.length>0)fetchLCFromAdapt(site,eidList,processId,displayElId);
+                    else updateLCDisplay(displayElId,null,null);
+                }
+                // Cleanup iframe
+                setTimeout(()=>{if(iframe.parentNode)iframe.parentNode.removeChild(iframe);},1000);
+            }
+        }catch(e){
+            // Cross-origin or load error
+            if(attempts>=maxAttempts){clearInterval(checkInterval);setTimeout(()=>{if(iframe.parentNode)iframe.parentNode.removeChild(iframe);},1000);updateLCDisplay(displayElId,null,null);}
+        }
+    },500);
+}
+function fetchLCFromAdapt(site,eidList,processId,displayElId){
+    const now=new Date();const endIso=now.toISOString();
+    const batchStart=new Date(now.getTime()-7*24*60*60*1000).toISOString();
+    const BATCH_SIZE=50;const batches=[];
+    for(let i=0;i<eidList.length;i+=BATCH_SIZE)batches.push(eidList.slice(i,i+BATCH_SIZE));
+    const lcCounts={1:0,2:0,3:0,4:0,5:0,unknown:0};
+    const lcRates={1:[],2:[],3:[],4:[],5:[],unknown:[]};
+    let done=0;const seen=new Set();
+    const fnKeywords=processId==='1003035'?['case transfer in','pallet transfer','stow','inbound']:['pick','outbound','each pick','case pick'];
+    batches.forEach(batch=>{
+        const eidParam=encodeURIComponent(JSON.stringify(batch));
+        const url=`https://adapt-iad.amazon.com/api/femida-svc/GetBatchEmployeePerformanceMetrics?warehouseId=${encodeURIComponent(site)}&employeeIds=${eidParam}&startTime=${encodeURIComponent(batchStart)}&endTime=${encodeURIComponent(endIso)}&performanceMetricType=ProcessPathRollupHourly`;
+        GM_xmlhttpRequest({method:'GET',url,timeout:30000,
+            onload:function(br){try{const d=JSON.parse(br.responseText);if(d&&d.batchPerformanceMetrics){Object.keys(d.batchPerformanceMetrics).forEach(eid=>{const metrics=d.batchPerformanceMetrics[eid];if(!Array.isArray(metrics))return;let bestLevel=0,isMatch=false,totalUnits=0,totalHrs=0;metrics.forEach(m=>{const attrs=m&&m.performanceMetricAttributes;if(!attrs)return;let fn='';try{const pa=typeof attrs.processAttributes==='string'?JSON.parse(attrs.processAttributes):attrs.processAttributes;fn=((pa&&pa.FUNCTION_NAME)||'').toLowerCase();}catch(e){}if(fnKeywords.some(k=>fn.includes(k))){isMatch=true;const lcStr=attrs.learningCurveId||'';const lvl=parseInt((lcStr.match(/\d/)||['0'])[0])||0;if(lvl>bestLevel)bestLevel=lvl;const u=parseFloat(attrs.totalUnitsProcessed||attrs.units||attrs.totalUnits||attrs.jobCount||0)||0;const h=parseFloat(attrs.totalHoursWorked||attrs.hours||attrs.totalPaidHours||attrs.paidHours||0)||0;const r=parseFloat(attrs.rate||attrs.uph||attrs.jph||attrs.throughput||0)||0;totalUnits+=u;totalHrs+=h;if(r>0&&totalUnits===0)totalUnits=r;}});if(isMatch&&!seen.has(eid)){seen.add(eid);const lvlKey=bestLevel>=1&&bestLevel<=5?bestLevel:'unknown';lcCounts[lvlKey]++;if(totalHrs>0&&totalHrs<200)lcRates[lvlKey].push(totalUnits/totalHrs);else if(totalUnits>0&&totalUnits<=300)lcRates[lvlKey].push(totalUnits);}});}}catch(e){console.warn('[SB-LC] ADAPT parse error:',e);}done++;if(done===batches.length){console.log('[SB-LC] ADAPT done. counts=',JSON.stringify(lcCounts),'rate lens=',Object.keys(lcRates).map(k=>k+':'+lcRates[k].length).join(','));if(lcRates[5].length>0)console.log('[SB-LC] LC5 sample rates:',lcRates[5].slice(0,5));updateLCDisplay(displayElId,lcCounts,lcRates);}},
+            onerror:function(){done++;if(done===batches.length)updateLCDisplay(displayElId,lcCounts,lcRates);},
+            ontimeout:function(){done++;if(done===batches.length)updateLCDisplay(displayElId,lcCounts,lcRates);}
+        });
+    });
+}
+function updateLCDisplay(elId,lcCounts,lcRates){
+    const el=document.getElementById(elId);if(!el)return;
+    // Save LC data to localStorage for per-period retention
+    try{const key='sb_lc_'+elId;localStorage.setItem(key,JSON.stringify({counts:lcCounts,rates:lcRates,ts:Date.now()}));}catch(e){}
+    if(!lcCounts){
+        // Try loading from localStorage cache
+        try{const cached=JSON.parse(localStorage.getItem('sb_lc_'+elId));if(cached&&cached.counts){lcCounts=cached.counts;lcRates=cached.rates;}}catch(e){}
+        if(!lcCounts){el.innerHTML='<span style="color:#5B6B7A;">Learning Curve Mix: \u2014</span>';return;}
+    }
+    const total=lcCounts[1]+lcCounts[2]+lcCounts[3]+lcCounts[4]+lcCounts[5]+(lcCounts.unknown||0);
+    if(total===0){el.innerHTML='<span style="color:#5B6B7A;">Learning Curve Mix: No data</span>';return;}
+    const pct=(n)=>Math.round((n/total)*100);
+    const avgRate=(lvl)=>{const rates=(lcRates&&lcRates[lvl])||[];if(rates.length===0)return'';const avg=rates.reduce((a,b)=>a+b,0)/rates.length;if(avg>300||avg<1)return'';return` (${Math.round(avg)} UPH)`;};
+    const parts=[];
+    if(lcCounts[5]>0)parts.push(`<span style="color:#27AE60;font-weight:bold;">LC5 ${pct(lcCounts[5])}%${avgRate(5)}</span>`);
+    if(lcCounts[4]>0)parts.push(`<span style="color:#5B6B7A;font-weight:bold;">LC4 ${pct(lcCounts[4])}%${avgRate(4)}</span>`);
+    if(lcCounts[3]>0)parts.push(`<span style="color:#eab308;">LC3 ${pct(lcCounts[3])}%${avgRate(3)}</span>`);
+    const l12=lcCounts[1]+lcCounts[2];
+    if(l12>0){const r12=[...(lcRates[1]||[]),...(lcRates[2]||[])];let avg12='';if(r12.length>0){const a=r12.reduce((x,y)=>x+y,0)/r12.length;if(a<=300&&a>=1)avg12=` (${Math.round(a)} UPH)`;}parts.push(`<span style="color:#F2994A;font-weight:bold;">LC1-2 ${pct(l12)}%${avg12}</span>`);}
+    el.innerHTML=`<span style="color:#5B6B7A;font-weight:600;">Learning Curve Mix</span> &nbsp; ${parts.join(' <span style="color:#555;">\u2022</span> ')}`;
 }
 
 // === DATA PROCESSING (cumulative) ===
@@ -189,10 +305,10 @@ function processData(raw){
         m.sort.p2.totalUnits=(m.sort.p1.totalUnits||0)+(raw.p2?.sort?.totalUnits||0);
     }
     if(m.ib.p2&&m.ib.p3&&(raw.p3?.stow?.totalUnits>0||raw.p3?.palletStow?.palletCases>0||raw.p3?.pick?.totalUnits>0)){
-        m.ib.p3.totalStow=(m.ib.p2.totalStow||0)+((raw.p3?.stow?.totalUnits||0)+(raw.p3?.palletStow?.palletCases||0));
-        m.ob.p3.pickUnits=(m.ob.p2.pickUnits||0)+(raw.p3?.pick?.totalUnits||0);
-        m.ob.p3.loadedUnits=(m.ob.p2.loadedUnits||0)+(raw.p3?.obDock?.totalUnits||0);
-        m.sort.p3.totalUnits=(m.sort.p2.totalUnits||0)+(raw.p3?.sort?.totalUnits||0);
+        m.ib.p3.totalStow=m.ib.full?.totalStow||(m.ib.p2.totalStow||0)+((raw.p3?.stow?.totalUnits||0)+(raw.p3?.palletStow?.palletCases||0));
+        m.ob.p3.pickUnits=m.ob.full?.pickUnits||(m.ob.p2.pickUnits||0)+(raw.p3?.pick?.totalUnits||0);
+        m.ob.p3.loadedUnits=m.ob.full?.loadedUnits||(m.ob.p2.loadedUnits||0)+(raw.p3?.obDock?.totalUnits||0);
+        m.sort.p3.totalUnits=m.sort.full?.totalUnits||(m.sort.p2.totalUnits||0)+(raw.p3?.sort?.totalUnits||0);
     }
     return m;
 }
@@ -230,10 +346,10 @@ function blankFuturePeriods(config){
     const keys=['p1','p2','p3'];
     keys.forEach((pk,idx)=>{
         if(!hasPeriodStarted(periods[idx],config)){
-            const prefixes=['ib-sync-','ib-stow-','ib-cases-','ib-pallets-','ib-cti-','ib-rate-','ib-dhrs-','ib-dpct-','ib-ihrs-','ib-ipct-','ib-thrs-','ib-cplh-','ib-op-','ib-dhc-','ib-ihc-',
-                'ob-sync-','ob-pick-','ob-cases-','ob-rate-','ob-loadp-','ob-dhrs-','ob-dpct-','ob-ihrs-','ob-ipct-','ob-thrs-','ob-cplh-','ob-op-','ob-dhc-','ob-ihc-',
+            const prefixes=['ib-sync-','ib-stow-','ib-cases-','ib-pallets-','ib-cti-','ib-rate-','ib-dhrs-','ib-dpct-','ib-ihrs-','ib-ipct-','ib-thrs-','ib-cplh-','ib-op-',
+                'ob-sync-','ob-pick-','ob-cases-','ob-rate-','ob-loadp-','ob-dhrs-','ob-dpct-','ob-ihrs-','ob-ipct-','ob-thrs-','ob-cplh-','ob-op-',
                 'sort-total-','sort-units-','sort-rate-','sort-dhrs-','sort-cplh-'];
-            prefixes.forEach(pre=>{const el=document.getElementById(pre+pk);if(el)el.textContent='';});
+            prefixes.forEach(pre=>{const el=document.getElementById(pre+pk);if(el){el.textContent='';el.style.background='';}});
         }
     });
 }
@@ -242,29 +358,48 @@ function blankFuturePeriods(config){
 function renderIB(m){
     const p1=m.ib.p1||{},p2=m.ib.p2||{},p3=m.ib.p3||{},f=m.ib.full||{};
     setEl('ib-sync-p1',fmt(p1.totalStow));setEl('ib-sync-p2',fmt(p2.totalStow));setEl('ib-sync-p3',fmt(p3.totalStow));setEl('ib-sync-total',fmt(f.totalStow));
-    setEl('ib-stow-p1',fmt(p1.totalStow));setEl('ib-stow-p2',fmt(p2.totalStow));setEl('ib-stow-p3',fmt(p3.totalStow));setEl('ib-stow-total',fmt(f.totalStow));
+    // Conditional format sync metrics cells vs targets
+    const ibG=parseFloat(document.getElementById('ib-goal-input')?.value)||0;
+    if(ibG>0){const periods=loadConfig().schedType==='4Q'?4:3;
+        [['ib-sync-p1',p1.totalStow,ibG/periods],['ib-sync-p2',p2.totalStow,ibG/periods*2],['ib-sync-p3',p3.totalStow,ibG],['ib-sync-total',f.totalStow,ibG]].forEach(([id,act,tgt])=>{
+            const el=document.getElementById(id);if(!el)return;if(!act||act<=0){el.style.background='';return;}el.style.background=act>=tgt?'rgba(52,211,153,0.15)':act>=tgt*0.95?'rgba(251,191,36,0.1)':'rgba(220,38,38,0.12)';});
+    }
     setEl('ib-cases-p1',fmt(p1.stowUnits));setEl('ib-cases-p2',fmt(p2.stowUnits));setEl('ib-cases-p3',fmt(p3.stowUnits));setEl('ib-cases-total',fmt(f.stowUnits));
     setEl('ib-pallets-p1',fmt(p1.palletUnits||0));setEl('ib-pallets-p2',fmt(p2.palletUnits||0));setEl('ib-pallets-p3',fmt(p3.palletUnits||0));setEl('ib-pallets-total',fmt(f.palletUnits||0));
     setEl('ib-cti-p1',fmt(p1.totalStow));setEl('ib-cti-p2',fmt(p2.totalStow));setEl('ib-cti-p3',fmt(p3.totalStow));setEl('ib-cti-total',fmt(f.totalStow));
     setEl('ib-rate-p1',fmt(p1.rate,1));setEl('ib-rate-p2',fmt(p2.rate,1));setEl('ib-rate-p3',fmt(p3.rate,1));setEl('ib-rate-total',fmt(f.rate,1));
+    // Conditional format rate cells vs target
+    const ibRateT=parseFloat(document.getElementById('ib-rate-target')?.value)||0;
+    if(ibRateT>0){['ib-rate-p1','ib-rate-p2','ib-rate-p3','ib-rate-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';return;}if(v>=ibRateT)el.style.background='rgba(52,211,153,0.15)';else if(v>=ibRateT*0.95)el.style.background='rgba(251,191,36,0.1)';else el.style.background='rgba(220,38,38,0.12)';});}
     setEl('ib-dhrs-p1',fmt(p1.directHours,2));setEl('ib-dhrs-p2',fmt(p2.directHours,2));setEl('ib-dhrs-p3',fmt(p3.directHours,2));setEl('ib-dhrs-total',fmt(f.directHours,2));
     setEl('ib-dpct-p1',fmtPct(p1.directPct));setEl('ib-dpct-p2',fmtPct(p2.directPct));setEl('ib-dpct-p3',fmtPct(p3.directPct));setEl('ib-dpct-total',fmtPct(f.directPct));
     setEl('ib-ihrs-p1',fmt(p1.indirectHours,2));setEl('ib-ihrs-p2',fmt(p2.indirectHours,2));setEl('ib-ihrs-p3',fmt(p3.indirectHours,2));setEl('ib-ihrs-total',fmt(f.indirectHours,2));
     setEl('ib-ipct-p1',fmtPct(p1.indirectPct));setEl('ib-ipct-p2',fmtPct(p2.indirectPct));setEl('ib-ipct-p3',fmtPct(p3.indirectPct));setEl('ib-ipct-total',fmtPct(f.indirectPct));
     setEl('ib-thrs-p1',fmt(p1.totalHours,2));setEl('ib-thrs-p2',fmt(p2.totalHours,2));setEl('ib-thrs-p3',fmt(p3.totalHours,2));setEl('ib-thrs-total',fmt(f.totalHours,2));
     setEl('ib-cplh-p1',fmt(p1.cplh,2));setEl('ib-cplh-p2',fmt(p2.cplh,2));setEl('ib-cplh-p3',fmt(p3.cplh,2));setEl('ib-cplh-total',fmt(f.cplh,2));
+    // Conditional format CPLH cells vs target
+    const ibCT=parseFloat(document.getElementById('ib-cplh-target')?.value)||0;
+    if(ibCT>0){['ib-cplh-p1','ib-cplh-p2','ib-cplh-p3','ib-cplh-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';return;}if(v>=ibCT)el.style.background='rgba(46,125,50,0.12)';else if(v>=ibCT*0.9)el.style.background='rgba(230,81,0,0.1)';else el.style.background='rgba(198,40,40,0.1)';});}
     setEl('ib-op-p1',fmtPct(p1.pctToOP));setEl('ib-op-p2',fmtPct(p2.pctToOP));setEl('ib-op-p3',fmtPct(p3.pctToOP));const opEl=setEl('ib-op-total',fmtPct(f.pctToOP));setPctClass(opEl,f.pctToOP||0);
-    // Direct HC & Indirect HC (no total — HC doesn't sum across periods)
-    setEl('ib-dhc-p1',fmt(p1.directHC,1));setEl('ib-dhc-p2',fmt(p2.directHC,1));setEl('ib-dhc-p3',fmt(p3.directHC,1));setEl('ib-dhc-total','');
-    setEl('ib-ihc-p1',fmt(p1.indirectHC,1));setEl('ib-ihc-p2',fmt(p2.indirectHC,1));setEl('ib-ihc-p3',fmt(p3.indirectHC,1));setEl('ib-ihc-total','');
+    // Conditional format % to OP cells
+    ['ib-op-p1','ib-op-p2','ib-op-p3','ib-op-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const txt=el.textContent;const v=parseFloat(txt)||0;if(v<=0){el.style.background='';return;}if(v>=100)el.style.background='rgba(52,211,153,0.15)';else if(v>=95)el.style.background='rgba(251,191,36,0.1)';else el.style.background='rgba(220,38,38,0.12)';});
     setEl('ib-timestamp',new Date().toLocaleString()+' MST');
 }
 function renderOB(m){
     const p1=m.ob.p1||{},p2=m.ob.p2||{},p3=m.ob.p3||{},f=m.ob.full||{};
     setEl('ob-sync-p1',fmt(p1.pickUnits));setEl('ob-sync-p2',fmt(p2.pickUnits));setEl('ob-sync-p3',fmt(p3.pickUnits));setEl('ob-sync-total',fmt(f.pickUnits));
+    // Conditional format OB sync metrics cells vs targets
+    const obG=parseFloat(document.getElementById('ob-goal-input')?.value)||0;
+    if(obG>0){const periods=loadConfig().schedType==='4Q'?4:3;
+        [['ob-sync-p1',p1.pickUnits,obG/periods],['ob-sync-p2',p2.pickUnits,obG/periods*2],['ob-sync-p3',p3.pickUnits,obG],['ob-sync-total',f.pickUnits,obG]].forEach(([id,act,tgt])=>{
+            const el=document.getElementById(id);if(!el)return;if(!act||act<=0){el.style.background='';return;}el.style.background=act>=tgt?'rgba(52,211,153,0.15)':act>=tgt*0.95?'rgba(251,191,36,0.1)':'rgba(220,38,38,0.12)';});
+    }
     setEl('ob-pick-p1',fmt(p1.pickUnits));setEl('ob-pick-p2',fmt(p2.pickUnits));setEl('ob-pick-p3',fmt(p3.pickUnits));setEl('ob-pick-total',fmt(f.pickUnits));
     setEl('ob-cases-p1',fmt(p1.pickUnits));setEl('ob-cases-p2',fmt(p2.pickUnits));setEl('ob-cases-p3',fmt(p3.pickUnits));setEl('ob-cases-total',fmt(f.pickUnits));
     setEl('ob-rate-p1',fmt(p1.pickRate,1));setEl('ob-rate-p2',fmt(p2.pickRate,1));setEl('ob-rate-p3',fmt(p3.pickRate,1));setEl('ob-rate-total',fmt(f.pickRate,1));
+    // Conditional format OB rate cells
+    const obRT=parseFloat(document.getElementById('ob-rate-target')?.value)||0;
+    if(obRT>0){['ob-rate-p1','ob-rate-p2','ob-rate-p3','ob-rate-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';return;}if(v>=obRT)el.style.background='rgba(52,211,153,0.15)';else if(v>=obRT*0.95)el.style.background='rgba(251,191,36,0.1)';else el.style.background='rgba(220,38,38,0.12)';});}
     setEl('ob-loadp-p1',fmt(p1.loadedUnits));setEl('ob-loadp-p2',fmt(p2.loadedUnits));setEl('ob-loadp-p3',fmt(p3.loadedUnits));setEl('ob-loadp-total',fmt(f.loadedUnits));
     setEl('ob-dhrs-p1',fmt(p1.directHours,2));setEl('ob-dhrs-p2',fmt(p2.directHours,2));setEl('ob-dhrs-p3',fmt(p3.directHours,2));setEl('ob-dhrs-total',fmt(f.directHours,2));
     setEl('ob-dpct-p1',fmtPct(p1.directPct));setEl('ob-dpct-p2',fmtPct(p2.directPct));setEl('ob-dpct-p3',fmtPct(p3.directPct));setEl('ob-dpct-total',fmtPct(f.directPct));
@@ -272,9 +407,12 @@ function renderOB(m){
     setEl('ob-ipct-p1',fmtPct(p1.indirectPct));setEl('ob-ipct-p2',fmtPct(p2.indirectPct));setEl('ob-ipct-p3',fmtPct(p3.indirectPct));setEl('ob-ipct-total',fmtPct(f.indirectPct));
     setEl('ob-thrs-p1',fmt(p1.totalHours,2));setEl('ob-thrs-p2',fmt(p2.totalHours,2));setEl('ob-thrs-p3',fmt(p3.totalHours,2));setEl('ob-thrs-total',fmt(f.totalHours,2));
     setEl('ob-cplh-p1',fmt(p1.cplh,2));setEl('ob-cplh-p2',fmt(p2.cplh,2));setEl('ob-cplh-p3',fmt(p3.cplh,2));setEl('ob-cplh-total',fmt(f.cplh,2));
+    // Conditional format OB CPLH cells vs target
+    const obCT=parseFloat(document.getElementById('ob-cplh-target')?.value)||0;
+    if(obCT>0){['ob-cplh-p1','ob-cplh-p2','ob-cplh-p3','ob-cplh-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';return;}if(v>=obCT)el.style.background='rgba(46,125,50,0.12)';else if(v>=obCT*0.9)el.style.background='rgba(230,81,0,0.1)';else el.style.background='rgba(198,40,40,0.1)';});}
     setEl('ob-op-p1',fmtPct(p1.pctToOP));setEl('ob-op-p2',fmtPct(p2.pctToOP));setEl('ob-op-p3',fmtPct(p3.pctToOP));const opEl=setEl('ob-op-total',fmtPct(f.pctToOP));setPctClass(opEl,f.pctToOP||0);
-    setEl('ob-dhc-p1',fmt(p1.directHC,1));setEl('ob-dhc-p2',fmt(p2.directHC,1));setEl('ob-dhc-p3',fmt(p3.directHC,1));setEl('ob-dhc-total','');
-    setEl('ob-ihc-p1',fmt(p1.indirectHC,1));setEl('ob-ihc-p2',fmt(p2.indirectHC,1));setEl('ob-ihc-p3',fmt(p3.indirectHC,1));setEl('ob-ihc-total','');
+    // Conditional format OB % to OP
+    ['ob-op-p1','ob-op-p2','ob-op-p3','ob-op-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const txt=el.textContent;const v=parseFloat(txt)||0;if(v<=0){el.style.background='';return;}if(v>=100)el.style.background='rgba(52,211,153,0.15)';else if(v>=95)el.style.background='rgba(251,191,36,0.1)';else el.style.background='rgba(220,38,38,0.12)';});
     setEl('ob-timestamp',new Date().toLocaleString()+' MST');
 }
 function renderSort(m){
@@ -351,9 +489,11 @@ function renderTargets(m){
     setEl('sum-sort-goal',sortG>0?fmt(sortG):'—');setEl('sum-sort-rate',sf.rate?fmt(sf.rate,1):'—');setEl('sum-sort-cplh',sf.cplh?fmt(sf.cplh,2):'—');
     if(sortG>0&&sf.totalUnits){const p=(sf.totalUnits/sortG)*100;const el=setEl('sum-sort-pct',fmtPct(p));const pColor=getPaceColor(p,config);el.classList.remove('pct-good','pct-warn','pct-bad');el.classList.add(pColor==='green'?'pct-good':pColor==='amber'?'pct-warn':'pct-bad');setEl('sum-sort-actual',fmt(sf.totalUnits));setEl('sum-sort-remaining',fmt(sortG-sf.totalUnits));
         const bar=document.getElementById('sort-progress-bar');if(bar){bar.style.width=Math.min(p,100)+'%';bar.className='goal-progress-bar '+pColor;}}
-    // Pace Insights
-    renderPaceInsight('ib-pace-insight',ibG,f.totalStow||0,f.rate||0,f.directHC||0,config);
-    renderPaceInsight('ob-pace-insight',obG,ob.pickUnits||0,ob.pickRate||0,ob.directHC||0,config);
+    // Pace Insights — use most recent period's active headcount (from function rollup employee links)
+    const ibActiveHC=(m.ib.p3?.headcount>0?m.ib.p3.headcount:m.ib.p2?.headcount>0?m.ib.p2.headcount:m.ib.p1?.headcount)||0;
+    const obActiveHC=(m.ob.p3?.pickHC>0?m.ob.p3.pickHC:m.ob.p2?.pickHC>0?m.ob.p2.pickHC:m.ob.p1?.pickHC)||0;
+    renderPaceInsight('ib-pace-insight',ibG,f.totalStow||0,f.rate||0,ibActiveHC,config);
+    renderPaceInsight('ob-pace-insight',obG,ob.pickUnits||0,ob.pickRate||0,obActiveHC,config);
 }
 function renderPaceInsight(elId,goal,actual,rate,hc,config){
     const el=document.getElementById(elId);if(!el)return;
@@ -409,27 +549,54 @@ function renderCharts(m){
     const pList=[sched.p1,sched.p2,sched.p3];
     function pStarted(p){return hasPeriodStarted(p,config);}
     function val(v,idx){return pStarted(pList[idx])?v:null;}
-    const baseOpts=(yL,y2L)=>({responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{labels:{color:'#9aa0a6',font:{size:9},boxWidth:10}}},scales:{x:{ticks:{color:'#9aa0a6',font:{size:9}},grid:{color:'#363b44'}},y:{ticks:{color:'#9aa0a6',font:{size:9}},grid:{color:'#363b44'},beginAtZero:true,title:{display:!!yL,text:yL||'',color:'#9aa0a6',font:{size:9}}},y2:{position:'right',ticks:{color:'#ffcc00',font:{size:9}},grid:{drawOnChartArea:false},beginAtZero:true,title:{display:!!y2L,text:y2L||'',color:'#ffcc00',font:{size:9}}}}});
+    const baseOpts=(yL,y2L)=>({responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{labels:{color:'#000',font:{size:9},boxWidth:10}}},scales:{x:{ticks:{color:'#000',font:{size:9}},grid:{color:'#ddd'}},y:{ticks:{color:'#000',font:{size:9}},grid:{color:'#ddd'},beginAtZero:true,title:{display:!!yL,text:yL||'',color:'#000',font:{size:9}}},y2:{position:'right',ticks:{color:'#e65100',font:{size:9}},grid:{drawOnChartArea:false},beginAtZero:true,title:{display:!!y2L,text:y2L||'',color:'#e65100',font:{size:9}}}}});
     function make(id,data,opts){const ctx=document.getElementById(id);if(!ctx)return;if(charts[id])charts[id].destroy();charts[id]=new Chart(ctx,{type:'bar',data,options:opts});}
     // Stow
     const sp=ibG>0?[Math.round(ibG/periods),Math.round(ibG/periods*2),Math.round(ibG)]:[0,0,0];
-    make('chart-stow',{labels,datasets:[{type:'bar',label:'Planned',data:[val(sp[0],0),val(sp[1],1),val(sp[2],2)],backgroundColor:'rgba(158,158,158,0.4)',borderColor:'#9e9e9e',borderWidth:1,yAxisID:'y'},{type:'bar',label:'Actual',data:[val(m.ib.p1?.totalStow||0,0),val(m.ib.p2?.totalStow||0,1),val(m.ib.p3?.totalStow||0,2)],backgroundColor:'rgba(76,175,80,0.6)',borderColor:'#4CAF50',borderWidth:1,yAxisID:'y'},{type:'line',label:'Rate',data:[val(m.ib.p1?.rate||0,0),val(m.ib.p2?.rate||0,1),val(m.ib.p3?.rate||0,2)],borderColor:'#ffcc00',borderWidth:2,pointRadius:4,pointBackgroundColor:'#ffcc00',tension:.2,yAxisID:'y2',spanGaps:false}]},baseOpts('Stowed','Rate'));
+    make('chart-stow',{labels,datasets:[{type:'bar',label:'Planned',data:[val(sp[0],0),val(sp[1],1),val(sp[2],2)],backgroundColor:'rgba(180,180,180,0.5)',borderColor:'#999',borderWidth:1,yAxisID:'y'},{type:'bar',label:'Actual',data:[val(m.ib.p1?.totalStow||0,0),val(m.ib.p2?.totalStow||0,1),val(m.ib.p3?.totalStow||0,2)],backgroundColor:'rgba(0,0,0,0.75)',borderColor:'#000',borderWidth:1,yAxisID:'y'},{type:'line',label:'Rate',data:[val(m.ib.p1?.rate||0,0),val(m.ib.p2?.rate||0,1),val(m.ib.p3?.rate||0,2)],borderColor:'#e65100',borderWidth:2,pointRadius:4,pointBackgroundColor:'#e65100',tension:.2,yAxisID:'y2',spanGaps:false}]},baseOpts('Stowed','Rate'));
     // CPLH
-    make('chart-cplh-ib',{labels,datasets:[{type:'bar',label:'CPLH',data:[val(m.ib.p1?.cplh||0,0),val(m.ib.p2?.cplh||0,1),val(m.ib.p3?.cplh||0,2)],backgroundColor:'rgba(52,199,89,0.7)',borderColor:'#34c759',borderWidth:1,yAxisID:'y'},{type:'line',label:'Direct%',data:[val(m.ib.p1?.directPct||0,0),val(m.ib.p2?.directPct||0,1),val(m.ib.p3?.directPct||0,2)],borderColor:'#2196F3',borderWidth:2,pointRadius:3,tension:.2,yAxisID:'y2',spanGaps:false},{type:'line',label:'Indirect%',data:[val(m.ib.p1?.indirectPct||0,0),val(m.ib.p2?.indirectPct||0,1),val(m.ib.p3?.indirectPct||0,2)],borderColor:'#FF9800',borderWidth:2,pointRadius:3,tension:.2,yAxisID:'y2',spanGaps:false}]},baseOpts('CPLH','Spend %'));
+    make('chart-cplh-ib',{labels,datasets:[{type:'bar',label:'CPLH',data:[val(m.ib.p1?.cplh||0,0),val(m.ib.p2?.cplh||0,1),val(m.ib.p3?.cplh||0,2)],backgroundColor:'rgba(0,0,0,0.75)',borderColor:'#000',borderWidth:1,yAxisID:'y'},{type:'line',label:'Direct%',data:[val(m.ib.p1?.directPct||0,0),val(m.ib.p2?.directPct||0,1),val(m.ib.p3?.directPct||0,2)],borderColor:'#1565c0',borderWidth:2,pointRadius:3,tension:.2,yAxisID:'y2',spanGaps:false},{type:'line',label:'Indirect%',data:[val(m.ib.p1?.indirectPct||0,0),val(m.ib.p2?.indirectPct||0,1),val(m.ib.p3?.indirectPct||0,2)],borderColor:'#e65100',borderWidth:2,pointRadius:3,tension:.2,yAxisID:'y2',spanGaps:false}]},baseOpts('CPLH','Spend %'));
     // Pick
     const pp=obG>0?[Math.round(obG/periods),Math.round(obG/periods*2),Math.round(obG)]:[0,0,0];
-    make('chart-pick',{labels,datasets:[{type:'bar',label:'Planned',data:[val(pp[0],0),val(pp[1],1),val(pp[2],2)],backgroundColor:'rgba(158,158,158,0.4)',borderColor:'#9e9e9e',borderWidth:1,yAxisID:'y'},{type:'bar',label:'Actual',data:[val(m.ob.p1?.pickUnits||0,0),val(m.ob.p2?.pickUnits||0,1),val(m.ob.p3?.pickUnits||0,2)],backgroundColor:'rgba(76,175,80,0.6)',borderColor:'#4CAF50',borderWidth:1,yAxisID:'y'},{type:'line',label:'Rate',data:[val(m.ob.p1?.pickRate||0,0),val(m.ob.p2?.pickRate||0,1),val(m.ob.p3?.pickRate||0,2)],borderColor:'#ffcc00',borderWidth:2,pointRadius:4,pointBackgroundColor:'#ffcc00',tension:.2,yAxisID:'y2',spanGaps:false}]},baseOpts('Picked','Pick Rate'));
+    make('chart-pick',{labels,datasets:[{type:'bar',label:'Planned',data:[val(pp[0],0),val(pp[1],1),val(pp[2],2)],backgroundColor:'rgba(180,180,180,0.5)',borderColor:'#999',borderWidth:1,yAxisID:'y'},{type:'bar',label:'Actual',data:[val(m.ob.p1?.pickUnits||0,0),val(m.ob.p2?.pickUnits||0,1),val(m.ob.p3?.pickUnits||0,2)],backgroundColor:'rgba(0,0,0,0.75)',borderColor:'#000',borderWidth:1,yAxisID:'y'},{type:'line',label:'Rate',data:[val(m.ob.p1?.pickRate||0,0),val(m.ob.p2?.pickRate||0,1),val(m.ob.p3?.pickRate||0,2)],borderColor:'#e65100',borderWidth:2,pointRadius:4,pointBackgroundColor:'#e65100',tension:.2,yAxisID:'y2',spanGaps:false}]},baseOpts('Picked','Pick Rate'));
     // Loaded
-    make('chart-loaded',{labels,datasets:[{type:'bar',label:'Picked',data:[val(m.ob.p1?.pickUnits||0,0),val(m.ob.p2?.pickUnits||0,1),val(m.ob.p3?.pickUnits||0,2)],backgroundColor:'rgba(255,152,0,0.7)',borderColor:'#FF9800',borderWidth:1},{type:'bar',label:'Loaded',data:[val(m.ob.p1?.loadedUnits||0,0),val(m.ob.p2?.loadedUnits||0,1),val(m.ob.p3?.loadedUnits||0,2)],backgroundColor:'rgba(76,175,80,0.7)',borderColor:'#4CAF50',borderWidth:1}]},baseOpts('Units'));
+    make('chart-loaded',{labels,datasets:[{type:'bar',label:'Picked',data:[val(m.ob.p1?.pickUnits||0,0),val(m.ob.p2?.pickUnits||0,1),val(m.ob.p3?.pickUnits||0,2)],backgroundColor:'rgba(230,81,0,0.7)',borderColor:'#e65100',borderWidth:1},{type:'bar',label:'Loaded',data:[val(m.ob.p1?.loadedUnits||0,0),val(m.ob.p2?.loadedUnits||0,1),val(m.ob.p3?.loadedUnits||0,2)],backgroundColor:'rgba(46,125,50,0.7)',borderColor:'#2e7d32',borderWidth:1}]},baseOpts('Units'));
 }
 
 // === ACTIONS ===
 function renderActions(){
     const actions=loadActions(),tbody=document.getElementById('actions-body');if(!tbody)return;
     tbody.innerHTML='';
-    actions.forEach((a,i)=>{const tr=document.createElement('tr');tr.innerHTML=`<td><input type="text" value="${a.item||''}" data-i="${i}" data-f="item"></td><td><input type="text" value="${a.owner||''}" data-i="${i}" data-f="owner" style="width:100px"></td><td><select data-i="${i}" data-f="status"><option ${a.status==='Open'?'selected':''}>Open</option><option ${a.status==='In Progress'?'selected':''}>In Progress</option><option ${a.status==='Done'?'selected':''}>Done</option></select></td><td><span class="action-delete" data-i="${i}">\u2715</span></td>`;tbody.appendChild(tr);});
-    tbody.querySelectorAll('input,select').forEach(el=>el.addEventListener('change',()=>{const a=loadActions(),i=+el.dataset.i;if(a[i]){a[i][el.dataset.f]=el.value;saveActions(a);}}));
-    tbody.querySelectorAll('.action-delete').forEach(el=>el.addEventListener('click',()=>{const a=loadActions();a.splice(+el.dataset.i,1);saveActions(a);renderActions();}));
+    actions.forEach((a,i)=>{const tr=document.createElement('tr');tr.innerHTML=`<td><input type="text" value="${a.time||''}" data-i="${i}" data-f="time" style="width:50px;text-align:center;" placeholder="HH:MM"></td><td><input type="text" value="${a.item||''}" data-i="${i}" data-f="item"></td><td><input type="text" value="${a.owner||''}" data-i="${i}" data-f="owner" style="width:80px"></td><td><select data-i="${i}" data-f="status"><option ${a.status==='Open'?'selected':''}>Open</option><option ${a.status==='In Progress'?'selected':''}>In Progress</option><option ${a.status==='Done'?'selected':''}>Done</option></select></td><td><span class="action-delete" data-i="${i}">\u2715</span></td>`;tbody.appendChild(tr);});
+    tbody.querySelectorAll('input,select').forEach(el=>el.addEventListener('change',()=>{const a=loadActions(),i=+el.dataset.i;if(a[i]){a[i][el.dataset.f]=el.value;saveActions(a);renderTimeline();}}));
+    tbody.querySelectorAll('.action-delete').forEach(el=>el.addEventListener('click',()=>{const a=loadActions();a.splice(+el.dataset.i,1);saveActions(a);renderActions();renderTimeline();}));
+    renderTimeline();
+}
+function renderTimeline(){
+    const container=document.getElementById('shift-timeline');if(!container)return;
+    const config=loadConfig();
+    const sched=config.shiftType==='Nights'?config.nights:config.days;
+    const startH=sched.full.sh,endH=sched.full.eh;
+    // Build array of hours in the shift
+    const hours=[];
+    let h=startH;
+    for(let i=0;i<12;i++){hours.push(h%24);h=(h+1)%24;if(hours.length>1&&h===(endH+1)%24)break;}
+    const actions=loadActions();
+    const now=new Date();const currentH=now.getHours();
+    container.innerHTML='';
+    hours.forEach(hr=>{
+        const div=document.createElement('div');
+        div.className='timeline-hour';
+        if(hr===currentH)div.classList.add('current-hour');
+        // Check if any actions at this hour
+        const hrStr=String(hr).padStart(2,'0');
+        const hasAction=actions.some(a=>a.time&&a.time.startsWith(hrStr));
+        if(hasAction)div.classList.add('has-action');
+        div.textContent=hr>12?hr-12+'p':hr===0?'12a':hr===12?'12p':hr+'a';
+        div.title=hrStr+':00';
+        div.onclick=()=>{const a=loadActions();a.push({time:hrStr+':00',item:'',owner:'',status:'Open'});saveActions(a);renderActions();};
+        container.appendChild(div);
+    });
 }
 
 // === PERIOD DOTS ===
@@ -460,8 +627,8 @@ function updatePeriodDots(){
 
 // === HTML ===
 function buildHTML(){return `
-<nav class="topnav"><div class="topnav-left"><span class="logo"><svg width="28" height="28" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="46" fill="#22262e" stroke="#4a9eff" stroke-width="4"/><path d="M25 65 L25 40 L50 28 L75 40 L75 65 Z" fill="none" stroke="#e8eaed" stroke-width="3" stroke-linejoin="round"/><line x1="25" y1="65" x2="75" y2="65" stroke="#e8eaed" stroke-width="3"/><rect x="30" y="45" width="16" height="20" fill="none" stroke="#e8eaed" stroke-width="2"/><line x1="30" y1="50" x2="46" y2="50" stroke="#e8eaed" stroke-width="1.5"/><line x1="30" y1="55" x2="46" y2="55" stroke="#e8eaed" stroke-width="1.5"/><line x1="30" y1="60" x2="46" y2="60" stroke="#e8eaed" stroke-width="1.5"/><rect x="54" y="48" width="14" height="17" fill="none" stroke="#e8eaed" stroke-width="2"/><rect x="57" y="52" width="4" height="5" fill="#e8eaed"/><rect x="62" y="55" width="3" height="4" fill="#e8eaed"/></svg></span><h1 class="site-title">FC Sync Board</h1>
-<div class="nav-tabs"><button class="nav-tab active" data-tab="sync">Sync IB-OB</button><button class="nav-tab" data-tab="support">Support Teams</button><button class="nav-tab" data-tab="settings">Settings</button></div></div>
+<nav class="topnav"><div class="topnav-left"><span class="logo"><svg width="28" height="28" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="46" fill="#333A44" stroke="#4a9eff" stroke-width="4"/><path d="M25 65 L25 40 L50 28 L75 40 L75 65 Z" fill="none" stroke="#E8EAED" stroke-width="3" stroke-linejoin="round"/><line x1="25" y1="65" x2="75" y2="65" stroke="#E8EAED" stroke-width="3"/><rect x="30" y="45" width="16" height="20" fill="none" stroke="#E8EAED" stroke-width="2"/><line x1="30" y1="50" x2="46" y2="50" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="55" x2="46" y2="55" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="60" x2="46" y2="60" stroke="#E8EAED" stroke-width="1.5"/><rect x="54" y="48" width="14" height="17" fill="none" stroke="#E8EAED" stroke-width="2"/><rect x="57" y="52" width="4" height="5" fill="#E8EAED"/><rect x="62" y="55" width="3" height="4" fill="#E8EAED"/></svg></span><h1 class="site-title">FC Sync Board</h1>
+<div class="nav-tabs"><button class="nav-tab active" data-tab="sync">Sync IB-OB</button><button class="nav-tab" data-tab="hourly">Hourly</button><button class="nav-tab" data-tab="settings">Settings</button></div></div>
 <div class="topnav-right"><select id="site-select" class="select-input"></select><select id="shift-select" class="select-input"><option value="Days">Days</option><option value="Nights">Nights</option></select>
 <div class="period-indicator"><span class="period-dot" id="dot-p1">P1</span><span class="period-dot" id="dot-p2">P2</span><span class="period-dot" id="dot-p3">P3</span></div>
 <button id="btn-fetch" class="btn btn-primary">\u25B6 Get Data</button><button id="btn-snip" class="btn btn-snip">\uD83D\uDCF7 Snip</button><button id="btn-exit" class="btn btn-danger">\u2715 Exit</button><span id="last-update" class="meta-text">Ready</span></div></nav>
@@ -471,9 +638,7 @@ function buildHTML(){return `
 <section class="metrics-section ib-section"><div class="section-header"><h2>INBOUND | NTP</h2><span class="fclm-timestamp" id="ib-timestamp">\u2014</span></div>
 <table class="metrics-table"><thead><tr><th></th><th>P1</th><th>P2</th><th>P3</th><th>Total</th></tr></thead><tbody>
 <tr class="row-target"><td class="bold">Targets</td><td id="ib-target-p1">\u2014</td><td id="ib-target-p2">\u2014</td><td id="ib-target-p3">\u2014</td><td id="ib-target-total">\u2014</td></tr>
-<tr class="row-wip"><td>Cage WIP</td><td><input type="number" class="table-input" id="ib-wip-p1" placeholder="\u2014"></td><td><input type="number" class="table-input" id="ib-wip-p2" placeholder="\u2014"></td><td><input type="number" class="table-input" id="ib-wip-p3" placeholder="\u2014"></td><td><span class="wip-eos">EOS</span><input type="number" class="table-input" id="ib-wip-eos" placeholder="\u2014"></td></tr>
 <tr class="row-sync"><td class="bold">Sync Metrics</td><td id="ib-sync-p1">0</td><td id="ib-sync-p2">0</td><td id="ib-sync-p3">0</td><td id="ib-sync-total">0</td></tr>
-<tr><td>&nbsp;&nbsp;Stow - Total</td><td id="ib-stow-p1">0</td><td id="ib-stow-p2">0</td><td id="ib-stow-p3">0</td><td id="ib-stow-total">0</td></tr>
 <tr><td>&nbsp;&nbsp;Cases Stowed</td><td id="ib-cases-p1">0</td><td id="ib-cases-p2">0</td><td id="ib-cases-p3">0</td><td id="ib-cases-total">0</td></tr>
 <tr><td>&nbsp;&nbsp;Pallets Stowed</td><td id="ib-pallets-p1">0</td><td id="ib-pallets-p2">0</td><td id="ib-pallets-p3">0</td><td id="ib-pallets-total">0</td></tr>
 <tr><td>&nbsp;&nbsp;CTI/PTI per period</td><td id="ib-cti-p1">0</td><td id="ib-cti-p2">0</td><td id="ib-cti-p3">0</td><td id="ib-cti-total">0</td></tr>
@@ -486,14 +651,12 @@ function buildHTML(){return `
 <tr class="row-cplh"><td class="bold">CPLH</td><td id="ib-cplh-p1">\u2014</td><td id="ib-cplh-p2">\u2014</td><td id="ib-cplh-p3">\u2014</td><td id="ib-cplh-total">\u2014</td></tr>
 <tr><td>% to OP</td><td id="ib-op-p1">\u2014</td><td id="ib-op-p2">\u2014</td><td id="ib-op-p3">\u2014</td><td id="ib-op-total">\u2014</td></tr>
 <tr class="row-fast"><td>Fast Start</td><td id="ib-fast-p1">\u2014</td><td id="ib-fast-p2">\u2014</td><td id="ib-fast-p3">\u2014</td><td></td></tr>
-<tr class="row-hc"><td>Direct HC</td><td id="ib-dhc-p1">\u2014</td><td id="ib-dhc-p2">\u2014</td><td id="ib-dhc-p3">\u2014</td><td id="ib-dhc-total">\u2014</td></tr>
-<tr class="row-hc"><td>Indirect HC</td><td id="ib-ihc-p1">\u2014</td><td id="ib-ihc-p2">\u2014</td><td id="ib-ihc-p3">\u2014</td><td id="ib-ihc-total">\u2014</td></tr>
+<tr class="row-lc"><td colspan="5" id="ib-lc-display" style="font-size:11px;color:#5B6B7A;">Learning Curve Mix: \u2014</td></tr>
 </tbody></table></section>
 
 <section class="metrics-section ob-section"><div class="section-header"><h2>OUTBOUND | NTP</h2><span class="fclm-timestamp" id="ob-timestamp">\u2014</span></div>
 <table class="metrics-table"><thead><tr><th></th><th>P1</th><th>P2</th><th>P3</th><th>Total</th></tr></thead><tbody>
 <tr class="row-target"><td class="bold">Targets</td><td id="ob-target-p1">\u2014</td><td id="ob-target-p2">\u2014</td><td id="ob-target-p3">\u2014</td><td id="ob-target-total">\u2014</td></tr>
-<tr class="row-wip"><td>Cage WIP</td><td><input type="number" class="table-input" id="ob-wip-p1" placeholder="\u2014"></td><td><input type="number" class="table-input" id="ob-wip-p2" placeholder="\u2014"></td><td><input type="number" class="table-input" id="ob-wip-p3" placeholder="\u2014"></td><td><span class="wip-eos">EOS</span><input type="number" class="table-input" id="ob-wip-eos" placeholder="\u2014"></td></tr>
 <tr class="row-sync"><td class="bold">Sync Metrics</td><td id="ob-sync-p1">0</td><td id="ob-sync-p2">0</td><td id="ob-sync-p3">0</td><td id="ob-sync-total">0</td></tr>
 <tr><td>&nbsp;&nbsp;Pick - Total</td><td id="ob-pick-p1">0</td><td id="ob-pick-p2">0</td><td id="ob-pick-p3">0</td><td id="ob-pick-total">0</td></tr>
 <tr><td>&nbsp;&nbsp;Cases Picked</td><td id="ob-cases-p1">0</td><td id="ob-cases-p2">0</td><td id="ob-cases-p3">0</td><td id="ob-cases-total">0</td></tr>
@@ -507,14 +670,12 @@ function buildHTML(){return `
 <tr class="row-cplh"><td class="bold">CPLH</td><td id="ob-cplh-p1">\u2014</td><td id="ob-cplh-p2">\u2014</td><td id="ob-cplh-p3">\u2014</td><td id="ob-cplh-total">\u2014</td></tr>
 <tr><td>% to OP</td><td id="ob-op-p1">\u2014</td><td id="ob-op-p2">\u2014</td><td id="ob-op-p3">\u2014</td><td id="ob-op-total">\u2014</td></tr>
 <tr class="row-fast"><td>Fast Start</td><td id="ob-fast-p1">\u2014</td><td id="ob-fast-p2">\u2014</td><td id="ob-fast-p3">\u2014</td><td></td></tr>
-<tr class="row-hc"><td>Direct HC</td><td id="ob-dhc-p1">\u2014</td><td id="ob-dhc-p2">\u2014</td><td id="ob-dhc-p3">\u2014</td><td id="ob-dhc-total">\u2014</td></tr>
-<tr class="row-hc"><td>Indirect HC</td><td id="ob-ihc-p1">\u2014</td><td id="ob-ihc-p2">\u2014</td><td id="ob-ihc-p3">\u2014</td><td id="ob-ihc-total">\u2014</td></tr>
+<tr class="row-lc"><td colspan="5" id="ob-lc-display" style="font-size:11px;color:#5B6B7A;">Learning Curve Mix: \u2014</td></tr>
 </tbody></table></section>
 
 <section class="metrics-section sort-section" id="sort-section"><div class="section-header"><h2>SORT | NTP</h2></div>
 <table class="metrics-table"><thead><tr><th></th><th>P1</th><th>P2</th><th>P3</th><th>Total</th></tr></thead><tbody>
 <tr class="row-target"><td class="bold">Targets</td><td id="sort-target-p1">\u2014</td><td id="sort-target-p2">\u2014</td><td id="sort-target-p3">\u2014</td><td id="sort-target-total">\u2014</td></tr>
-<tr class="row-wip"><td>Cage WIP</td><td><input type="number" class="table-input" id="sort-wip-p1" placeholder="\u2014"></td><td><input type="number" class="table-input" id="sort-wip-p2" placeholder="\u2014"></td><td><input type="number" class="table-input" id="sort-wip-p3" placeholder="\u2014"></td><td><span class="wip-eos">EOS</span><input type="number" class="table-input" id="sort-wip-eos" placeholder="\u2014"></td></tr>
 <tr><td>Sort - Total</td><td id="sort-total-p1">0</td><td id="sort-total-p2">0</td><td id="sort-total-p3">0</td><td id="sort-total-total">0</td></tr>
 <tr><td>Sort (Units)</td><td id="sort-units-p1">0</td><td id="sort-units-p2">0</td><td id="sort-units-p3">0</td><td id="sort-units-total">0</td></tr>
 <tr class="row-rate"><td>Sort Rate (UPH)</td><td id="sort-rate-p1">\u2014</td><td id="sort-rate-p2">\u2014</td><td id="sort-rate-p3">\u2014</td><td id="sort-rate-total">\u2014</td></tr>
@@ -523,7 +684,8 @@ function buildHTML(){return `
 </tbody></table></section>
 
 <section class="metrics-section"><div class="section-header"><h2>SYNC Actions</h2><div><button id="btn-add-action" class="btn btn-small">+ Add</button> <button id="btn-clear-actions" class="btn btn-small btn-danger">Clear</button></div></div>
-<table class="actions-table"><thead><tr><th>Action Item</th><th>Owner</th><th>Status</th><th></th></tr></thead><tbody id="actions-body"></tbody></table></section>
+<div class="shift-timeline" id="shift-timeline"></div>
+<table class="actions-table" style="margin-top:8px;"><thead><tr><th>Time</th><th>Action Item</th><th>Owner</th><th>Status</th><th></th></tr></thead><tbody id="actions-body"></tbody></table></section>
 </div><!-- sync-left -->
 
 <div class="sync-right">
@@ -532,28 +694,39 @@ function buildHTML(){return `
 <div class="goal-card ob-card"><div class="goal-header"><span class="goal-title">Outbound</span><span class="goal-pct" id="sum-ob-pct">\u2014</span></div><div class="goal-progress" id="ob-progress-wrap"><div class="goal-progress-bar green" id="ob-progress-bar" style="width:0%"></div><div class="period-marker" id="ob-marker-p1" data-label="P1" style="left:33%"></div><div class="period-marker" id="ob-marker-p2" data-label="P2" style="left:66%"></div></div><div class="goal-stats"><span>Goal <strong id="sum-pick-goal">\u2014</strong></span><span>Actual <strong id="sum-ob-actual">\u2014</strong></span><span>Remaining <strong id="sum-ob-remaining">\u2014</strong></span></div><div class="goal-stats"><span>\u25B2 <strong id="sum-pick-rate">\u2014</strong> Rate</span><span>\u2713 <strong id="sum-ob-cplh">\u2014</strong> CPLH</span></div><div class="pace-insight" id="ob-pace-insight"></div></div>
 <div class="goal-card sort-card" id="sort-summary-card"><div class="goal-header"><span class="goal-title">Sort</span><span class="goal-pct" id="sum-sort-pct">\u2014</span></div><div class="goal-progress"><div class="goal-progress-bar green" id="sort-progress-bar" style="width:0%"></div></div><div class="goal-stats"><span>Goal <strong id="sum-sort-goal">\u2014</strong></span><span>Actual <strong id="sum-sort-actual">\u2014</strong></span><span>Remaining <strong id="sum-sort-remaining">\u2014</strong></span></div><div class="goal-stats"><span>\u25B2 <strong id="sum-sort-rate">\u2014</strong> Rate</span><span>\u2713 <strong id="sum-sort-cplh">\u2014</strong> CPLH</span></div></div>
 </div>
-<div class="targets-panel"><h3 class="panel-title">Shift Plan Targets</h3>
+<div class="site-cplh-panel" id="site-cplh-panel" style="background:#fff;border:2px solid #000;border-radius:4px;padding:10px 14px;">
+<h3 style="font-size:11px;font-weight:700;margin-bottom:6px;">Site CPLH</h3>
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:12px;">
+<div><span style="color:#333;font-size:10px;">SITE CPLH</span><br><strong id="site-cplh-value" style="font-size:16px;">\u2014</strong></div>
+<div><span style="color:#333;font-size:10px;">THROUGHPUT VOL</span><br><strong id="site-throughput-vol">\u2014</strong></div>
+<div><span style="color:#333;font-size:10px;">THROUGHPUT HRS</span><br><strong id="site-throughput-hrs">\u2014</strong></div>
+</div>
+</div>
+<div class="targets-panel"><h3 class="panel-title" style="display:flex;justify-content:space-between;align-items:center;">Shift Plan Targets <button id="btn-clear-targets" class="btn btn-small btn-danger">Clear</button></h3>
 <div class="target-groups-row">
 <div class="tg-compact"><h4>INBOUND</h4><table class="target-table"><thead><tr><th></th><th>Target</th><th>%</th></tr></thead><tbody>
 <tr><td>24 HR BB GOAL</td><td><input type="number" id="ib-bb-goal" class="target-input"></td><td></td></tr>
 <tr><td>IB GOAL</td><td><input type="number" id="ib-goal-input" class="target-input"></td><td><span id="ib-goal-pct">\u2014</span></td></tr>
 <tr><td>STOW RATE</td><td><input type="number" id="ib-rate-target" class="target-input"></td><td><span id="ib-rate-pct">\u2014</span></td></tr>
 <tr><td>IB CPLH</td><td><input type="number" id="ib-cplh-target" class="target-input"></td><td><span id="ib-cplh-pct">\u2014</span></td></tr>
-<tr><td>SOS FAST START</td><td><input type="number" id="ib-fast-sos" class="target-input" value="13"></td><td><span id="ib-fast-sos-pct">\u2014</span></td></tr>
-<tr><td>EOL FAST START</td><td><input type="number" id="ib-fast-eol" class="target-input" value="18"></td><td><span id="ib-fast-eol-pct">\u2014</span></td></tr>
+<tr><td>SOS FAST START</td><td><input type="number" id="ib-fast-sos" class="target-input" value="13" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ib-fast-sos-pct">\u2014</span></td></tr>
+<tr><td>EOL FAST START</td><td><input type="number" id="ib-fast-eol" class="target-input" value="18" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ib-fast-eol-pct">\u2014</span></td></tr>
 </tbody></table></div>
 <div class="tg-compact"><h4>OUTBOUND</h4><table class="target-table"><thead><tr><th></th><th>Target</th><th>%</th></tr></thead><tbody>
 <tr><td>24 HR BB GOAL</td><td><input type="number" id="ob-bb-goal" class="target-input"></td><td></td></tr>
 <tr><td>DA GOAL</td><td><input type="number" id="ob-goal-input" class="target-input"></td><td><span id="ob-goal-pct">\u2014</span></td></tr>
 <tr><td>PICK RATE</td><td><input type="number" id="ob-rate-target" class="target-input"></td><td><span id="ob-rate-pct">\u2014</span></td></tr>
 <tr><td>DA CPLH</td><td><input type="number" id="ob-cplh-target" class="target-input"></td><td><span id="ob-cplh-pct">\u2014</span></td></tr>
-<tr><td>SOS FAST START</td><td><input type="number" id="ob-fast-sos" class="target-input" value="13"></td><td><span id="ob-fast-sos-pct">\u2014</span></td></tr>
-<tr><td>EOL FAST START</td><td><input type="number" id="ob-fast-eol" class="target-input" value="18"></td><td><span id="ob-fast-eol-pct">\u2014</span></td></tr>
+<tr><td>SOS FAST START</td><td><input type="number" id="ob-fast-sos" class="target-input" value="13" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ob-fast-sos-pct">\u2014</span></td></tr>
+<tr><td>EOL FAST START</td><td><input type="number" id="ob-fast-eol" class="target-input" value="18" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ob-fast-eol-pct">\u2014</span></td></tr>
 </tbody></table></div>
 </div>
 <div id="sort-targets-right" class="sort-tgt"><h4>SORT</h4><table class="target-table"><tbody>
 <tr><td>SORT PRIMARY GOAL</td><td><input type="number" id="sort-goal" class="target-input"></td><td><span id="sort-goal-pct">\u2014</span></td></tr>
 <tr><td>SORT RATE (UPH)</td><td><input type="number" id="sort-rate-target" class="target-input"></td><td></td></tr>
+</tbody></table></div>
+<div class="sort-tgt" style="margin-top:6px;padding-top:6px;border-top:2px solid #000;"><h4 style="color:#333;">SITE</h4><table class="target-table"><tbody>
+<tr><td>SITE CPLH TARGET</td><td><input type="number" id="site-cplh-target" class="target-input" step="0.01"></td><td><span id="site-cplh-pct">\u2014</span></td></tr>
 </tbody></table></div>
 </div>
 <div class="charts-panel">
@@ -563,6 +736,11 @@ function buildHTML(){return `
 <div class="chart-card"><h3>Picked vs Loaded</h3><canvas id="chart-loaded" height="170"></canvas></div>
 </div>
 </div><!-- sync-right -->
+</div></main>
+
+<main id="tab-hourly" class="tab-content"><div class="hourly-container">
+<div class="section-header"><h2>Hourly Breakdown</h2><button id="btn-fetch-hourly" class="btn btn-primary">\u25B6 Fetch Hourly</button><span id="hourly-status" class="meta-text"></span></div>
+<div id="hourly-tables"></div>
 </div></main>
 
 <main id="tab-support" class="tab-content"><div class="support-grid">
@@ -609,87 +787,303 @@ function buildHTML(){return `
 
 // === CSS ===
 function buildCSS(){return `
-#sb-root{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#1a1d23;color:#e8eaed;font-size:13px;line-height:1.4;min-height:100vh;}
-.topnav{display:flex;align-items:center;justify-content:space-between;padding:6px 16px;background:#22262e;border-bottom:1px solid #363b44;position:sticky;top:0;z-index:100;}
+#sb-root{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#ffffff;color:#000000;font-size:13px;line-height:1.4;min-height:100vh;}
+.topnav{display:flex;align-items:center;justify-content:space-between;padding:6px 16px;background:#f0f0f0;border-bottom:2px solid #000;position:sticky;top:0;z-index:100;}
 .topnav-left{display:flex;align-items:center;gap:14px;}.topnav-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
-.logo{font-size:20px;display:flex;align-items:center;}.site-title{font-size:15px;font-weight:600;margin:0;white-space:nowrap;}
-.nav-tabs{display:flex;gap:4px;}.nav-tab{padding:5px 12px;border:none;background:transparent;color:#9aa0a6;border-radius:6px;cursor:pointer;font-size:12px;font-weight:500;}
-.nav-tab:hover{background:#2a2f38;color:#e8eaed;}.nav-tab.active{background:#4a9eff;color:#fff;}
-.select-input{padding:4px 8px;background:#2a2f38;border:1px solid #363b44;color:#e8eaed;border-radius:5px;font-size:12px;}
-.meta-text{font-size:11px;color:#9aa0a6;}
-.period-indicator{display:flex;gap:4px;}.period-dot{padding:3px 8px;border-radius:4px;font-size:10px;font-weight:700;background:#2a2f38;color:#9aa0a6;border:1px solid #363b44;}
-.period-dot.active{background:#34c759;color:#000;border-color:#34c759;}.period-dot.completed{background:#4a9eff;color:#fff;border-color:#4a9eff;}
-.btn{padding:5px 10px;border:none;border-radius:5px;font-size:12px;font-weight:500;cursor:pointer;}.btn-primary{background:#4a9eff;color:#fff;}.btn-primary:hover{background:#3d8be0;}.btn-primary:disabled{opacity:.5;cursor:wait;}
-.btn-danger{background:#ff453a;color:#fff;}.btn-small{padding:3px 7px;font-size:11px;}.btn-snip{background:#9c27b0;color:#fff;}.btn-snip:hover{background:#7b1fa2;}
+.logo{font-size:20px;display:flex;align-items:center;}.site-title{font-size:15px;font-weight:700;margin:0;white-space:nowrap;color:#000;}
+.nav-tabs{display:flex;gap:4px;}.nav-tab{padding:5px 12px;border:1px solid #000;background:#fff;color:#333;border-radius:4px;cursor:pointer;font-size:12px;font-weight:500;}
+.nav-tab:hover{background:#e0e0e0;color:#000;}.nav-tab.active{background:#2e7d32;color:#fff;border-color:#2e7d32;}
+.select-input{padding:4px 8px;background:#fff;border:1px solid #000;color:#000;border-radius:4px;font-size:12px;}
+.meta-text{font-size:11px;color:#333;}
+.period-indicator{display:flex;gap:4px;}.period-dot{padding:3px 8px;border-radius:4px;font-size:10px;font-weight:700;background:#e0e0e0;color:#666;border:1px solid #000;}
+.period-dot.active{background:#2e7d32;color:#fff;border-color:#2e7d32;}.period-dot.completed{background:#1565c0;color:#fff;border-color:#1565c0;}
+.btn{padding:5px 10px;border:1px solid #000;border-radius:4px;font-size:12px;font-weight:600;cursor:pointer;}.btn-primary{background:#2e7d32;color:#fff;border-color:#2e7d32;}.btn-primary:hover{background:#1b5e20;}.btn-primary:disabled{opacity:.5;cursor:wait;}
+.btn-danger{background:#c62828;color:#fff;border-color:#c62828;}.btn-small{padding:3px 7px;font-size:11px;}.btn-snip{background:#6a1b9a;color:#fff;border-color:#6a1b9a;}.btn-snip:hover{background:#4a148c;}
 .tab-content{display:none;padding:10px 16px;}.tab-content.active{display:block;}
 .sync-layout{display:grid;grid-template-columns:1fr 520px;gap:10px;align-items:start;}
 .sync-left{min-width:0;}
 .sync-right{position:sticky;top:52px;display:flex;flex-direction:column;gap:8px;max-height:calc(100vh - 60px);overflow-y:auto;overflow-x:hidden;padding-right:4px;}
-.targets-panel{background:#22262e;border-radius:8px;border:1px solid #363b44;padding:8px 10px;}
-.panel-title{font-size:10px;color:#9aa0a6;margin:0 0 6px;}
+.targets-panel{background:#fff;border-radius:4px;border:2px solid #000;padding:8px 10px;}
+.panel-title{font-size:10px;color:#333;margin:0 0 6px;font-weight:600;}
 .target-groups-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
-.tg-compact h4{font-size:11px;margin-bottom:4px;color:#2196F3;font-weight:700;}
-.tg-compact:last-child h4{color:#FF9800;}
-.sort-tgt{margin-top:6px;padding-top:6px;border-top:1px solid #363b44;}
-.sort-tgt h4{font-size:11px;color:#FF9800;font-weight:700;margin-bottom:4px;}
-.target-table{width:100%;border-collapse:collapse;font-size:10px;}.target-table th{padding:2px 4px;font-size:9px;color:#9aa0a6;text-align:center;border-bottom:1px solid #363b44;}.target-table th:first-child{text-align:left;}
-.target-table td{padding:2px 4px;border-bottom:1px solid #363b44;white-space:nowrap;}.target-table td:first-child{font-size:10px;color:#9aa0a6;}
-.target-input{width:55px;padding:2px 4px;background:#2a2f38;border:1px solid #363b44;color:#ffcc00;border-radius:3px;font-size:11px;text-align:right;font-weight:600;-moz-appearance:textfield;}
+.tg-compact h4{font-size:11px;margin-bottom:4px;color:#1565c0;font-weight:700;}
+.tg-compact:last-child h4{color:#e65100;}
+.sort-tgt{margin-top:6px;padding-top:6px;border-top:2px solid #000;}
+.sort-tgt h4{font-size:11px;color:#6a1b9a;font-weight:700;margin-bottom:4px;}
+.target-table{width:100%;border-collapse:collapse;font-size:10px;}.target-table th{padding:2px 4px;font-size:9px;color:#333;text-align:center;border-bottom:2px solid #000;}.target-table th:first-child{text-align:left;}
+.target-table td{padding:2px 4px;border-bottom:1px solid #ccc;white-space:nowrap;}.target-table td:first-child{font-size:10px;color:#333;font-weight:600;}
+.target-input{width:68px;padding:3px 5px;background:#ffffcc;border:1px solid #000;color:#000;border-radius:3px;font-size:12px;text-align:right;font-weight:700;-moz-appearance:textfield;}
 .target-input::-webkit-outer-spin-button,.target-input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
 .goal-summary-col{display:flex;flex-direction:column;gap:8px;}
-.goal-card{background:#22262e;border:1px solid #363b44;border-radius:8px;padding:10px 14px;display:flex;flex-direction:column;gap:4px;}
-.goal-card.ib-card{border-left:4px solid #2196F3;}
-.goal-card.ob-card{border-left:4px solid #FF9800;}
-.goal-card.sort-card{border-left:4px solid #555;}
+.goal-card{background:#fff;border:2px solid #000;border-radius:4px;padding:10px 14px;display:flex;flex-direction:column;gap:4px;}
+.goal-card.ib-card{border-left:4px solid #1565c0;}
+.goal-card.ob-card{border-left:4px solid #e65100;}
+.goal-card.sort-card{border-left:4px solid #6a1b9a;}
 .goal-header{display:flex;justify-content:space-between;align-items:center;}
-.goal-title{font-size:11px;font-weight:700;text-transform:uppercase;color:#9aa0a6;}
+.goal-title{font-size:11px;font-weight:700;text-transform:uppercase;color:#333;}
 .goal-pct{font-size:18px;font-weight:700;}
-.goal-progress{width:100%;height:6px;background:#363b44;border-radius:3px;overflow:visible;margin:2px 0;position:relative;}
-.goal-progress-bar{height:100%;border-radius:3px;transition:width 0.3s;}
-.goal-progress-bar.green{background:#34c759;}.goal-progress-bar.amber{background:#ffcc00;}.goal-progress-bar.red{background:#ff453a;}
-.period-marker{position:absolute;top:-2px;width:2px;height:10px;background:#9aa0a6;border-radius:1px;}
-.period-marker::after{content:attr(data-label);position:absolute;top:-12px;left:-4px;font-size:8px;color:#9aa0a6;}
-.goal-stats{display:flex;gap:12px;font-size:11px;color:#9aa0a6;flex-wrap:wrap;}
-.goal-stats span{white-space:nowrap;}.goal-stats strong{color:#e8eaed;}
-.pace-insight{font-size:10px;color:#9aa0a6;margin-top:4px;padding-top:4px;border-top:1px solid #363b44;line-height:1.4;}
-.pace-insight .pace-good{color:#34c759;}.pace-insight .pace-warn{color:#ffcc00;}.pace-insight .pace-bad{color:#ff453a;}
-.goal-label{font-size:10px;color:#9aa0a6;text-transform:uppercase;}.goal-value{font-size:12px;font-weight:700;text-align:right;}
+.goal-progress{width:100%;height:6px;background:#ddd;border-radius:3px;overflow:visible;margin:2px 0;position:relative;border:1px solid #000;}
+.goal-progress-bar{height:100%;border-radius:2px;transition:width 0.3s;}
+.goal-progress-bar.green{background:#2e7d32;}.goal-progress-bar.amber{background:#e65100;}.goal-progress-bar.red{background:#c62828;}
+.period-marker{position:absolute;top:-2px;width:2px;height:10px;background:#000;border-radius:1px;}
+.period-marker::after{content:attr(data-label);position:absolute;top:-12px;left:-4px;font-size:8px;color:#333;}
+.goal-stats{display:flex;gap:12px;font-size:11px;color:#333;flex-wrap:wrap;}
+.goal-stats span{white-space:nowrap;}.goal-stats strong{color:#000;}
+.pace-insight{font-size:10px;color:#333;margin-top:4px;padding-top:4px;border-top:1px solid #ccc;line-height:1.4;}
+.pace-insight .pace-good{color:#2e7d32;}.pace-insight .pace-warn{color:#e65100;}.pace-insight .pace-bad{color:#c62828;}
+.goal-label{font-size:10px;color:#333;text-transform:uppercase;font-weight:600;}.goal-value{font-size:12px;font-weight:700;text-align:right;}
 .charts-panel{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
-.chart-card{background:#22262e;border-radius:8px;border:1px solid #363b44;padding:10px;}.chart-card h3{font-size:11px;margin-bottom:6px;color:#e8eaed;font-weight:600;}.chart-card canvas{width:100%!important;height:170px!important;}
+.chart-card{background:#fff;border-radius:4px;border:2px solid #000;padding:10px;}.chart-card h3{font-size:11px;margin-bottom:6px;color:#000;font-weight:700;}.chart-card canvas{width:100%!important;height:170px!important;}
 `;}
 
 function buildCSS2(){return `
-.metrics-section{background:#22262e;border-radius:8px;border:1px solid #363b44;padding:14px 18px;margin-bottom:12px;}
-.metrics-section.ib-section{border-left:4px solid #2196F3;}
-.metrics-section.ob-section{border-left:4px solid #FF9800;}
-.metrics-section.sort-section{border-left:4px solid #555;}
-.section-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;}.section-header h2{font-size:13px;font-weight:700;margin:0;}.fclm-timestamp{font-size:11px;color:#9aa0a6;}
-.metrics-table{width:100%;border-collapse:collapse;font-size:12px;}.metrics-table th{text-align:center;padding:5px 8px;border-bottom:2px solid #363b44;color:#9aa0a6;font-weight:600;font-size:11px;border-right:1px solid #363b44;}.metrics-table th:first-child{text-align:left;}.metrics-table th:last-child{border-right:none;}
-.metrics-table td{padding:4px 8px;text-align:center;border-bottom:1px solid #363b44;border-right:1px solid #363b44;}.metrics-table td:first-child{text-align:left;border-left:none;}.metrics-table td:last-child{border-right:none;}
-.metrics-table .bold{font-weight:700;}.row-sync td{background:rgba(74,158,255,0.08);font-weight:700;}.row-cplh td{background:rgba(52,199,89,0.1);font-weight:700;font-size:13px;}
-.row-rate td{color:#e8eaed;font-weight:500;}.row-fast td{color:#ff9500;}.row-total td{border-top:2px solid #363b44;}.row-target td{background:rgba(255,204,0,0.08);font-weight:700;}.row-hc td{color:#9aa0a6;font-style:italic;}.row-wip td{font-style:italic;color:#9aa0a6;}
-.table-input{width:60px;padding:2px 5px;background:rgba(255,204,0,0.15);border:1px solid rgba(255,204,0,0.4);color:#ffcc00;border-radius:3px;font-size:12px;text-align:center;font-weight:600;-moz-appearance:textfield;}
+.metrics-section{background:#fff;border-radius:4px;border:2px solid #000;padding:14px 18px;margin-bottom:12px;}
+.metrics-section.ib-section{border-left:4px solid #1565c0;}
+.metrics-section.ob-section{border-left:4px solid #e65100;}
+.metrics-section.sort-section{border-left:4px solid #6a1b9a;}
+.section-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;}.section-header h2{font-size:13px;font-weight:700;margin:0;color:#000;}.fclm-timestamp{font-size:11px;color:#333;}
+.metrics-table{width:100%;border-collapse:collapse;font-size:12px;}.metrics-table th{text-align:center;padding:5px 8px;border-bottom:2px solid #000;color:#000;font-weight:700;font-size:11px;border-right:1px solid #ccc;}.metrics-table th:first-child{text-align:left;}.metrics-table th:last-child{border-right:none;}
+.metrics-table td{padding:4px 8px;text-align:center;border-bottom:1px solid #ccc;border-right:1px solid #ccc;}.metrics-table td:first-child{text-align:left;border-left:none;}.metrics-table td:last-child{border-right:none;}
+.metrics-table .bold{font-weight:700;}.row-sync td{font-weight:700;}.row-cplh td{font-weight:700;font-size:13px;}
+.row-rate td{color:#e65100;font-weight:600;}.row-fast td{color:#e65100;}.row-total td{border-top:2px solid #000;}.row-target td{background:#fff9c4;font-weight:700;}.row-hc td{color:#666;font-style:italic;}.row-wip td{font-style:italic;color:#666;}
+.table-input{width:60px;padding:2px 5px;background:#ffffcc;border:1px solid #000;color:#000;border-radius:3px;font-size:12px;text-align:center;font-weight:700;-moz-appearance:textfield;}
 .table-input::-webkit-outer-spin-button,.table-input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
-.wip-eos{font-size:9px;color:#9aa0a6;margin-right:4px;}
-.pct-good{color:#34c759!important;font-weight:700;}.pct-warn{color:#ffcc00!important;font-weight:700;}.pct-bad{color:#ff453a!important;font-weight:700;}
-.actions-table{width:100%;border-collapse:collapse;font-size:12px;}.actions-table th{text-align:left;padding:4px 8px;border-bottom:2px solid #363b44;color:#9aa0a6;}.actions-table td{padding:4px 8px;border-bottom:1px solid #363b44;}
-.actions-table input{width:100%;background:#2a2f38;border:1px solid #363b44;color:#e8eaed;padding:3px 6px;border-radius:4px;font-size:12px;}
-.actions-table select{background:#2a2f38;border:1px solid #363b44;color:#e8eaed;padding:3px 6px;border-radius:4px;font-size:11px;}.action-delete{cursor:pointer;color:#ff453a;font-size:14px;}
-.support-grid{display:grid;grid-template-columns:1fr;gap:16px;}.support-card{background:#22262e;border-radius:8px;border:1px solid #363b44;padding:16px;border-left:4px solid #363b44;}
-.support-card.safety{border-left-color:#34c759;}.support-card.quality{border-left-color:#ff9500;}.support-card.learning{border-left-color:#4a9eff;}
-.support-card h2{font-size:14px;margin-bottom:10px;}.support-table{width:100%;border-collapse:collapse;font-size:12px;margin-bottom:12px;}
-.support-table th{padding:4px 6px;border-bottom:2px solid #363b44;color:#9aa0a6;text-align:center;font-size:11px;}.support-table th:first-child{text-align:left;}
-.support-table td{padding:3px 6px;border-bottom:1px solid #363b44;}.support-input{width:55px;padding:2px 5px;background:#2a2f38;border:1px solid #363b44;color:#e8eaed;border-radius:3px;font-size:12px;text-align:center;}
-.fixed-target{display:inline-block;width:55px;text-align:center;font-weight:700;color:#34c759;font-size:12px;}
-.callout-section{margin-top:8px;}.callout-section h4{font-size:11px;color:#9aa0a6;margin-bottom:4px;}
-.callout-textarea{width:100%;min-height:60px;padding:8px;background:#2a2f38;border:1px solid #363b44;color:#e8eaed;border-radius:5px;font-size:12px;resize:vertical;font-family:inherit;}
-.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;}.settings-card{background:#22262e;border-radius:8px;border:1px solid #363b44;padding:16px;}.settings-card h2{font-size:14px;margin-bottom:10px;}
-.settings-table{width:100%;border-collapse:collapse;font-size:12px;}.settings-table th{padding:4px 6px;border-bottom:2px solid #363b44;color:#9aa0a6;text-align:center;font-size:11px;}.settings-table th:first-child{text-align:left;}
-.settings-table td{padding:4px 6px;text-align:center;}.settings-table td:first-child{text-align:left;font-weight:500;}
-.sched-input{width:50px;padding:3px 5px;background:#2a2f38;border:1px solid #363b44;color:#ffcc00;border-radius:4px;font-size:12px;text-align:center;}
-.setting-row{display:flex;align-items:center;gap:10px;margin-bottom:8px;}.setting-row label{font-size:12px;min-width:100px;}.settings-note{font-size:11px;color:#9aa0a6;margin-top:10px;}
+.wip-eos{font-size:9px;color:#666;margin-right:4px;}
+.pct-good{color:#2e7d32!important;font-weight:700;}.pct-warn{color:#e65100!important;font-weight:700;}.pct-bad{color:#c62828!important;font-weight:700;}
+.actions-table{width:100%;border-collapse:collapse;font-size:12px;}.actions-table th{text-align:left;padding:4px 8px;border-bottom:2px solid #000;color:#000;font-weight:700;}.actions-table td{padding:4px 8px;border-bottom:1px solid #ccc;}
+.actions-table input{width:100%;background:#fff;border:1px solid #000;color:#000;padding:3px 6px;border-radius:4px;font-size:12px;}
+.actions-table select{background:#fff;border:1px solid #000;color:#000;padding:3px 6px;border-radius:4px;font-size:11px;}.action-delete{cursor:pointer;color:#c62828;font-size:14px;}
+.shift-timeline{display:flex;gap:1px;height:32px;border-radius:4px;overflow:hidden;background:#ccc;margin-bottom:6px;border:1px solid #000;}
+.timeline-hour{flex:1;background:#f5f5f5;display:flex;align-items:center;justify-content:center;font-size:9px;color:#333;cursor:pointer;position:relative;transition:background .15s;}
+.timeline-hour:hover{background:#e0e0e0;}
+.timeline-hour.has-action{background:rgba(21,101,192,0.15);}
+.timeline-hour.current-hour{border-bottom:2px solid #2e7d32;}
+.support-grid{display:grid;grid-template-columns:1fr;gap:16px;}.support-card{background:#fff;border-radius:4px;border:2px solid #000;padding:16px;border-left:4px solid #000;}
+.support-card.safety{border-left-color:#c62828;}.support-card.quality{border-left-color:#e65100;}.support-card.learning{border-left-color:#1565c0;}
+.support-card h2{font-size:14px;margin-bottom:10px;font-weight:700;}.support-table{width:100%;border-collapse:collapse;font-size:12px;margin-bottom:12px;}
+.support-table th{padding:4px 6px;border-bottom:2px solid #000;color:#000;text-align:center;font-size:11px;font-weight:700;}.support-table th:first-child{text-align:left;}
+.support-table td{padding:3px 6px;border-bottom:1px solid #ccc;}.support-input{width:55px;padding:2px 5px;background:#fff;border:1px solid #000;color:#000;border-radius:3px;font-size:12px;text-align:center;}
+.fixed-target{display:inline-block;width:55px;text-align:center;font-weight:700;color:#2e7d32;font-size:12px;}
+.callout-section{margin-top:8px;}.callout-section h4{font-size:11px;color:#333;margin-bottom:4px;font-weight:700;}
+.callout-textarea{width:100%;min-height:60px;padding:8px;background:#fff;border:1px solid #000;color:#000;border-radius:4px;font-size:12px;resize:vertical;font-family:inherit;}
+.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;}.settings-card{background:#fff;border-radius:4px;border:2px solid #000;padding:16px;}.settings-card h2{font-size:14px;margin-bottom:10px;font-weight:700;}
+.settings-table{width:100%;border-collapse:collapse;font-size:12px;}.settings-table th{padding:4px 6px;border-bottom:2px solid #000;color:#000;text-align:center;font-size:11px;font-weight:700;}.settings-table th:first-child{text-align:left;}
+.settings-table td{padding:4px 6px;text-align:center;}.settings-table td:first-child{text-align:left;font-weight:600;}
+.sched-input{width:50px;padding:3px 5px;background:#ffffcc;border:1px solid #000;color:#000;border-radius:4px;font-size:12px;text-align:center;font-weight:700;}
+.setting-row{display:flex;align-items:center;gap:10px;margin-bottom:8px;}.setting-row label{font-size:12px;min-width:100px;}.settings-note{font-size:11px;color:#333;margin-top:10px;}
 @media(max-width:1100px){.sync-layout{grid-template-columns:1fr;}.sync-right{position:static;max-height:none;}}
+.hourly-container{padding:4px 0;}.hourly-container .section-header{margin-bottom:12px;gap:10px;}
+.hourly-tables-grid{display:grid;grid-template-columns:1fr;gap:12px;}
+.hourly-section{background:#fff;border:2px solid #000;border-radius:4px;padding:12px 16px;margin-bottom:10px;}
+.hourly-section h3{font-size:13px;font-weight:700;margin-bottom:8px;}
+.hourly-section.ib-hourly{border-left:4px solid #1565c0;}
+.hourly-section.ob-hourly{border-left:4px solid #e65100;}
+.hourly-section.sort-hourly{border-left:4px solid #6a1b9a;}
 `;}
+
+// === HOURLY TAB ===
+async function fetchHourlyData(){
+    const config=loadConfig();
+    const site=config.site;
+    const sched=config.shiftType==='Nights'?config.nights:config.days;
+    const {startDate}=getShiftDates(config);
+    const statusEl=document.getElementById('hourly-status');
+    const btn=document.getElementById('btn-fetch-hourly');
+    btn.disabled=true;btn.textContent='\u23F3 Fetching...';
+    if(statusEl)statusEl.textContent='Fetching hourly data...';
+
+    // Start = P1 start (SOS), End = P3 end (EOS)
+    const hourlyStartH=sched.p1.sh;
+    const hourlyStartM=sched.p1.sm;
+    const eosH=sched.p3.eh, eosM=sched.p3.em;
+
+    // Calculate total minutes from SOS to EOS
+    const sMins=hourlyStartH*60+hourlyStartM;
+    const eMins=eosH*60+eosM;
+    let totalMins=eMins>sMins?eMins-sMins:(1440-sMins)+eMins;
+
+    // Build hour slots: first = SOS to next full hour, middle = full hours, last = last full hour to EOS
+    const hours=[];
+    // First slot: SOS to next full hour
+    const firstSlotEnd=(Math.ceil(sMins/60)*60)%1440;
+    if(firstSlotEnd!==sMins){
+        // SOS doesn't start on the hour, so first slot is partial
+        hours.push({sh:hourlyStartH,sm:hourlyStartM,eh:Math.floor(firstSlotEnd/60),em:firstSlotEnd%60,label:String(hourlyStartH).padStart(2,'0')+':'+String(hourlyStartM).padStart(2,'0')});
+    }
+    // Middle full-hour slots
+    let cursor=firstSlotEnd===sMins?sMins:firstSlotEnd;
+    while(true){
+        const nextHour=(cursor+60)%1440;
+        // Calculate minutes remaining from cursor to EOS (handling midnight wrap)
+        let cursorToEos;
+        if(eMins>sMins){
+            // No midnight crossing
+            cursorToEos=eMins-cursor;
+        } else {
+            // Crosses midnight
+            if(cursor>=sMins) cursorToEos=(1440-cursor)+eMins;
+            else cursorToEos=eMins-cursor;
+        }
+        if(cursorToEos<=0) break;
+        if(cursorToEos<=60){
+            // Last slot: cursor to EOS
+            hours.push({sh:Math.floor(cursor/60),sm:cursor%60,eh:eosH,em:eosM,label:String(Math.floor(cursor/60)).padStart(2,'0')+':'+String(cursor%60).padStart(2,'0')});
+            break;
+        }
+        hours.push({sh:Math.floor(cursor/60),sm:cursor%60,eh:Math.floor(nextHour/60),em:nextHour%60,label:String(Math.floor(cursor/60)).padStart(2,'0')+':'+String(cursor%60).padStart(2,'0')});
+        cursor=nextHour;
+    }
+    const totalHours=hours.length;
+
+    // Fetch each hour in parallel (same as fetchPeriod)
+    try{
+        const results=await Promise.all(hours.map(hr=>fetchPeriod(site,startDate,hr)));
+        const hourlyData=results.map((raw,i)=>{
+            const stow=raw.stow||{},pStow=raw.palletStow||{},pick=raw.pick||{},obDock=raw.obDock||{},sort=raw.sort||{},ppr=raw.ppr||{};
+            const palletCases=pStow.palletCases||0;
+            const ibU=(stow.totalUnits||0)+palletCases;
+            const ibDH=stow.directHours||0;
+            const ibTotalHrs=ppr.ibActualHrs||ibDH;
+            const ibIndirect=ibTotalHrs>ibDH?ibTotalHrs-ibDH:0;
+            const caseStowReserve=ppr.caseStowReserveHrs||0;
+            const cplhHrs=ibTotalHrs-caseStowReserve;
+            const obPickDH=pick.directHours||0;
+            const daHrs=ppr.daTransferHrs||obPickDH;
+            const obIndirect=daHrs>obPickDH?daHrs-obPickDH:0;
+            return{
+                label:hours[i].label,
+                ib:{totalStow:ibU,stowUnits:stow.totalUnits||0,palletUnits:pStow.totalUnits||0,rate:stow.rate||0,directHours:ibDH,indirectHours:ibIndirect,totalHours:ibTotalHrs,directPct:ibTotalHrs>0?(ibDH/ibTotalHrs)*100:0,indirectPct:ibTotalHrs>0?(ibIndirect/ibTotalHrs)*100:0,cplh:cplhHrs>0?ibU/cplhHrs:0,pctToOP:(ppr.ibPlannedHrs||0)>0?(ibTotalHrs/ppr.ibPlannedHrs)*100:0},
+                ob:{pickUnits:pick.totalUnits||0,loadedUnits:obDock.totalUnits||0,pickRate:pick.rate||0,directHours:obPickDH,indirectHours:obIndirect,totalHours:daHrs,directPct:daHrs>0?(obPickDH/daHrs)*100:0,indirectPct:daHrs>0?(obIndirect/daHrs)*100:0,cplh:daHrs>0?(obDock.totalUnits||0)/daHrs:0,pctToOP:(ppr.daTransferPlan||0)>0?(daHrs/ppr.daTransferPlan)*100:0},
+                sort:{totalUnits:sort.totalUnits||0,rate:sort.rate||0,directHours:sort.directHours||0,cplh:(sort.directHours||0)>0?sort.totalUnits/sort.directHours:0}
+            };
+        });
+        renderHourlyTables(hourlyData,totalHours);
+        if(statusEl)statusEl.textContent='\u2713 Updated '+new Date().toLocaleTimeString();
+    }catch(err){
+        console.error('Hourly fetch failed:',err);
+        if(statusEl)statusEl.textContent='\u26A0 '+err.message;
+    }finally{btn.disabled=false;btn.textContent='\u25B6 Fetch Hourly';}
+}
+
+function renderHourlyTables(hourlyData,totalHours){
+    const container=document.getElementById('hourly-tables');if(!container)return;
+    const config=loadConfig();
+    const ibGoal=parseFloat(document.getElementById('ib-goal-input')?.value)||0;
+    const obGoal=parseFloat(document.getElementById('ob-goal-input')?.value)||0;
+    const sortGoal=parseFloat(document.getElementById('sort-goal')?.value)||0;
+    const ibRateT=parseFloat(document.getElementById('ib-rate-target')?.value)||0;
+    const obRateT=parseFloat(document.getElementById('ob-rate-target')?.value)||0;
+    const ibCplhT=parseFloat(document.getElementById('ib-cplh-target')?.value)||0;
+    const obCplhT=parseFloat(document.getElementById('ob-cplh-target')?.value)||0;
+
+    const ibPerHr=ibGoal>0?Math.round(ibGoal/totalHours):0;
+    const obPerHr=obGoal>0?Math.round(obGoal/totalHours):0;
+    const sortPerHr=sortGoal>0?Math.round(sortGoal/totalHours):0;
+
+    function condBg(actual,target){if(!actual||actual<=0||!target||target<=0)return'';return actual>=target?'background:rgba(46,125,50,0.12)':actual>=target*0.9?'background:rgba(230,81,0,0.1)':'background:rgba(198,40,40,0.1)';}
+    function fv(v,d=0){if(!v||isNaN(v)||v===0)return'';return Number(v).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d});}
+    function fvPct(v){if(!v||isNaN(v)||v===0)return'';return v.toFixed(1)+'%';}
+    function actTarget(actual,target,decimals=0){const a=fv(actual,decimals);const t=fv(target,decimals);if(!a&&!t)return'';if(!t)return a;if(!a)return'— / '+t;return a+' / '+t;}
+
+    // Headers
+    const headers=hourlyData.map(h=>'<th>'+h.label+'</th>').join('');
+    const totalHeader='<th>Total</th>';
+
+    // Calculate cumulative totals
+    let ibCum=0,obCum=0,sortCum=0;
+    const ibCums=[],obCums=[],sortCums=[];
+    hourlyData.forEach(h=>{ibCum+=h.ib.totalStow;obCum+=h.ob.pickUnits;sortCum+=h.sort.totalUnits;ibCums.push(ibCum);obCums.push(obCum);sortCums.push(sortCum);});
+
+    // IB Table
+    function buildTable(title,cssClass,rows){
+        return `<section class="hourly-section ${cssClass}"><h3>${title}</h3><div style="overflow-x:auto;"><table class="metrics-table"><thead><tr><th></th>${headers}${totalHeader}</tr></thead><tbody>${rows}</tbody></table></div></section>`;
+    }
+
+    function ibRow(label,getter,target,decimals=0){
+        let total=0;const cells=hourlyData.map((h,i)=>{const v=getter(h,i);if(typeof v==='number')total+=v;const display=fv(v,decimals);const style=target?condBg(v,target):'';return`<td style="${style}">${display}</td>`;}).join('');
+        return`<tr><td>${label}</td>${cells}<td style="font-weight:700;"></td></tr>`;
+    }
+    function ibRateRow(label,getter,target){
+        const cells=hourlyData.map(h=>{const v=getter(h);const display=fv(v,1);const style=target?condBg(v,target):'';return`<td style="${style}">${display}</td>`;}).join('');
+        return`<tr class="row-rate"><td>${label}</td>${cells}<td style="font-weight:700;">${actTarget(hourlyData.map(h=>getter(h)).filter(v=>v>0).reduce((a,b,_,arr)=>a+b/arr.length,0),target,1)}</td></tr>`;
+    }
+    function ibCumRow(label,cums,perHrTarget,goal){
+        const cells=cums.map((v,i)=>{const cumTarget=perHrTarget*(i+1);const style=condBg(v,cumTarget);return`<td style="font-weight:700;${style}">${fv(v)}</td>`;}).join('');
+        return`<tr class="row-sync"><td class="bold">${label}</td>${cells}<td style="font-weight:700;">${actTarget(cums[cums.length-1]||0,goal)}</td></tr>`;
+    }
+
+    const ibTargetRow=ibPerHr>0?`<tr class="row-target"><td class="bold">Target (per hr)</td>${hourlyData.map((_,i)=>`<td>${fv(ibPerHr*(i+1))}</td>`).join('')}<td style="font-weight:700;">${fv(ibGoal)}</td></tr>`:'';
+    const ibRows=ibTargetRow+
+        ibCumRow('Sync Metrics (Running Total)',ibCums,ibPerHr,ibGoal)+
+        ibRow('Cases Stowed',h=>h.ib.stowUnits)+
+        ibRow('Pallets Stowed',h=>h.ib.palletUnits)+
+        ibRateRow('Stow Rate',h=>h.ib.rate,ibRateT)+
+        ibRow('Direct Hours',h=>h.ib.directHours,0,2)+
+        ibRow('Indirect Hours',h=>h.ib.indirectHours,0,2)+
+        ibRow('Total Hours',h=>h.ib.totalHours,0,2)+
+        `<tr class="row-cplh"><td class="bold">CPLH</td>${hourlyData.map(h=>{const v=h.ib.cplh;const style=ibCplhT&&v>0?(v>=ibCplhT?'background:rgba(46,125,50,0.12)':v>=ibCplhT*0.9?'background:rgba(230,81,0,0.1)':'background:rgba(198,40,40,0.1)'):'';return`<td style="${style}">${fv(v,2)}</td>`;}).join('')}<td style="font-weight:700;">${actTarget(ibCum>0&&hourlyData.reduce((s,h)=>s+h.ib.totalHours,0)>0?ibCum/hourlyData.reduce((s,h)=>s+h.ib.totalHours,0):0,ibCplhT,2)}</td></tr>`;
+
+    const obTargetRow=obPerHr>0?`<tr class="row-target"><td class="bold">Target (per hr)</td>${hourlyData.map((_,i)=>`<td>${fv(obPerHr*(i+1))}</td>`).join('')}<td style="font-weight:700;">${fv(obGoal)}</td></tr>`:'';
+    const obRows=obTargetRow+
+        ibCumRow('Sync Metrics (Running Total)',obCums,obPerHr,obGoal)+
+        ibRow('Picked',h=>h.ob.pickUnits)+
+        ibRow('Loaded',h=>h.ob.loadedUnits)+
+        ibRateRow('Pick Rate',h=>h.ob.pickRate,obRateT)+
+        ibRow('Direct Hours',h=>h.ob.directHours,0,2)+
+        ibRow('Indirect Hours',h=>h.ob.indirectHours,0,2)+
+        ibRow('Total Hours',h=>h.ob.totalHours,0,2)+
+        `<tr class="row-cplh"><td class="bold">CPLH</td>${hourlyData.map(h=>{const v=h.ob.cplh;const style=obCplhT&&v>0?(v>=obCplhT?'background:rgba(46,125,50,0.12)':v>=obCplhT*0.9?'background:rgba(230,81,0,0.1)':'background:rgba(198,40,40,0.1)'):'';return`<td style="${style}">${fv(v,2)}</td>`;}).join('')}<td style="font-weight:700;">${actTarget(obCum>0&&hourlyData.reduce((s,h)=>s+h.ob.totalHours,0)>0?obCum/hourlyData.reduce((s,h)=>s+h.ob.totalHours,0):0,obCplhT,2)}</td></tr>`;
+
+    let sortHTML='';
+    const hasSortData=hourlyData.some(h=>h.sort.totalUnits>0);
+    if(hasSortData){
+        const sortTargetRow=sortPerHr>0?`<tr class="row-target"><td class="bold">Target (per hr)</td>${hourlyData.map((_,i)=>`<td>${fv(sortPerHr*(i+1))}</td>`).join('')}<td style="font-weight:700;">${fv(sortGoal)}</td></tr>`:'';
+        const sortRows=sortTargetRow+
+            ibCumRow('Sync Metrics (Running Total)',sortCums,sortPerHr,sortGoal)+
+            ibRow('Sorted',h=>h.sort.totalUnits)+
+            ibRateRow('Sort Rate',h=>h.sort.rate,0)+
+            ibRow('Direct Hours',h=>h.sort.directHours,0,2)+
+            `<tr class="row-cplh"><td class="bold">CPLH</td>${hourlyData.map(h=>`<td>${fv(h.sort.cplh,2)}</td>`).join('')}<td>${fv(sortCum>0&&hourlyData.reduce((s,h)=>s+h.sort.directHours,0)>0?sortCum/hourlyData.reduce((s,h)=>s+h.sort.directHours,0):0,2)}</td></tr>`;
+        sortHTML=buildTable('SORT | Hourly','sort-hourly',sortRows);
+    }
+
+    container.innerHTML=buildTable('INBOUND | Hourly','ib-hourly',ibRows)+buildTable('OUTBOUND | Hourly','ob-hourly',obRows)+sortHTML;
+
+    // Blank out future hour columns (hours that haven't started yet)
+    const now=new Date();
+    const currentMins=now.getHours()*60+now.getMinutes();
+    const tables=container.querySelectorAll('.metrics-table');
+    tables.forEach(table=>{
+        const rows=table.querySelectorAll('tbody tr');
+        rows.forEach(row=>{
+            const cells=row.querySelectorAll('td');
+            // cells[0] is label, cells[1..N-1] are hour columns, cells[N] is total
+            hourlyData.forEach((h,i)=>{
+                const cellIdx=i+1; // +1 because first td is label
+                if(cellIdx>=cells.length-1)return; // skip total column
+                const slotMins=h.label?parseInt(h.label.split(':')[0])*60+parseInt(h.label.split(':')[1]):0;
+                // Determine if this hour has started
+                let hasStarted=false;
+                if(config.shiftType==='Nights'){
+                    // Night shift: hours before midnight (>=12) started if currentMins >= slotMins
+                    // Hours after midnight (<12) started if we're past midnight (currentMins < 720) and currentMins >= slotMins
+                    const slotH=parseInt(h.label.split(':')[0]);
+                    if(slotH>=12){hasStarted=currentMins>=720?currentMins>=slotMins:true;}
+                    else{hasStarted=currentMins<720?currentMins>=slotMins:false;}
+                }else{
+                    hasStarted=currentMins>=slotMins;
+                }
+                if(!hasStarted && cells[cellIdx]){
+                    // Don't blank target row
+                    if(!row.classList.contains('row-target')){
+                        cells[cellIdx].textContent='';
+                        cells[cellIdx].style.background='';
+                    }
+                }
+            });
+        });
+    });
+}
 
 // === BOOT ===
 let boardActive=false, currentMetrics=null, config=loadConfig(), originalBody='';
@@ -723,7 +1117,7 @@ function initBoard(){
     document.getElementById('shift-select').value=config.shiftType;
     // Load targets
     const t=config.targets||{};
-    ['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target'].forEach(id=>{const el=document.getElementById(id);if(el&&t[id])el.value=t[id];});
+    ['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','site-cplh-target'].forEach(id=>{const el=document.getElementById(id);if(el&&t[id])el.value=t[id];});
     // Load settings
     const ds=config.days,ns=config.nights;
     ['ds-full-sh','ds-full-sm','ds-full-eh','ds-full-em','ds-p1-sh','ds-p1-sm','ds-p1-eh','ds-p1-em','ds-p2-sh','ds-p2-sm','ds-p2-eh','ds-p2-em','ds-p3-sh','ds-p3-sm','ds-p3-eh','ds-p3-em'].forEach((id,i)=>{const vals=[ds.full.sh,ds.full.sm,ds.full.eh,ds.full.em,ds.p1.sh,ds.p1.sm,ds.p1.eh,ds.p1.em,ds.p2.sh,ds.p2.sm,ds.p2.eh,ds.p2.em,ds.p3.sh,ds.p3.sm,ds.p3.eh,ds.p3.em];const el=document.getElementById(id);if(el)el.value=vals[i];});
@@ -734,11 +1128,18 @@ function initBoard(){
     document.getElementById('btn-fetch').onclick=doFetch;
     document.getElementById('btn-exit').onclick=exitBoard;
     document.getElementById('btn-snip').onclick=doSnip;
+    document.getElementById('btn-fetch-hourly')?.addEventListener('click',fetchHourlyData);
+    document.getElementById('btn-clear-targets')?.addEventListener('click',()=>{
+        ['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','sort-goal','sort-rate-target'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
+        saveTargetsUI();updateTargetRows();
+        // Clear the % column displays
+        ['ib-goal-pct','ib-rate-pct','ib-cplh-pct','ob-goal-pct','ob-rate-pct','ob-cplh-pct','sort-goal-pct','sort-rate-pct'].forEach(id=>{const el=document.getElementById(id);if(el){el.textContent='\u2014';el.classList.remove('pct-good','pct-warn','pct-bad');}});
+    });
     document.getElementById('btn-add-action')?.addEventListener('click',()=>{const a=loadActions();a.push({item:'',owner:'',status:'Open'});saveActions(a);renderActions();});
     document.getElementById('btn-clear-actions')?.addEventListener('click',()=>{if(confirm('Clear all actions?')){saveActions([]);renderActions();}});
     document.getElementById('btn-save-settings')?.addEventListener('click',saveSettingsUI);
     sel.onchange=e=>{config.site=e.target.value;if(SITE_SCHEDULES[config.site]){config.days=SITE_SCHEDULES[config.site].days;config.nights=SITE_SCHEDULES[config.site].nights;}saveConfig(config);refreshSettingsInputs();};
-    document.getElementById('shift-select').onchange=e=>{config.shiftType=e.target.value;saveConfig(config);};
+    document.getElementById('shift-select').onchange=e=>{config.shiftType=e.target.value;saveConfig(config);doFetch();};
     document.querySelectorAll('.target-input').forEach(inp=>{inp.addEventListener('input',updateTargetRows);inp.addEventListener('change',()=>{saveTargetsUI();if(currentMetrics)renderTargets(currentMetrics);});});
     document.querySelectorAll('.nav-tab').forEach(tab=>tab.onclick=()=>{document.querySelectorAll('.nav-tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));tab.classList.add('active');const target=document.getElementById('tab-'+tab.dataset.tab);if(target)target.classList.add('active');});
     const sup=loadSupport();Object.keys(sup).forEach(id=>{const el=document.getElementById(id);if(el)el.value=sup[id];});
@@ -759,17 +1160,23 @@ function doSnip(){
     btn.textContent='\u23F3 Capturing...';btn.disabled=true;
     // Temporarily remove sticky/scroll constraints so full content is captured
     const rightPanel=root.querySelector('.sync-right');
+    const syncLayout=root.querySelector('.sync-layout');
     const origStyles={};
-    if(rightPanel){origStyles.position=rightPanel.style.position;origStyles.maxHeight=rightPanel.style.maxHeight;origStyles.overflow=rightPanel.style.overflow;origStyles.top=rightPanel.style.top;rightPanel.style.position='static';rightPanel.style.maxHeight='none';rightPanel.style.overflow='visible';rightPanel.style.top='auto';}
+    if(rightPanel){origStyles.rPos=rightPanel.style.position;origStyles.rMax=rightPanel.style.maxHeight;origStyles.rOvf=rightPanel.style.overflow;origStyles.rTop=rightPanel.style.top;origStyles.rMinH=rightPanel.style.minHeight;rightPanel.style.position='static';rightPanel.style.maxHeight='none';rightPanel.style.overflow='visible';rightPanel.style.top='auto';rightPanel.style.minHeight='100%';}
+    if(syncLayout){origStyles.sGrid=syncLayout.style.gridTemplateColumns;origStyles.sAlign=syncLayout.style.alignItems;syncLayout.style.gridTemplateColumns='1fr 600px';syncLayout.style.alignItems='stretch';}
+    // Also ensure the sb-root expands fully
+    root.style.overflow='visible';root.style.height='auto';root.style.minWidth='1400px';root.style.width='1400px';
     // Force colors for html2canvas (doesn't resolve CSS vars well)
     const style=document.createElement('style');style.id='snip-fix';
-    style.textContent='#sb-root,#sb-root *{color:#e8eaed !important;}#sb-root .pct-good{color:#34c759 !important;}#sb-root .pct-warn{color:#ffcc00 !important;}#sb-root .pct-bad{color:#ff453a !important;}#sb-root .row-fast td{color:#ff9500 !important;}#sb-root .goal-title{color:#9aa0a6 !important;}#sb-root .goal-stats{color:#9aa0a6 !important;}#sb-root .goal-stats strong{color:#e8eaed !important;}#sb-root .fclm-timestamp{color:#9aa0a6 !important;}#sb-root .meta-text{color:#9aa0a6 !important;}#sb-root .target-input{color:#ffcc00 !important;}#sb-root .table-input{color:#ffcc00 !important;}#sb-root .panel-title{color:#9aa0a6 !important;}#sb-root .tg-compact h4{color:#2196F3 !important;}#sb-root .tg-compact:last-child h4{color:#FF9800 !important;}#sb-root .fixed-target{color:#34c759 !important;}#sb-root .row-hc td{color:#9aa0a6 !important;}#sb-root .section-header h2{color:#e8eaed !important;}#sb-root .metrics-table .bold{color:#e8eaed !important;}#sb-root .nav-tab{color:#9aa0a6 !important;}#sb-root .nav-tab.active{color:#fff !important;}';
+    style.textContent='#sb-root,#sb-root *{color:#000 !important;}#sb-root .pct-good{color:#2e7d32 !important;}#sb-root .pct-warn{color:#e65100 !important;}#sb-root .pct-bad{color:#c62828 !important;}#sb-root .row-fast td{color:#e65100 !important;}#sb-root .goal-title{color:#333 !important;}#sb-root .goal-stats{color:#333 !important;}#sb-root .goal-stats strong{color:#000 !important;}#sb-root .fclm-timestamp{color:#333 !important;}#sb-root .meta-text{color:#333 !important;}#sb-root .target-input{color:#000 !important;padding:4px 6px !important;font-size:13px !important;line-height:1.3 !important;}#sb-root .table-input{color:#000 !important;}#sb-root .panel-title{color:#333 !important;}#sb-root .tg-compact h4{color:#1565c0 !important;}#sb-root .tg-compact:last-child h4{color:#2e7d32 !important;}#sb-root .fixed-target{color:#2e7d32 !important;}#sb-root .row-hc td{color:#666 !important;}#sb-root .section-header h2{color:#000 !important;}#sb-root .metrics-table .bold{color:#000 !important;}#sb-root .nav-tab{color:#333 !important;}#sb-root .nav-tab.active{color:#fff !important;}#sb-root .target-table td{padding:4px 6px !important;line-height:1.4 !important;}';
     document.head.appendChild(style);
     setTimeout(()=>{
-        html2canvas(root,{backgroundColor:'#1a1d23',scale:1,useCORS:true,logging:false,windowHeight:root.scrollHeight,height:root.scrollHeight}).then(canvas=>{
+        html2canvas(root,{backgroundColor:'#ffffff',scale:1.5,useCORS:true,logging:false,windowHeight:root.scrollHeight,height:root.scrollHeight}).then(canvas=>{
             // Restore styles
             document.head.removeChild(style);
-            if(rightPanel){rightPanel.style.position=origStyles.position;rightPanel.style.maxHeight=origStyles.maxHeight;rightPanel.style.overflow=origStyles.overflow;rightPanel.style.top=origStyles.top;}
+            if(rightPanel){rightPanel.style.position=origStyles.rPos;rightPanel.style.maxHeight=origStyles.rMax;rightPanel.style.overflow=origStyles.rOvf;rightPanel.style.top=origStyles.rTop;rightPanel.style.minHeight=origStyles.rMinH||'';}
+            if(syncLayout){syncLayout.style.gridTemplateColumns=origStyles.sGrid;syncLayout.style.alignItems=origStyles.sAlign||'';}
+            root.style.overflow='';root.style.height='';root.style.minWidth='';root.style.width='';
             canvas.toBlob(blob=>{
                 if(navigator.clipboard&&window.ClipboardItem){
                     navigator.clipboard.write([new ClipboardItem({'image/png':blob})]).then(()=>{
@@ -777,7 +1184,7 @@ function doSnip(){
                     }).catch(()=>{downloadBlob(blob);btn.textContent='\uD83D\uDCF7 Snip';btn.disabled=false;});
                 } else {downloadBlob(blob);btn.textContent='\uD83D\uDCF7 Snip';btn.disabled=false;}
             },'image/png');
-        }).catch(e=>{document.head.removeChild(style);if(rightPanel){rightPanel.style.position=origStyles.position;rightPanel.style.maxHeight=origStyles.maxHeight;rightPanel.style.overflow=origStyles.overflow;rightPanel.style.top=origStyles.top;}console.error('Snip failed:',e);btn.textContent='\uD83D\uDCF7 Snip';btn.disabled=false;alert('Screenshot failed: '+e.message);});
+        }).catch(e=>{document.head.removeChild(style);if(rightPanel){rightPanel.style.position=origStyles.rPos;rightPanel.style.maxHeight=origStyles.rMax;rightPanel.style.overflow=origStyles.rOvf;rightPanel.style.top=origStyles.rTop;}if(syncLayout){syncLayout.style.gridTemplateColumns=origStyles.sGrid;syncLayout.style.alignItems=origStyles.sAlign||'';}root.style.overflow='';root.style.height='';console.error('Snip failed:',e);btn.textContent='\uD83D\uDCF7 Snip';btn.disabled=false;alert('Screenshot failed: '+e.message);});
     },150);
 }
 function downloadBlob(blob){
@@ -796,14 +1203,35 @@ async function doFetch(){
         renderTargets(currentMetrics);renderCharts(currentMetrics);
         renderFastStart(raw.fastStart,config);
         blankFuturePeriods(config);
+        // Render Site CPLH: (Stow EACH units + OB Dock/Transfer Out EACH units) / THROUGHPUT hours
+        // For sort sites use eachUnits, for non-sort (case) sites use caseUnits
+        const pprFull=raw.full?.ppr||{};
+        const hasSortData=(currentMetrics.sort.full?.totalUnits||0)>0;
+        const stowVol=hasSortData?(raw.full?.stow?.eachUnits||0):(raw.full?.stow?.caseUnits||0);
+        const obDockVol=hasSortData?(raw.full?.obDock?.eachUnits||0):(raw.full?.obDock?.caseUnits||0);
+        const tHrs=pprFull.throughputHrs||0;
+        const siteThroughputVol=stowVol+obDockVol;
+        const siteCplh=tHrs>0?siteThroughputVol/tHrs:0;
+        setEl('site-cplh-value',siteCplh>0?fmt(siteCplh,2):'\u2014');
+        // Color Site CPLH based on target
+        const siteCplhTarget=parseFloat(document.getElementById('site-cplh-target')?.value)||0;
+        const siteCplhEl=document.getElementById('site-cplh-value');
+        if(siteCplhEl){siteCplhEl.style.color='';if(siteCplhTarget>0&&siteCplh>0){if(siteCplh>=siteCplhTarget)siteCplhEl.style.color='#2e7d32';else if(siteCplh>=siteCplhTarget*0.9)siteCplhEl.style.color='#e65100';else siteCplhEl.style.color='#c62828';}}
+        setEl('site-throughput-vol',siteThroughputVol>0?fmt(siteThroughputVol):'\u2014');
+        setEl('site-throughput-hrs',tHrs>0?fmt(tHrs,2):'\u2014');
+        // Site CPLH % to target
+        if(siteCplhTarget>0&&siteCplh>0){const p=(siteCplh/siteCplhTarget)*100;const el=setEl('site-cplh-pct',fmtPct(p));setPctClass(el,p);}
+        // Fetch Learning Curve data from ADAPT
+        fetchLearningCurve(config.site,'1003035','ib-lc-display'); // Stow
+        fetchLearningCurve(config.site,'1003065','ob-lc-display'); // Pick
         // Retry charts if Chart.js wasn't ready yet
         if(typeof Chart==='undefined'){setTimeout(()=>{if(typeof Chart!=='undefined'&&currentMetrics)renderCharts(currentMetrics);},2000);}
     }catch(err){console.error(err);setStatus('\u26A0\uFE0F '+err.message);alert('Fetch failed: '+err.message+'\n\nMake sure you are on Amazon network and authenticated to Midway.');}
     finally{btn.disabled=false;btn.textContent='\u25B6 Get Data';}
 }
 
-function saveTargetsUI(){a
-    const t={};['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target'].forEach(id=>{t[id]=document.getElementById(id)?.value||'';});
+function saveTargetsUI(){
+    const t={};['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','site-cplh-target'].forEach(id=>{t[id]=document.getElementById(id)?.value||'';});
     config.targets=t;saveConfig(config);
 }
 
