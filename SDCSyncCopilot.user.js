@@ -387,11 +387,11 @@ function renderIB(m){
 }
 function renderOB(m){
     const p1=m.ob.p1||{},p2=m.ob.p2||{},p3=m.ob.p3||{},f=m.ob.full||{};
-    setEl('ob-sync-p1',fmt(p1.pickUnits));setEl('ob-sync-p2',fmt(p2.pickUnits));setEl('ob-sync-p3',fmt(p3.pickUnits));setEl('ob-sync-total',fmt(f.pickUnits));
-    // Conditional format OB sync metrics cells vs targets
+    setEl('ob-sync-p1',fmt(p1.loadedUnits));setEl('ob-sync-p2',fmt(p2.loadedUnits));setEl('ob-sync-p3',fmt(p3.loadedUnits));setEl('ob-sync-total',fmt(f.loadedUnits));
+    // Conditional format OB sync metrics cells vs targets (based on loaded)
     const obG=parseFloat(document.getElementById('ob-goal-input')?.value)||0;
     if(obG>0){const periods=loadConfig().schedType==='4Q'?4:3;
-        [['ob-sync-p1',p1.pickUnits,obG/periods],['ob-sync-p2',p2.pickUnits,obG/periods*2],['ob-sync-p3',p3.pickUnits,obG],['ob-sync-total',f.pickUnits,obG]].forEach(([id,act,tgt])=>{
+        [['ob-sync-p1',p1.loadedUnits,obG/periods],['ob-sync-p2',p2.loadedUnits,obG/periods*2],['ob-sync-p3',p3.loadedUnits,obG],['ob-sync-total',f.loadedUnits,obG]].forEach(([id,act,tgt])=>{
             const el=document.getElementById(id);if(!el)return;if(!act||act<=0){el.style.background='';return;}el.style.background=act>=tgt?'rgba(52,211,153,0.15)':act>=tgt*0.95?'rgba(251,191,36,0.1)':'rgba(220,38,38,0.12)';});
     }
     setEl('ob-pick-p1',fmt(p1.pickUnits));setEl('ob-pick-p2',fmt(p2.pickUnits));setEl('ob-pick-p3',fmt(p3.pickUnits));setEl('ob-pick-total',fmt(f.pickUnits));
@@ -401,6 +401,11 @@ function renderOB(m){
     const obRT=parseFloat(document.getElementById('ob-rate-target')?.value)||0;
     if(obRT>0){['ob-rate-p1','ob-rate-p2','ob-rate-p3','ob-rate-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';return;}if(v>=obRT)el.style.background='rgba(52,211,153,0.15)';else if(v>=obRT*0.95)el.style.background='rgba(251,191,36,0.1)';else el.style.background='rgba(220,38,38,0.12)';});}
     setEl('ob-loadp-p1',fmt(p1.loadedUnits));setEl('ob-loadp-p2',fmt(p2.loadedUnits));setEl('ob-loadp-p3',fmt(p3.loadedUnits));setEl('ob-loadp-total',fmt(f.loadedUnits));
+    // Conditional format Loaded per Period cells vs targets
+    if(obG>0){const periods=loadConfig().schedType==='4Q'?4:3;
+        [['ob-loadp-p1',p1.loadedUnits,obG/periods],['ob-loadp-p2',p2.loadedUnits,obG/periods*2],['ob-loadp-p3',p3.loadedUnits,obG],['ob-loadp-total',f.loadedUnits,obG]].forEach(([id,act,tgt])=>{
+            const el=document.getElementById(id);if(!el)return;if(!act||act<=0){el.style.background='';return;}el.style.background=act>=tgt?'rgba(52,211,153,0.15)':act>=tgt*0.95?'rgba(251,191,36,0.1)':'rgba(220,38,38,0.12)';});
+    }
     setEl('ob-dhrs-p1',fmt(p1.directHours,2));setEl('ob-dhrs-p2',fmt(p2.directHours,2));setEl('ob-dhrs-p3',fmt(p3.directHours,2));setEl('ob-dhrs-total',fmt(f.directHours,2));
     setEl('ob-dpct-p1',fmtPct(p1.directPct));setEl('ob-dpct-p2',fmtPct(p2.directPct));setEl('ob-dpct-p3',fmtPct(p3.directPct));setEl('ob-dpct-total',fmtPct(f.directPct));
     setEl('ob-ihrs-p1',fmt(p1.indirectHours,2));setEl('ob-ihrs-p2',fmt(p2.indirectHours,2));setEl('ob-ihrs-p3',fmt(p3.indirectHours,2));setEl('ob-ihrs-total',fmt(f.indirectHours,2));
@@ -451,7 +456,7 @@ function renderTargets(m){
     if(ibG>0){const p=(f.totalStow||0)/ibG*100;const el=setEl('ib-goal-pct',fmtPct(p));setPctClass(el,p);}
     if(ibRateT>0&&f.rate){const p=(f.rate/ibRateT)*100;const el=setEl('ib-rate-pct',fmtPct(p));setPctClass(el,p);}
     if(ibCplhT>0&&f.cplh){const p=(f.cplh/ibCplhT)*100;const el=setEl('ib-cplh-pct',fmtPct(p));setPctClass(el,p);}
-    if(obG>0){const p=(ob.pickUnits||0)/obG*100;const el=setEl('ob-goal-pct',fmtPct(p));setPctClass(el,p);}
+    if(obG>0){const p=(ob.loadedUnits||0)/obG*100;const el=setEl('ob-goal-pct',fmtPct(p));setPctClass(el,p);}
     // OB Rate % to goal
     const obRateT=parseFloat(document.getElementById('ob-rate-target')?.value)||0;
     const obCplhT=parseFloat(document.getElementById('ob-cplh-target')?.value)||0;
@@ -482,7 +487,7 @@ function renderTargets(m){
     const ibM1=document.getElementById('ib-marker-p1');const ibM2=document.getElementById('ib-marker-p2');
     if(ibM1)ibM1.style.left=(100/periods)+'%';if(ibM2)ibM2.style.left=(200/periods)+'%';
     setEl('sum-pick-goal',obG>0?fmt(obG):'—');setEl('sum-pick-rate',ob.pickRate?fmt(ob.pickRate,1):'—');setEl('sum-ob-cplh',ob.cplh?fmt(ob.cplh,2):'—');
-    if(obG>0&&ob.pickUnits){const p=(ob.pickUnits/obG)*100;const el=setEl('sum-ob-pct',fmtPct(p));const pColor=getPaceColor(p,config);el.classList.remove('pct-good','pct-warn','pct-bad');el.classList.add(pColor==='green'?'pct-good':pColor==='amber'?'pct-warn':'pct-bad');setEl('sum-ob-actual',fmt(ob.pickUnits));setEl('sum-ob-remaining',fmt(obG-ob.pickUnits));
+    if(obG>0&&ob.loadedUnits){const p=(ob.loadedUnits/obG)*100;const el=setEl('sum-ob-pct',fmtPct(p));const pColor=getPaceColor(p,config);el.classList.remove('pct-good','pct-warn','pct-bad');el.classList.add(pColor==='green'?'pct-good':pColor==='amber'?'pct-warn':'pct-bad');setEl('sum-ob-actual',fmt(ob.loadedUnits));setEl('sum-ob-remaining',fmt(obG-ob.loadedUnits));
         const bar=document.getElementById('ob-progress-bar');if(bar){bar.style.width=Math.min(p,100)+'%';bar.className='goal-progress-bar '+pColor;}}
     const obM1=document.getElementById('ob-marker-p1');const obM2=document.getElementById('ob-marker-p2');
     if(obM1)obM1.style.left=(100/periods)+'%';if(obM2)obM2.style.left=(200/periods)+'%';
@@ -493,7 +498,7 @@ function renderTargets(m){
     const ibActiveHC=(m.ib.p3?.headcount>0?m.ib.p3.headcount:m.ib.p2?.headcount>0?m.ib.p2.headcount:m.ib.p1?.headcount)||0;
     const obActiveHC=(m.ob.p3?.pickHC>0?m.ob.p3.pickHC:m.ob.p2?.pickHC>0?m.ob.p2.pickHC:m.ob.p1?.pickHC)||0;
     renderPaceInsight('ib-pace-insight',ibG,f.totalStow||0,f.rate||0,ibActiveHC,config);
-    renderPaceInsight('ob-pace-insight',obG,ob.pickUnits||0,ob.pickRate||0,obActiveHC,config);
+    renderPaceInsight('ob-pace-insight',obG,ob.loadedUnits||0,ob.pickRate||0,obActiveHC,config);
 }
 function renderPaceInsight(elId,goal,actual,rate,hc,config){
     const el=document.getElementById(elId);if(!el)return;
