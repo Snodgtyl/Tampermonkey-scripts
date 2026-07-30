@@ -1114,6 +1114,27 @@ function launch(){
 
 function exitBoard(){document.body.innerHTML=originalBody;boardActive=false;addLaunchBtn();}
 
+function clearBoard(){
+    // Clear all metric cells (not inputs, not target rows)
+    document.querySelectorAll('.metrics-table td:not(:first-child)').forEach(td=>{
+        if(!td.querySelector('input')&&!td.closest('.row-target')){td.textContent='\u2014';td.style.background='';}
+    });
+    // Clear summary cards
+    ['sum-stow-goal','sum-stow-rate','sum-ib-cplh','sum-ib-pct','sum-ib-actual','sum-ib-remaining','sum-pick-goal','sum-pick-rate','sum-ob-cplh','sum-ob-pct','sum-ob-actual','sum-ob-remaining','sum-sort-goal','sum-sort-rate','sum-sort-cplh','sum-sort-pct','sum-sort-actual','sum-sort-remaining'].forEach(id=>{const el=document.getElementById(id);if(el){el.textContent='\u2014';el.classList.remove('pct-good','pct-warn','pct-bad');}});
+    // Reset progress bars
+    ['ib-progress-bar','ob-progress-bar','sort-progress-bar'].forEach(id=>{const el=document.getElementById(id);if(el){el.style.width='0%';el.className='goal-progress-bar green';}});
+    // Clear site CPLH
+    ['site-cplh-value','site-throughput-vol','site-throughput-hrs'].forEach(id=>{const el=document.getElementById(id);if(el){el.textContent='\u2014';el.style.color='';}});
+    // Clear hourly tables
+    const hourlyContainer=document.getElementById('hourly-tables');if(hourlyContainer)hourlyContainer.innerHTML='';
+    // Clear charts
+    Object.keys(charts).forEach(k=>{if(charts[k]){charts[k].destroy();delete charts[k];}});
+    // Clear pace insights
+    ['ib-pace-insight','ob-pace-insight'].forEach(id=>{const el=document.getElementById(id);if(el)el.textContent='';});
+    // Re-render target rows
+    updateTargetRows();
+}
+
 function initBoard(){
     config=loadConfig();
     const sel=document.getElementById('site-select');
@@ -1143,8 +1164,8 @@ function initBoard(){
     document.getElementById('btn-add-action')?.addEventListener('click',()=>{const a=loadActions();a.push({item:'',owner:'',status:'Open'});saveActions(a);renderActions();});
     document.getElementById('btn-clear-actions')?.addEventListener('click',()=>{if(confirm('Clear all actions?')){saveActions([]);renderActions();}});
     document.getElementById('btn-save-settings')?.addEventListener('click',saveSettingsUI);
-    sel.onchange=e=>{config.site=e.target.value;if(SITE_SCHEDULES[config.site]){config.days=SITE_SCHEDULES[config.site].days;config.nights=SITE_SCHEDULES[config.site].nights;}saveConfig(config);refreshSettingsInputs();};
-    document.getElementById('shift-select').onchange=e=>{config.shiftType=e.target.value;saveConfig(config);doFetch();};
+    sel.onchange=e=>{config.site=e.target.value;if(SITE_SCHEDULES[config.site]){config.days=SITE_SCHEDULES[config.site].days;config.nights=SITE_SCHEDULES[config.site].nights;}saveConfig(config);refreshSettingsInputs();currentMetrics=null;clearBoard();updatePeriodDots();};
+    document.getElementById('shift-select').onchange=e=>{config.shiftType=e.target.value;saveConfig(config);currentMetrics=null;clearBoard();updatePeriodDots();doFetch();};
     document.querySelectorAll('.target-input').forEach(inp=>{inp.addEventListener('input',updateTargetRows);inp.addEventListener('change',()=>{saveTargetsUI();if(currentMetrics)renderTargets(currentMetrics);});});
     document.querySelectorAll('.nav-tab').forEach(tab=>tab.onclick=()=>{document.querySelectorAll('.nav-tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));tab.classList.add('active');const target=document.getElementById('tab-'+tab.dataset.tab);if(target)target.classList.add('active');});
     const sup=loadSupport();Object.keys(sup).forEach(id=>{const el=document.getElementById(id);if(el)el.value=sup[id];});
