@@ -1,13 +1,16 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      5.0.0
+// @version      6.0.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
 // @grant        GM_xmlhttpRequest
 // @connect      fc-benchmarking.amazon.com
 // @connect      adapt-iad.amazon.com
+// @connect      galaxybi.aka.corp.amazon.com
+// @connect      galaxybiprintfile-prod.s3.us-west-2.amazonaws.com
+// @connect      midway-auth.amazon.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -100,15 +103,24 @@ function parsePPR(html){
     let throughputVol=0,throughputHrs=0;
     const tpRow=doc.querySelector('tr#ppr\\.fcSummary\\.throughput')||doc.querySelector('tr[id*="fcSummary.throughput"]');
     if(tpRow){const cells=tpRow.querySelectorAll('td');cells.forEach(c=>{const cls=c.className;const div=c.querySelector('div.original');const txt=(div?div.textContent:c.textContent).trim().replace(/,/g,'');const v=parseFloat(txt);if(cls.includes('actualVolume')&&!isNaN(v))throughputVol=v;if(cls.includes('actualTimeSeconds')&&!isNaN(v))throughputHrs=v;});}
-    return{ibPlannedHrs:ibPlan,ibActualHrs:ibAct,obPlannedHrs:obPlan,obActualHrs:obAct,daTransferHrs,daTransferPlan,caseStowReserveHrs,throughputVol,throughputHrs};
+    // TIME OFF TASK row from FC Summary
+    let totHrs=0;
+    const totRow=doc.querySelector('tr#ppr\\.fcSummary\\.timeOffTask')||doc.querySelector('tr[id*="fcSummary.timeOffTask"]');
+    if(totRow){const cells=totRow.querySelectorAll('td');cells.forEach(c=>{const cls=c.className;const div=c.querySelector('div.original');const txt=(div?div.textContent:c.textContent).trim().replace(/,/g,'');const v=parseFloat(txt);if(cls.includes('actualTimeSeconds')&&!isNaN(v))totHrs=v;});}
+    // Fallback: search rows for "Time Off Task" text if ID selector didn't match
+    if(totHrs===0){for(const row of rows){const cells=row.querySelectorAll('td,th');for(let ci=0;ci<cells.length;ci++){const ct=cells[ci].textContent.trim();if(ct==='Time Off Task'){const hrsCell=row.querySelector('td.actualTimeSeconds')||row.querySelector('td.numeric.actualTimeSeconds');if(hrsCell){const div=hrsCell.querySelector('div.original');const txt=(div?div.textContent:hrsCell.textContent).trim().replace(/,/g,'');totHrs=parseFloat(txt)||0;}break;}}if(totHrs>0)break;}}
+    return{ibPlannedHrs:ibPlan,ibActualHrs:ibAct,obPlannedHrs:obPlan,obActualHrs:obAct,daTransferHrs,daTransferPlan,caseStowReserveHrs,throughputVol,throughputHrs,totHrs};
 }
 
 async function fetchPeriod(site,startDate,sched){
     const sh=sched.sh,sm=sched.sm,eh=sched.eh,em=sched.em;
-    let eDate=new Date(startDate);if(eh<sh)eDate.setDate(eDate.getDate()+1);
-    const urls={ppr:buildPPRUrl(site,startDate,sh,sm,eDate,eh,em),stow:buildFnUrl(site,PROCESS_IDS.stow,startDate,sh,sm,eDate,eh,em),palletStow:buildFnUrl(site,PROCESS_IDS.palletStow,startDate,sh,sm,eDate,eh,em),pick:buildFnUrl(site,PROCESS_IDS.pick,startDate,sh,sm,eDate,eh,em),sort:buildFnUrl(site,PROCESS_IDS.sort,startDate,sh,sm,eDate,eh,em),obDock:buildFnUrl(site,PROCESS_IDS.obDock,startDate,sh,sm,eDate,eh,em)};
+    // For night shift periods after midnight, adjust the start date to next day
+    let sDate=new Date(startDate);
+    if(sh<12&&startDate.getHours()>=12){sDate.setDate(sDate.getDate()+1);}
+    let eDate=new Date(sDate);if(eh<sh)eDate.setDate(eDate.getDate()+1);
+    const urls={ppr:buildPPRUrl(site,sDate,sh,sm,eDate,eh,em),stow:buildFnUrl(site,PROCESS_IDS.stow,sDate,sh,sm,eDate,eh,em),palletStow:buildFnUrl(site,PROCESS_IDS.palletStow,sDate,sh,sm,eDate,eh,em),pick:buildFnUrl(site,PROCESS_IDS.pick,sDate,sh,sm,eDate,eh,em),sort:buildFnUrl(site,PROCESS_IDS.sort,sDate,sh,sm,eDate,eh,em),obDock:buildFnUrl(site,PROCESS_IDS.obDock,sDate,sh,sm,eDate,eh,em)};
     const res={};
-    await Promise.all(Object.entries(urls).map(async([k,u])=>{try{const h=await fetchHTML(u);res[k]=k==='ppr'?parsePPR(h):parseFnRollup(h);}catch(e){console.warn('[SB]',k,e.message);res[k]=k==='ppr'?{ibPlannedHrs:0,ibActualHrs:0,obPlannedHrs:0,obActualHrs:0,daTransferHrs:0,daTransferPlan:0,caseStowReserveHrs:0,throughputVol:0,throughputHrs:0}:{totalUnits:0,directHours:0,rate:0,headcount:0};}}));
+    await Promise.all(Object.entries(urls).map(async([k,u])=>{try{const h=await fetchHTML(u);res[k]=k==='ppr'?parsePPR(h):parseFnRollup(h);}catch(e){console.warn('[SB]',k,e.message);res[k]=k==='ppr'?{ibPlannedHrs:0,ibActualHrs:0,obPlannedHrs:0,obActualHrs:0,daTransferHrs:0,daTransferPlan:0,caseStowReserveHrs:0,throughputVol:0,throughputHrs:0,totHrs:0}:{totalUnits:0,directHours:0,rate:0,headcount:0};}}));
     return res;
 }
 
@@ -116,15 +128,16 @@ async function fetchAllData(config){
     const site=config.site,sched=config.shiftType==='Nights'?config.nights:config.days,{startDate}=getShiftDates(config);
     setStatus('Fetching all periods...');
     // Fetch all periods in parallel for speed
-    const [full,p1,p2,p3,fastStart]=await Promise.all([
+    const [full,p1,p2,p3,fastStart,data24]=await Promise.all([
         fetchPeriod(site,startDate,sched.full),
         fetchPeriod(site,startDate,sched.p1),
         fetchPeriod(site,startDate,sched.p2),
         fetchPeriod(site,startDate,sched.p3),
-        fetchFastStart(site,config.shiftType)
+        fetchFastStart(site,config.shiftType),
+        fetch24hrData(site)
     ]);
     setStatus('\u2713 Updated '+new Date().toLocaleTimeString());
-    return{full,p1,p2,p3,fastStart};
+    return{full,p1,p2,p3,fastStart,data24};
 }
 
 function fetchFastStart(site,shiftType){
@@ -141,6 +154,231 @@ function fetchFastStart(site,shiftType){
             onerror:function(){resolve({ibSOS:0,ibEOL:0,obSOS:0,obEOL:0});}
         });
     });
+}
+
+// === 24-HOUR DATA FETCH (00:00 - 23:59 today) for BB Goal Tracker ===
+async function fetch24hrData(site){
+    try{
+        const today=new Date();
+        const startDate=new Date(today);startDate.setHours(0,0,0,0);
+        const endDate=new Date(today);
+        // Stow (Case Transfer In) and OB Dock (Transfer Out) function rollups for full day
+        const stowUrl=buildFnUrl(site,PROCESS_IDS.stow,startDate,0,0,endDate,23,59);
+        const obDockUrl=buildFnUrl(site,PROCESS_IDS.obDock,startDate,0,0,endDate,23,59);
+        const [stowHtml,obDockHtml]=await Promise.all([fetchHTML(stowUrl),fetchHTML(obDockUrl)]);
+        const stow=parseFnRollup(stowHtml);
+        const obDock=parseFnRollup(obDockHtml);
+        const ibDensity24=(stow.caseUnits||0)>0?(stow.eachUnits||0)/(stow.caseUnits||1):0;
+        const obDensity24=(obDock.caseUnits||0)>0?(obDock.eachUnits||0)/(obDock.caseUnits||1):0;
+        return{ibVol24:stow.totalUnits||0,obVol24:obDock.totalUnits||0,ibDensity24,obDensity24};
+    }catch(e){console.warn('[SB] 24hr data fetch error:',e.message);return{ibVol24:0,obVol24:0,ibDensity24:0,obDensity24:0};}
+}
+
+// === LABOR PLANNING (LP) CPLH — Manual Input + Auto-fetch attempt ===
+function loadLPValues(){
+    try{const s=localStorage.getItem('syncboard_lp');return s?JSON.parse(s):{};}catch(e){return{};}
+}
+function saveLPValues(lp){
+    try{localStorage.setItem('syncboard_lp',JSON.stringify(lp));}catch(e){}
+}
+
+function fetchLPDataAuto(site){
+    return new Promise((resolve)=>{
+        attemptLPFetch(site,resolve,false);
+    });
+}
+function attemptLPFetch(site,resolve,isRetry){
+        const now=new Date();
+        const day=now.getDay();
+        const sun=new Date(now);sun.setDate(now.getDate()-(day===0?0:day));sun.setHours(0,0,0,0);
+        const sundayStr=sun.getFullYear()+'-'+String(sun.getMonth()+1).padStart(2,'0')+'-'+String(sun.getDate()).padStart(2,'0');
+        const end=new Date(sun);end.setDate(end.getDate()+14);
+        const endStr=end.getFullYear()+'-'+String(end.getMonth()+1).padStart(2,'0')+'-'+String(end.getDate()).padStart(2,'0');
+        const reportsUrl=`https://galaxybi.aka.corp.amazon.com/api/folders/labor-planning/templates/lR8NujgNmqXM-print-file/reports?site=${site}&reportType=PUBLISHED&startReportDate=${sundayStr}&endReportDate=${endStr}&userName=snodgtyl`;
+        console.log('[SB-LP] Fetching reports:',reportsUrl);
+        GM_xmlhttpRequest({method:'GET',url:reportsUrl,
+            headers:{'Accept':'*/*','Content-Type':'application/json'},
+            onload:function(resp){
+                try{
+                    const text=resp.responseText.trim();
+                    if(!text.startsWith('[')&&!text.startsWith('{')){
+                        console.warn('[SB-LP] Reports not JSON, status:',resp.status,'first 200:',text.substring(0,200));
+                        resolve(null);return;
+                    }
+                    const data=JSON.parse(text);
+                    const reports=data.reports||data||[];
+                    const finalReport=reports.find(r=>r.reportName&&r.reportName.toLowerCase().includes('final'));
+                    if(!finalReport||!finalReport.planId){console.warn('[SB-LP] No Final report found');resolve(null);return;}
+                    const planId=finalReport.planId;
+                    console.log('[SB-LP] Found:',finalReport.reportName,'planId=',planId);
+                    let done=0;const results={ibCplh:0,obCplh:0,siteCplh:0,ctiRate:0,topRate:0,ibDensityLP:0,obDensityLP:0};
+                    const checkDone=()=>{if(done>=7){saveLPValues(results);resolve(results);}};
+                    fetchLPPageAuto(planId,'IB',sundayStr,'key','IB Total CPLH',(v)=>{results.ibCplh=v;done++;checkDone();});
+                    fetchLPPageAuto(planId,'DA',sundayStr,'key','DA Bldg to Bldg Total - CPLH',(v)=>{results.obCplh=v;done++;checkDone();});
+                    fetchLPPageAuto(planId,'UnderatedRatesAndHours',sundayStr,'lineItem','Total Building CPLH Inc Support',(v)=>{results.siteCplh=v;done++;checkDone();});
+                    fetchLPPageAutoRate(planId,'UnderatedRatesAndHours',sundayStr,'Case Transfer In',(v)=>{results.ctiRate=v;done++;checkDone();});
+                    fetchLPPageAutoRate(planId,'UnderatedRatesAndHours',sundayStr,'Transfer Out Pick - Small',(v)=>{results.topRate=v;done++;checkDone();});
+                    fetchLPPageAutoRate(planId,'Density',sundayStr,'Case Transfer In',(v)=>{results.ibDensityLP=v;done++;checkDone();});
+                    fetchLPPageAutoRate(planId,'Density',sundayStr,'DA Bldg to Bldg Transfer TOTAL',(v)=>{results.obDensityLP=v;done++;checkDone();});
+                }catch(e){console.warn('[SB-LP] Parse error:',e);resolve(null);}
+            },
+            onerror:function(e){
+                if(!isRetry){
+                    console.log('[SB-LP] Auth failed, refreshing GalaxyBI session via iframe...');
+                    const iframe=document.createElement('iframe');
+                    iframe.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;';
+                    iframe.src='https://galaxybi.aka.corp.amazon.com/';
+                    document.body.appendChild(iframe);
+                    setTimeout(()=>{
+                        if(iframe.parentNode)iframe.parentNode.removeChild(iframe);
+                        console.log('[SB-LP] Retrying LP fetch after auth...');
+                        attemptLPFetch(site,resolve,true);
+                    },5000);
+                }else{
+                    console.warn('[SB-LP] Fetch error after retry:',e);
+                    resolve(null);
+                }
+            },
+            ontimeout:function(){resolve(null);}
+        });
+}
+
+function fetchLPPageAuto(planId,pageName,sundayStr,fieldName,targetKey,callback){
+    const site=loadConfig().site;
+    const url=`https://galaxybi.aka.corp.amazon.com/api/metadata/pageUrl?pageName=${pageName}&planId=${planId}&site=${site}`;
+    console.log('[SB-LP] Fetching page:',pageName,'url:',url);
+    GM_xmlhttpRequest({method:'GET',url,headers:{'Accept':'*/*','Content-Type':'application/json'},
+        onload:function(resp){
+            try{
+                const text=resp.responseText.trim();
+                console.log('[SB-LP] pageUrl response for',pageName,'status:',resp.status,'first 200:',text.substring(0,200));
+                if(!text.startsWith('{')){callback(0);return;}
+                const s3Url=JSON.parse(text).url;
+                if(!s3Url){console.warn('[SB-LP] No url field for',pageName);callback(0);return;}
+                console.log('[SB-LP] Got S3 URL for',pageName,s3Url.substring(0,80)+'...');
+                GM_xmlhttpRequest({method:'GET',url:s3Url,headers:{'Accept':'*/*'},
+                    onload:function(s3Resp){
+                        try{
+                            const rows=JSON.parse(s3Resp.responseText);
+                            console.log('[SB-LP]',pageName,'data:',rows.length,'rows');
+                            if(pageName==='UnderatedRatesAndHours'){
+                                console.log('[SB-LP] Sample row keys:',rows.length>0?Object.keys(rows[0]):[]);
+                                console.log('[SB-LP] Sample row 0:',JSON.stringify(rows[0]).substring(0,200));
+                                const found=rows.filter(r=>JSON.stringify(r).toLowerCase().includes('building cplh'));
+                                console.log('[SB-LP] ALL "Building CPLH" rows (',found.length,'):');
+                                found.forEach((r,i)=>console.log('[SB-LP]  ',i,r.type,r.lineItem,r.date,r.packType,'=',r.value));
+                            }
+                            let val=0;
+                            for(const row of rows){
+                                const name=(row[fieldName]||'').trim();
+                                const matches=name===targetKey||name.includes(targetKey);
+                                if(matches&&row.date===sundayStr){
+                                    // For UnderatedRatesAndHours, look for Forecast + Cartons
+                                    if(pageName==='UnderatedRatesAndHours'){
+                                        if(row.type!=='Forecast'||row.packType!=='Cartons')continue;
+                                    }else{
+                                        if(row.packType&&row.packType!=='Units')continue;
+                                    }
+                                    val=parseFloat(row.value)||0;break;
+                                }
+                            }
+                            // Fallback
+                            if(val===0){for(const row of rows){const name=(row[fieldName]||'').trim();const matches=name===targetKey||name.includes(targetKey);if(matches&&row.value&&parseFloat(row.value)>0){if(pageName==='UnderatedRatesAndHours'){if(row.type!=='Forecast'||row.packType!=='Cartons')continue;}val=parseFloat(row.value);break;}}}
+                            console.log(`[SB-LP] ${pageName} → ${targetKey} = ${val}`);
+                            callback(val);
+                        }catch(e){console.warn('[SB-LP] S3 parse error:',pageName,e);callback(0);}
+                    },onerror:function(e){console.warn('[SB-LP] S3 fetch error:',pageName,e);callback(0);},ontimeout:function(){callback(0);}
+                });
+            }catch(e){console.warn('[SB-LP] pageUrl parse error:',pageName,e);callback(0);}
+        },onerror:function(e){console.warn('[SB-LP] pageUrl fetch error:',pageName,e);callback(0);},ontimeout:function(){callback(0);}
+    });
+}
+
+function fetchLPPageAutoRate(planId,pageName,sundayStr,targetLineItem,callback){
+    const site=loadConfig().site;
+    const url=`https://galaxybi.aka.corp.amazon.com/api/metadata/pageUrl?pageName=${pageName}&planId=${planId}&site=${site}`;
+    GM_xmlhttpRequest({method:'GET',url,headers:{'Accept':'*/*','Content-Type':'application/json'},
+        onload:function(resp){
+            try{
+                const text=resp.responseText.trim();
+                if(!text.startsWith('{')){{callback(0);return;}}
+                const s3Url=JSON.parse(text).url;
+                if(!s3Url){callback(0);return;}
+                GM_xmlhttpRequest({method:'GET',url:s3Url,headers:{'Accept':'*/*'},
+                    onload:function(s3Resp){
+                        try{
+                            const rows=JSON.parse(s3Resp.responseText);
+                            let val=0;
+                            for(const row of rows){
+                                if((row.lineItem||'').trim()===targetLineItem&&row.date===sundayStr&&row.type==='Forecast'&&row.packType==='Cartons'){
+                                    val=parseFloat(row.value)||0;break;
+                                }
+                            }
+                            // Debug: if no match, try includes
+                            if(val===0&&targetLineItem.includes('Transfer Out')){
+                                const matches=rows.filter(r=>r.lineItem&&r.lineItem.includes('Transfer Out Pick')&&r.type==='Forecast'&&r.date===sundayStr&&r.packType==='Cartons'&&parseFloat(r.value)>0);
+                                console.log('[SB-LP] Transfer Out Pick matches:',matches.map(r=>r.lineItem+'='+r.value));
+                                if(matches.length>0){val=parseFloat(matches[0].value)||0;}
+                            }
+                            console.log(`[SB-LP] Rate: ${targetLineItem} = ${val}`);
+                            callback(val);
+                        }catch(e){callback(0);}
+                    },onerror:function(){callback(0);},ontimeout:function(){callback(0);}
+                });
+            }catch(e){callback(0);}
+        },onerror:function(){callback(0);},ontimeout:function(){callback(0);}
+    });
+}
+
+function renderLPPercents(metrics){
+    if(!metrics)return;
+    const lp=loadLPValues();
+    // Also check display spans for LP values (auto-populated)
+    const ibLpCplh=parseFloat(lp.ibCplh)||0;
+    const obLpCplh=parseFloat(lp.obCplh)||0;
+    const siteLpCplh=parseFloat(lp.siteCplh)||0;
+    if(ibLpCplh>0){
+        const f=metrics.ib?.full||{};
+        const ibLP=f.cplh>0?(f.cplh/ibLpCplh)*100:0;
+        setEl('ib-op-total',ibLP>0?fmtPct(ibLP):'\u2014');
+        const el=document.getElementById('ib-op-total');if(el){el.style.background='';if(ibLP>=100)el.style.background='rgba(52,211,153,0.15)';else if(ibLP>=95)el.style.background='rgba(251,191,36,0.1)';else if(ibLP>0)el.style.background='rgba(220,38,38,0.12)';}
+        ['p1','p2','p3'].forEach(p=>{const pCplh=metrics.ib?.[p]?.cplh||0;const pLP=pCplh>0?(pCplh/ibLpCplh)*100:0;const elP=setEl('ib-op-'+p,pLP>0?fmtPct(pLP):'\u2014');if(elP){elP.style.background='';if(pLP>=100)elP.style.background='rgba(52,211,153,0.15)';else if(pLP>=95)elP.style.background='rgba(251,191,36,0.1)';else if(pLP>0)elP.style.background='rgba(220,38,38,0.12)';}});
+    }
+    if(obLpCplh>0){
+        const f=metrics.ob?.full||{};
+        const obLP=f.cplh>0?(f.cplh/obLpCplh)*100:0;
+        setEl('ob-op-total',obLP>0?fmtPct(obLP):'\u2014');
+        const el=document.getElementById('ob-op-total');if(el){el.style.background='';if(obLP>=100)el.style.background='rgba(52,211,153,0.15)';else if(obLP>=95)el.style.background='rgba(251,191,36,0.1)';else if(obLP>0)el.style.background='rgba(220,38,38,0.12)';}
+        ['p1','p2','p3'].forEach(p=>{const pCplh=metrics.ob?.[p]?.cplh||0;const pLP=pCplh>0?(pCplh/obLpCplh)*100:0;const elP=setEl('ob-op-'+p,pLP>0?fmtPct(pLP):'\u2014');if(elP){elP.style.background='';if(pLP>=100)elP.style.background='rgba(52,211,153,0.15)';else if(pLP>=95)elP.style.background='rgba(251,191,36,0.1)';else if(pLP>0)elP.style.background='rgba(220,38,38,0.12)';}});
+    }
+    if(siteLpCplh>0){
+        const siteCplhVal=parseFloat(document.getElementById('site-cplh-value')?.textContent)||0;
+        if(siteCplhVal>0){const siteLP=(siteCplhVal/siteLpCplh)*100;const pctEl=setEl('site-cplh-pct',fmtPct(siteLP));setPctClass(pctEl,siteLP);}
+    }
+    // Update the LP display values
+    const ibDispEl=document.getElementById('lp-ib-cplh-display');if(ibDispEl)ibDispEl.textContent=ibLpCplh>0?ibLpCplh.toFixed(2):'\u2014';
+    const obDispEl=document.getElementById('lp-ob-cplh-display');if(obDispEl)obDispEl.textContent=obLpCplh>0?obLpCplh.toFixed(2):'\u2014';
+    const siteDispEl=document.getElementById('lp-site-cplh-display');if(siteDispEl)siteDispEl.textContent=siteLpCplh>0?siteLpCplh.toFixed(2):'\u2014';
+    const ctiRate=parseFloat(lp.ctiRate)||0;
+    const topRate=parseFloat(lp.topRate)||0;
+    const ibDensityLP=parseFloat(lp.ibDensityLP)||0;
+    const obDensityLP=parseFloat(lp.obDensityLP)||0;
+    const ctiDispEl=document.getElementById('lp-cti-rate-display');if(ctiDispEl)ctiDispEl.textContent=ctiRate>0?ctiRate.toFixed(1):'\u2014';
+    const topDispEl=document.getElementById('lp-top-rate-display');if(topDispEl)topDispEl.textContent=topRate>0?topRate.toFixed(1):'\u2014';
+    const ibDenDispEl=document.getElementById('lp-ib-density-display');if(ibDenDispEl)ibDenDispEl.textContent=ibDensityLP>0?ibDensityLP.toFixed(2):'\u2014';
+    const obDenDispEl=document.getElementById('lp-ob-density-display');if(obDenDispEl)obDenDispEl.textContent=obDensityLP>0?obDensityLP.toFixed(2):'\u2014';
+    // Conditional format IB Stow Rate cells based on LP CTI rate
+    if(ctiRate>0){['ib-rate-p1','ib-rate-p2','ib-rate-p3','ib-rate-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';return;}if(v>=ctiRate)el.style.background='rgba(52,211,153,0.15)';else if(v>=ctiRate*0.95)el.style.background='rgba(251,191,36,0.1)';else el.style.background='rgba(220,38,38,0.12)';});}
+    // Conditional format IB CPLH cells based on LP CPLH
+    if(ibLpCplh>0){['ib-cplh-p1','ib-cplh-p2','ib-cplh-p3','ib-cplh-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';return;}if(v>=ibLpCplh)el.style.background='rgba(52,211,153,0.15)';else if(v>=ibLpCplh*0.95)el.style.background='rgba(251,191,36,0.1)';else el.style.background='rgba(220,38,38,0.12)';});}
+    // Conditional format OB Pick Rate cells based on LP TOP rate
+    if(topRate>0){['ob-rate-p1','ob-rate-p2','ob-rate-p3','ob-rate-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';return;}if(v>=topRate)el.style.background='rgba(52,211,153,0.15)';else if(v>=topRate*0.95)el.style.background='rgba(251,191,36,0.1)';else el.style.background='rgba(220,38,38,0.12)';});}
+    // Conditional format OB CPLH cells based on LP CPLH
+    if(obLpCplh>0){['ob-cplh-p1','ob-cplh-p2','ob-cplh-p3','ob-cplh-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';return;}if(v>=obLpCplh)el.style.background='rgba(52,211,153,0.15)';else if(v>=obLpCplh*0.95)el.style.background='rgba(251,191,36,0.1)';else el.style.background='rgba(220,38,38,0.12)';});}
+    // Conditional format IB Density cells based on LP Density
+    if(ibDensityLP>0){['ib-density-p1','ib-density-p2','ib-density-p3','ib-density-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';el.style.color='';return;}if(v>=ibDensityLP){el.style.background='rgba(46,125,50,0.12)';el.style.color='#2e7d32';}else if(v>=ibDensityLP*0.9){el.style.background='rgba(230,81,0,0.1)';el.style.color='#e65100';}else{el.style.background='rgba(198,40,40,0.1)';el.style.color='#c62828';}});}
+    // Conditional format OB Density cells based on LP Density
+    if(obDensityLP>0){['ob-density-p1','ob-density-p2','ob-density-p3','ob-density-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';el.style.color='';return;}if(v>=obDensityLP){el.style.background='rgba(46,125,50,0.12)';el.style.color='#2e7d32';}else if(v>=obDensityLP*0.9){el.style.background='rgba(230,81,0,0.1)';el.style.color='#e65100';}else{el.style.background='rgba(198,40,40,0.1)';el.style.color='#c62828';}});}
 }
 
 // === LEARNING CURVE from FCLM iframe (reads live DOM with LC + JPH) ===
@@ -279,6 +517,7 @@ function processData(raw){
             directPct:ibTotalHrs>0?(ibDH/ibTotalHrs)*100:0,indirectPct:ibTotalHrs>0?(ibIndirect/ibTotalHrs)*100:0,
             rate:stow.rate||0,headcount:(stow.headcount||0)+(pStow.headcount||0),
             cplh:cplhHrs>0?ibU/cplhHrs:0,
+            density:(stow.caseUnits||0)>0?(stow.eachUnits||0)/(stow.caseUnits||1):0,
             directHC:dur>0?ibDH/dur:0,indirectHC:dur>0?ibIndirect/dur:0,
             pprPlannedHrs:ppr.ibPlannedHrs||0,pprActualHrs:ibPPRHrs,
             pctToOP:(ppr.ibPlannedHrs||0)>0?(ibPPRHrs/ppr.ibPlannedHrs)*100:0};
@@ -292,6 +531,7 @@ function processData(raw){
             directPct:obTotalHrs>0?(obPickDH/obTotalHrs)*100:0,indirectPct:obTotalHrs>0?(obIndirect/obTotalHrs)*100:0,
             pickRate:pick.rate||0,pickHC:pick.headcount||0,dockHC:obDock.headcount||0,
             cplh:daHrs>0?(obDock.totalUnits||0)/daHrs:(obPickDH>0?(obDock.totalUnits||0)/obPickDH:0),
+            density:(obDock.caseUnits||0)>0?(obDock.eachUnits||0)/(obDock.caseUnits||1):0,
             directHC:dur>0?obPickDH/dur:0,indirectHC:dur>0?obIndirect/dur:0,
             pprPlannedHrs:daPlan,pprActualHrs:daHrs,
             pctToOP:daPlan>0?(daHrs/daPlan)*100:0};
@@ -346,8 +586,8 @@ function blankFuturePeriods(config){
     const keys=['p1','p2','p3'];
     keys.forEach((pk,idx)=>{
         if(!hasPeriodStarted(periods[idx],config)){
-            const prefixes=['ib-sync-','ib-stow-','ib-cases-','ib-pallets-','ib-cti-','ib-rate-','ib-dhrs-','ib-dpct-','ib-ihrs-','ib-ipct-','ib-thrs-','ib-cplh-','ib-op-',
-                'ob-sync-','ob-pick-','ob-cases-','ob-rate-','ob-loadp-','ob-dhrs-','ob-dpct-','ob-ihrs-','ob-ipct-','ob-thrs-','ob-cplh-','ob-op-',
+            const prefixes=['ib-sync-','ib-stow-','ib-cases-','ib-pallets-','ib-cti-','ib-rate-','ib-density-','ib-dhrs-','ib-dpct-','ib-ihrs-','ib-ipct-','ib-thrs-','ib-cplh-','ib-op-',
+                'ob-sync-','ob-pick-','ob-cases-','ob-rate-','ob-density-','ob-loadp-','ob-dhrs-','ob-dpct-','ob-ihrs-','ob-ipct-','ob-thrs-','ob-cplh-','ob-op-',
                 'sort-total-','sort-units-','sort-rate-','sort-dhrs-','sort-cplh-'];
             prefixes.forEach(pre=>{const el=document.getElementById(pre+pk);if(el){el.textContent='';el.style.background='';}});
         }
@@ -368,21 +608,21 @@ function renderIB(m){
     setEl('ib-pallets-p1',fmt(p1.palletUnits||0));setEl('ib-pallets-p2',fmt(p2.palletUnits||0));setEl('ib-pallets-p3',fmt(p3.palletUnits||0));setEl('ib-pallets-total',fmt(f.palletUnits||0));
     setEl('ib-cti-p1',fmt(p1.totalStow));setEl('ib-cti-p2',fmt(p2.totalStow));setEl('ib-cti-p3',fmt(p3.totalStow));setEl('ib-cti-total',fmt(f.totalStow));
     setEl('ib-rate-p1',fmt(p1.rate,1));setEl('ib-rate-p2',fmt(p2.rate,1));setEl('ib-rate-p3',fmt(p3.rate,1));setEl('ib-rate-total',fmt(f.rate,1));
-    // Conditional format rate cells vs target
-    const ibRateT=parseFloat(document.getElementById('ib-rate-target')?.value)||0;
-    if(ibRateT>0){['ib-rate-p1','ib-rate-p2','ib-rate-p3','ib-rate-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';return;}if(v>=ibRateT)el.style.background='rgba(52,211,153,0.15)';else if(v>=ibRateT*0.95)el.style.background='rgba(251,191,36,0.1)';else el.style.background='rgba(220,38,38,0.12)';});}
+    // IB Density
+    setEl('ib-density-p1',p1.density>0?fmt(p1.density,2):'\u2014');setEl('ib-density-p2',p2.density>0?fmt(p2.density,2):'\u2014');setEl('ib-density-p3',p3.density>0?fmt(p3.density,2):'\u2014');setEl('ib-density-total',f.density>0?fmt(f.density,2):'\u2014');
+    // Conditional format IB density vs planned
+    const ibDT=parseFloat(document.getElementById('ib-density-target')?.value)||0;
+    if(ibDT>0){['ib-density-p1','ib-density-p2','ib-density-p3','ib-density-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';el.style.color='';return;}if(v>=ibDT){el.style.background='rgba(46,125,50,0.12)';el.style.color='#2e7d32';}else if(v>=ibDT*0.9){el.style.background='rgba(230,81,0,0.1)';el.style.color='#e65100';}else{el.style.background='rgba(198,40,40,0.1)';el.style.color='#c62828';}});}
+    // Rate conditional formatting handled by renderLPPercents (LP rate)
     setEl('ib-dhrs-p1',fmt(p1.directHours,2));setEl('ib-dhrs-p2',fmt(p2.directHours,2));setEl('ib-dhrs-p3',fmt(p3.directHours,2));setEl('ib-dhrs-total',fmt(f.directHours,2));
     setEl('ib-dpct-p1',fmtPct(p1.directPct));setEl('ib-dpct-p2',fmtPct(p2.directPct));setEl('ib-dpct-p3',fmtPct(p3.directPct));setEl('ib-dpct-total',fmtPct(f.directPct));
     setEl('ib-ihrs-p1',fmt(p1.indirectHours,2));setEl('ib-ihrs-p2',fmt(p2.indirectHours,2));setEl('ib-ihrs-p3',fmt(p3.indirectHours,2));setEl('ib-ihrs-total',fmt(f.indirectHours,2));
     setEl('ib-ipct-p1',fmtPct(p1.indirectPct));setEl('ib-ipct-p2',fmtPct(p2.indirectPct));setEl('ib-ipct-p3',fmtPct(p3.indirectPct));setEl('ib-ipct-total',fmtPct(f.indirectPct));
     setEl('ib-thrs-p1',fmt(p1.totalHours,2));setEl('ib-thrs-p2',fmt(p2.totalHours,2));setEl('ib-thrs-p3',fmt(p3.totalHours,2));setEl('ib-thrs-total',fmt(f.totalHours,2));
     setEl('ib-cplh-p1',fmt(p1.cplh,2));setEl('ib-cplh-p2',fmt(p2.cplh,2));setEl('ib-cplh-p3',fmt(p3.cplh,2));setEl('ib-cplh-total',fmt(f.cplh,2));
-    // Conditional format CPLH cells vs target
-    const ibCT=parseFloat(document.getElementById('ib-cplh-target')?.value)||0;
-    if(ibCT>0){['ib-cplh-p1','ib-cplh-p2','ib-cplh-p3','ib-cplh-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';return;}if(v>=ibCT)el.style.background='rgba(46,125,50,0.12)';else if(v>=ibCT*0.9)el.style.background='rgba(230,81,0,0.1)';else el.style.background='rgba(198,40,40,0.1)';});}
-    setEl('ib-op-p1',fmtPct(p1.pctToOP));setEl('ib-op-p2',fmtPct(p2.pctToOP));setEl('ib-op-p3',fmtPct(p3.pctToOP));const opEl=setEl('ib-op-total',fmtPct(f.pctToOP));setPctClass(opEl,f.pctToOP||0);
-    // Conditional format % to OP cells
-    ['ib-op-p1','ib-op-p2','ib-op-p3','ib-op-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const txt=el.textContent;const v=parseFloat(txt)||0;if(v<=0){el.style.background='';return;}if(v>=100)el.style.background='rgba(52,211,153,0.15)';else if(v>=95)el.style.background='rgba(251,191,36,0.1)';else el.style.background='rgba(220,38,38,0.12)';});
+    // CPLH conditional formatting handled by renderLPPercents (LP CPLH)
+    // % to LP will be populated by renderLPPercents
+    ['ib-op-p1','ib-op-p2','ib-op-p3','ib-op-total'].forEach(id=>{const el=document.getElementById(id);if(el){el.textContent='\u2014';el.style.background='';}});
     setEl('ib-timestamp',new Date().toLocaleString()+' MST');
 }
 function renderOB(m){
@@ -397,9 +637,12 @@ function renderOB(m){
     setEl('ob-pick-p1',fmt(p1.pickUnits));setEl('ob-pick-p2',fmt(p2.pickUnits));setEl('ob-pick-p3',fmt(p3.pickUnits));setEl('ob-pick-total',fmt(f.pickUnits));
     setEl('ob-cases-p1',fmt(p1.pickUnits));setEl('ob-cases-p2',fmt(p2.pickUnits));setEl('ob-cases-p3',fmt(p3.pickUnits));setEl('ob-cases-total',fmt(f.pickUnits));
     setEl('ob-rate-p1',fmt(p1.pickRate,1));setEl('ob-rate-p2',fmt(p2.pickRate,1));setEl('ob-rate-p3',fmt(p3.pickRate,1));setEl('ob-rate-total',fmt(f.pickRate,1));
-    // Conditional format OB rate cells
-    const obRT=parseFloat(document.getElementById('ob-rate-target')?.value)||0;
-    if(obRT>0){['ob-rate-p1','ob-rate-p2','ob-rate-p3','ob-rate-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';return;}if(v>=obRT)el.style.background='rgba(52,211,153,0.15)';else if(v>=obRT*0.95)el.style.background='rgba(251,191,36,0.1)';else el.style.background='rgba(220,38,38,0.12)';});}
+    // OB Density
+    setEl('ob-density-p1',p1.density>0?fmt(p1.density,2):'\u2014');setEl('ob-density-p2',p2.density>0?fmt(p2.density,2):'\u2014');setEl('ob-density-p3',p3.density>0?fmt(p3.density,2):'\u2014');setEl('ob-density-total',f.density>0?fmt(f.density,2):'\u2014');
+    // Conditional format OB density vs planned
+    const obDT=parseFloat(document.getElementById('ob-density-target')?.value)||0;
+    if(obDT>0){['ob-density-p1','ob-density-p2','ob-density-p3','ob-density-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';el.style.color='';return;}if(v>=obDT){el.style.background='rgba(46,125,50,0.12)';el.style.color='#2e7d32';}else if(v>=obDT*0.9){el.style.background='rgba(230,81,0,0.1)';el.style.color='#e65100';}else{el.style.background='rgba(198,40,40,0.1)';el.style.color='#c62828';}});}
+    // Rate conditional formatting handled by renderLPPercents (LP rate)
     setEl('ob-loadp-p1',fmt(p1.loadedUnits));setEl('ob-loadp-p2',fmt(p2.loadedUnits));setEl('ob-loadp-p3',fmt(p3.loadedUnits));setEl('ob-loadp-total',fmt(f.loadedUnits));
     // Conditional format Loaded per Period cells vs targets
     if(obG>0){const periods=loadConfig().schedType==='4Q'?4:3;
@@ -412,12 +655,9 @@ function renderOB(m){
     setEl('ob-ipct-p1',fmtPct(p1.indirectPct));setEl('ob-ipct-p2',fmtPct(p2.indirectPct));setEl('ob-ipct-p3',fmtPct(p3.indirectPct));setEl('ob-ipct-total',fmtPct(f.indirectPct));
     setEl('ob-thrs-p1',fmt(p1.totalHours,2));setEl('ob-thrs-p2',fmt(p2.totalHours,2));setEl('ob-thrs-p3',fmt(p3.totalHours,2));setEl('ob-thrs-total',fmt(f.totalHours,2));
     setEl('ob-cplh-p1',fmt(p1.cplh,2));setEl('ob-cplh-p2',fmt(p2.cplh,2));setEl('ob-cplh-p3',fmt(p3.cplh,2));setEl('ob-cplh-total',fmt(f.cplh,2));
-    // Conditional format OB CPLH cells vs target
-    const obCT=parseFloat(document.getElementById('ob-cplh-target')?.value)||0;
-    if(obCT>0){['ob-cplh-p1','ob-cplh-p2','ob-cplh-p3','ob-cplh-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';return;}if(v>=obCT)el.style.background='rgba(46,125,50,0.12)';else if(v>=obCT*0.9)el.style.background='rgba(230,81,0,0.1)';else el.style.background='rgba(198,40,40,0.1)';});}
-    setEl('ob-op-p1',fmtPct(p1.pctToOP));setEl('ob-op-p2',fmtPct(p2.pctToOP));setEl('ob-op-p3',fmtPct(p3.pctToOP));const opEl=setEl('ob-op-total',fmtPct(f.pctToOP));setPctClass(opEl,f.pctToOP||0);
-    // Conditional format OB % to OP
-    ['ob-op-p1','ob-op-p2','ob-op-p3','ob-op-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const txt=el.textContent;const v=parseFloat(txt)||0;if(v<=0){el.style.background='';return;}if(v>=100)el.style.background='rgba(52,211,153,0.15)';else if(v>=95)el.style.background='rgba(251,191,36,0.1)';else el.style.background='rgba(220,38,38,0.12)';});
+    // CPLH conditional formatting handled by renderLPPercents (LP CPLH)
+    // % to LP will be populated by renderLPPercents
+    ['ob-op-p1','ob-op-p2','ob-op-p3','ob-op-total'].forEach(id=>{const el=document.getElementById(id);if(el){el.textContent='\u2014';el.style.background='';}});
     setEl('ob-timestamp',new Date().toLocaleString()+' MST');
 }
 function renderSort(m){
@@ -456,12 +696,16 @@ function renderTargets(m){
     if(ibG>0){const p=(f.totalStow||0)/ibG*100;const el=setEl('ib-goal-pct',fmtPct(p));setPctClass(el,p);}
     if(ibRateT>0&&f.rate){const p=(f.rate/ibRateT)*100;const el=setEl('ib-rate-pct',fmtPct(p));setPctClass(el,p);}
     if(ibCplhT>0&&f.cplh){const p=(f.cplh/ibCplhT)*100;const el=setEl('ib-cplh-pct',fmtPct(p));setPctClass(el,p);}
+    const ibDensityT=parseFloat(document.getElementById('ib-density-target')?.value)||0;
+    if(ibDensityT>0&&f.density){const p=(f.density/ibDensityT)*100;const el=setEl('ib-density-pct',fmtPct(p));setPctClass(el,p);}
     if(obG>0){const p=(ob.loadedUnits||0)/obG*100;const el=setEl('ob-goal-pct',fmtPct(p));setPctClass(el,p);}
     // OB Rate % to goal
     const obRateT=parseFloat(document.getElementById('ob-rate-target')?.value)||0;
     const obCplhT=parseFloat(document.getElementById('ob-cplh-target')?.value)||0;
     if(obRateT>0&&ob.pickRate){const p=(ob.pickRate/obRateT)*100;const el=setEl('ob-rate-pct',fmtPct(p));setPctClass(el,p);}
     if(obCplhT>0&&ob.cplh){const p=(ob.cplh/obCplhT)*100;const el=setEl('ob-cplh-pct',fmtPct(p));setPctClass(el,p);}
+    const obDensityT=parseFloat(document.getElementById('ob-density-target')?.value)||0;
+    if(obDensityT>0&&ob.density){const p=(ob.density/obDensityT)*100;const el=setEl('ob-density-pct',fmtPct(p));setPctClass(el,p);}
     // Summary cards (hero KPI) with pace-based coloring
     // Color logic: compare actual % vs expected % based on time elapsed in shift
     function getPaceColor(actualPct, config){
@@ -505,12 +749,16 @@ function renderPaceInsight(elId,goal,actual,rate,hc,config){
     if(!goal||!actual||!rate||goal<=0){el.textContent='';return;}
     const sched=config.shiftType==='Nights'?config.nights:config.days;
     const now=new Date(),cm=now.getHours()*60+now.getMinutes();
-    const fullStart=sched.full.sh*60+sched.full.sm,fullEnd=sched.full.eh*60+sched.full.em;
+    // Use P1 start to P3 end as actual production window (not the padded full window)
+    const prodStart=sched.p1.sh*60+sched.p1.sm,prodEnd=sched.p3.eh*60+sched.p3.em;
     let shiftDuration,elapsed;
-    if(fullEnd>fullStart){shiftDuration=fullEnd-fullStart;elapsed=cm-fullStart;}
-    else{shiftDuration=(1440-fullStart)+fullEnd;elapsed=cm>=fullStart?cm-fullStart:(1440-fullStart)+cm;}
+    if(prodEnd>prodStart){shiftDuration=prodEnd-prodStart;elapsed=cm-prodStart;}
+    else{shiftDuration=(1440-prodStart)+prodEnd;elapsed=cm>=prodStart?cm-prodStart:(1440-prodStart)+cm;}
     if(elapsed<0)elapsed=0;
-    const remaining=(shiftDuration-elapsed)/60; // hours left
+    // Subtract 60 min of breaks (2x 30-min) from production duration
+    const productiveDuration=shiftDuration-60;
+    const productiveElapsed=Math.min(elapsed,productiveDuration);
+    const remaining=Math.max((productiveDuration-productiveElapsed)/60,0); // productive hours left
     if(remaining<=0){el.innerHTML='<span class="pace-good">\u2713 Shift complete</span>';return;}
     const needed=goal-actual;
     if(needed<=0){el.innerHTML='<span class="pace-good">\u2713 Goal met!</span>';return;}
@@ -640,6 +888,11 @@ function buildHTML(){return `
 
 <main id="tab-sync" class="tab-content active"><div class="sync-layout">
 <div class="sync-left">
+
+<section class="metrics-section"><div class="section-header"><h2>SYNC Actions</h2><div><button id="btn-add-action" class="btn btn-small">+ Add</button> <button id="btn-clear-actions" class="btn btn-small btn-danger">Clear</button></div></div>
+<div class="shift-timeline" id="shift-timeline"></div>
+<table class="actions-table" style="margin-top:8px;"><thead><tr><th>Time</th><th>Action Item</th><th>Owner</th><th>Status</th><th></th></tr></thead><tbody id="actions-body"></tbody></table></section>
+
 <section class="metrics-section ib-section"><div class="section-header"><h2>INBOUND | NTP</h2><span class="fclm-timestamp" id="ib-timestamp">\u2014</span></div>
 <table class="metrics-table"><thead><tr><th></th><th>P1</th><th>P2</th><th>P3</th><th>Total</th></tr></thead><tbody>
 <tr class="row-target"><td class="bold">Targets</td><td id="ib-target-p1">\u2014</td><td id="ib-target-p2">\u2014</td><td id="ib-target-p3">\u2014</td><td id="ib-target-total">\u2014</td></tr>
@@ -647,14 +900,15 @@ function buildHTML(){return `
 <tr><td>&nbsp;&nbsp;Cases Stowed</td><td id="ib-cases-p1">0</td><td id="ib-cases-p2">0</td><td id="ib-cases-p3">0</td><td id="ib-cases-total">0</td></tr>
 <tr><td>&nbsp;&nbsp;Pallets Stowed</td><td id="ib-pallets-p1">0</td><td id="ib-pallets-p2">0</td><td id="ib-pallets-p3">0</td><td id="ib-pallets-total">0</td></tr>
 <tr><td>&nbsp;&nbsp;CTI/PTI per period</td><td id="ib-cti-p1">0</td><td id="ib-cti-p2">0</td><td id="ib-cti-p3">0</td><td id="ib-cti-total">0</td></tr>
-<tr class="row-rate"><td>Stow Rate</td><td id="ib-rate-p1">\u2014</td><td id="ib-rate-p2">\u2014</td><td id="ib-rate-p3">\u2014</td><td id="ib-rate-total">\u2014</td></tr>
+<tr class="row-rate"><td>Stow Rate <span style="margin-left:20px;font-size:11px;background:#e3f2fd;color:#1565c0;padding:2px 8px;border-radius:4px;font-weight:700;">LP Target = <span id="lp-cti-rate-display">\u2014</span></span></td><td id="ib-rate-p1">\u2014</td><td id="ib-rate-p2">\u2014</td><td id="ib-rate-p3">\u2014</td><td id="ib-rate-total">\u2014</td></tr>
+<tr><td>Density <span style="margin-left:20px;font-size:11px;background:#e3f2fd;color:#1565c0;padding:2px 8px;border-radius:4px;font-weight:700;">LP Target = <span id="lp-ib-density-display">\u2014</span></span></td><td id="ib-density-p1">\u2014</td><td id="ib-density-p2">\u2014</td><td id="ib-density-p3">\u2014</td><td id="ib-density-total">\u2014</td></tr>
 <tr><td>Direct Hours</td><td id="ib-dhrs-p1">0</td><td id="ib-dhrs-p2">0</td><td id="ib-dhrs-p3">0</td><td id="ib-dhrs-total">0</td></tr>
 <tr><td>&nbsp;&nbsp;Direct %</td><td id="ib-dpct-p1">\u2014</td><td id="ib-dpct-p2">\u2014</td><td id="ib-dpct-p3">\u2014</td><td id="ib-dpct-total">\u2014</td></tr>
 <tr><td>Indirect Hours</td><td id="ib-ihrs-p1">0</td><td id="ib-ihrs-p2">0</td><td id="ib-ihrs-p3">0</td><td id="ib-ihrs-total">0</td></tr>
 <tr><td>&nbsp;&nbsp;Indirect %</td><td id="ib-ipct-p1">\u2014</td><td id="ib-ipct-p2">\u2014</td><td id="ib-ipct-p3">\u2014</td><td id="ib-ipct-total">\u2014</td></tr>
 <tr class="row-total"><td>Total Hours</td><td id="ib-thrs-p1">0</td><td id="ib-thrs-p2">0</td><td id="ib-thrs-p3">0</td><td id="ib-thrs-total">0</td></tr>
-<tr class="row-cplh"><td class="bold">CPLH</td><td id="ib-cplh-p1">\u2014</td><td id="ib-cplh-p2">\u2014</td><td id="ib-cplh-p3">\u2014</td><td id="ib-cplh-total">\u2014</td></tr>
-<tr><td>% to OP</td><td id="ib-op-p1">\u2014</td><td id="ib-op-p2">\u2014</td><td id="ib-op-p3">\u2014</td><td id="ib-op-total">\u2014</td></tr>
+<tr class="row-cplh"><td class="bold">CPLH <span style="margin-left:20px;font-size:11px;background:#e3f2fd;color:#1565c0;padding:2px 8px;border-radius:4px;font-weight:700;">LP Target = <span id="lp-ib-cplh-display">\u2014</span></span></td><td id="ib-cplh-p1">\u2014</td><td id="ib-cplh-p2">\u2014</td><td id="ib-cplh-p3">\u2014</td><td id="ib-cplh-total">\u2014</td></tr>
+<tr><td>% to LP</td><td id="ib-op-p1">\u2014</td><td id="ib-op-p2">\u2014</td><td id="ib-op-p3">\u2014</td><td id="ib-op-total">\u2014</td></tr>
 <tr class="row-fast"><td>Fast Start</td><td id="ib-fast-p1">\u2014</td><td id="ib-fast-p2">\u2014</td><td id="ib-fast-p3">\u2014</td><td></td></tr>
 <tr class="row-lc"><td colspan="5" id="ib-lc-display" style="font-size:11px;color:#5B6B7A;">Learning Curve Mix: \u2014</td></tr>
 </tbody></table></section>
@@ -665,15 +919,16 @@ function buildHTML(){return `
 <tr class="row-sync"><td class="bold">Sync Metrics</td><td id="ob-sync-p1">0</td><td id="ob-sync-p2">0</td><td id="ob-sync-p3">0</td><td id="ob-sync-total">0</td></tr>
 <tr><td>&nbsp;&nbsp;Pick - Total</td><td id="ob-pick-p1">0</td><td id="ob-pick-p2">0</td><td id="ob-pick-p3">0</td><td id="ob-pick-total">0</td></tr>
 <tr><td>&nbsp;&nbsp;Cases Picked</td><td id="ob-cases-p1">0</td><td id="ob-cases-p2">0</td><td id="ob-cases-p3">0</td><td id="ob-cases-total">0</td></tr>
-<tr class="row-rate"><td>Pick Rate</td><td id="ob-rate-p1">\u2014</td><td id="ob-rate-p2">\u2014</td><td id="ob-rate-p3">\u2014</td><td id="ob-rate-total">\u2014</td></tr>
+<tr class="row-rate"><td>Pick Rate <span style="margin-left:20px;font-size:11px;background:#fff3e0;color:#e65100;padding:2px 8px;border-radius:4px;font-weight:700;">LP Target = <span id="lp-top-rate-display">\u2014</span></span></td><td id="ob-rate-p1">\u2014</td><td id="ob-rate-p2">\u2014</td><td id="ob-rate-p3">\u2014</td><td id="ob-rate-total">\u2014</td></tr>
+<tr><td>Density <span style="margin-left:20px;font-size:11px;background:#fff3e0;color:#e65100;padding:2px 8px;border-radius:4px;font-weight:700;">LP Target = <span id="lp-ob-density-display">\u2014</span></span></td><td id="ob-density-p1">\u2014</td><td id="ob-density-p2">\u2014</td><td id="ob-density-p3">\u2014</td><td id="ob-density-total">\u2014</td></tr>
 <tr><td>Loaded per Period</td><td id="ob-loadp-p1">0</td><td id="ob-loadp-p2">0</td><td id="ob-loadp-p3">0</td><td id="ob-loadp-total">0</td></tr>
 <tr><td>Direct Hours</td><td id="ob-dhrs-p1">0</td><td id="ob-dhrs-p2">0</td><td id="ob-dhrs-p3">0</td><td id="ob-dhrs-total">0</td></tr>
 <tr><td>&nbsp;&nbsp;Direct %</td><td id="ob-dpct-p1">\u2014</td><td id="ob-dpct-p2">\u2014</td><td id="ob-dpct-p3">\u2014</td><td id="ob-dpct-total">\u2014</td></tr>
 <tr><td>Indirect Hours</td><td id="ob-ihrs-p1">0</td><td id="ob-ihrs-p2">0</td><td id="ob-ihrs-p3">0</td><td id="ob-ihrs-total">0</td></tr>
 <tr><td>&nbsp;&nbsp;Indirect %</td><td id="ob-ipct-p1">\u2014</td><td id="ob-ipct-p2">\u2014</td><td id="ob-ipct-p3">\u2014</td><td id="ob-ipct-total">\u2014</td></tr>
 <tr class="row-total"><td>Total Hours</td><td id="ob-thrs-p1">0</td><td id="ob-thrs-p2">0</td><td id="ob-thrs-p3">0</td><td id="ob-thrs-total">0</td></tr>
-<tr class="row-cplh"><td class="bold">CPLH</td><td id="ob-cplh-p1">\u2014</td><td id="ob-cplh-p2">\u2014</td><td id="ob-cplh-p3">\u2014</td><td id="ob-cplh-total">\u2014</td></tr>
-<tr><td>% to OP</td><td id="ob-op-p1">\u2014</td><td id="ob-op-p2">\u2014</td><td id="ob-op-p3">\u2014</td><td id="ob-op-total">\u2014</td></tr>
+<tr class="row-cplh"><td class="bold">CPLH <span style="margin-left:20px;font-size:11px;background:#fff3e0;color:#e65100;padding:2px 8px;border-radius:4px;font-weight:700;">LP Target = <span id="lp-ob-cplh-display">\u2014</span></span></td><td id="ob-cplh-p1">\u2014</td><td id="ob-cplh-p2">\u2014</td><td id="ob-cplh-p3">\u2014</td><td id="ob-cplh-total">\u2014</td></tr>
+<tr><td>% to LP</td><td id="ob-op-p1">\u2014</td><td id="ob-op-p2">\u2014</td><td id="ob-op-p3">\u2014</td><td id="ob-op-total">\u2014</td></tr>
 <tr class="row-fast"><td>Fast Start</td><td id="ob-fast-p1">\u2014</td><td id="ob-fast-p2">\u2014</td><td id="ob-fast-p3">\u2014</td><td></td></tr>
 <tr class="row-lc"><td colspan="5" id="ob-lc-display" style="font-size:11px;color:#5B6B7A;">Learning Curve Mix: \u2014</td></tr>
 </tbody></table></section>
@@ -688,9 +943,6 @@ function buildHTML(){return `
 <tr class="row-cplh"><td class="bold">CPLH</td><td id="sort-cplh-p1">\u2014</td><td id="sort-cplh-p2">\u2014</td><td id="sort-cplh-p3">\u2014</td><td id="sort-cplh-total">\u2014</td></tr>
 </tbody></table></section>
 
-<section class="metrics-section"><div class="section-header"><h2>SYNC Actions</h2><div><button id="btn-add-action" class="btn btn-small">+ Add</button> <button id="btn-clear-actions" class="btn btn-small btn-danger">Clear</button></div></div>
-<div class="shift-timeline" id="shift-timeline"></div>
-<table class="actions-table" style="margin-top:8px;"><thead><tr><th>Time</th><th>Action Item</th><th>Owner</th><th>Status</th><th></th></tr></thead><tbody id="actions-body"></tbody></table></section>
 </div><!-- sync-left -->
 
 <div class="sync-right">
@@ -700,11 +952,42 @@ function buildHTML(){return `
 <div class="goal-card sort-card" id="sort-summary-card"><div class="goal-header"><span class="goal-title">Sort</span><span class="goal-pct" id="sum-sort-pct">\u2014</span></div><div class="goal-progress"><div class="goal-progress-bar green" id="sort-progress-bar" style="width:0%"></div></div><div class="goal-stats"><span>Goal <strong id="sum-sort-goal">\u2014</strong></span><span>Actual <strong id="sum-sort-actual">\u2014</strong></span><span>Remaining <strong id="sum-sort-remaining">\u2014</strong></span></div><div class="goal-stats"><span>\u25B2 <strong id="sum-sort-rate">\u2014</strong> Rate</span><span>\u2713 <strong id="sum-sort-cplh">\u2014</strong> CPLH</span></div></div>
 </div>
 <div class="site-cplh-panel" id="site-cplh-panel" style="background:#fff;border:2px solid #000;border-radius:4px;padding:10px 14px;">
-<h3 style="font-size:11px;font-weight:700;margin-bottom:6px;">Site CPLH</h3>
+<h3 style="font-size:11px;font-weight:700;margin-bottom:6px;">Site CPLH <span style="margin-left:16px;font-size:11px;background:#e8f5e9;color:#2e7d32;padding:2px 8px;border-radius:4px;font-weight:700;">LP Target = <span id="lp-site-cplh-display">\u2014</span></span></h3>
 <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:12px;">
 <div><span style="color:#333;font-size:10px;">SITE CPLH</span><br><strong id="site-cplh-value" style="font-size:16px;">\u2014</strong></div>
 <div><span style="color:#333;font-size:10px;">THROUGHPUT VOL</span><br><strong id="site-throughput-vol">\u2014</strong></div>
 <div><span style="color:#333;font-size:10px;">THROUGHPUT HRS</span><br><strong id="site-throughput-hrs">\u2014</strong></div>
+</div>
+</div>
+<div id="tot-panel" style="background:#c62828;border:2px solid #000;border-radius:4px;padding:10px 14px;margin-top:6px;">
+<div style="display:flex;align-items:center;justify-content:space-between;">
+<h3 style="font-size:13px;font-weight:700;color:#fff;margin:0;">TOT</h3>
+<strong id="tot-value" style="font-size:18px;color:#fff;">\u2014</strong>
+</div>
+</div>
+<div id="bb-24hr-panel" style="background:#fff;border:2px solid #000;border-radius:4px;padding:10px 14px;margin-top:6px;">
+<h3 style="font-size:11px;font-weight:700;margin-bottom:8px;">24 Hour Goal Tracker</h3>
+<div style="margin-bottom:8px;">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+<span style="font-size:11px;font-weight:600;color:#1565c0;">INBOUND</span>
+<span style="font-size:11px;" id="bb24-ib-text">\u2014</span>
+</div>
+<div style="position:relative;background:#e0e0e0;border-radius:3px;height:12px;overflow:hidden;">
+<div id="bb24-ib-bar" style="height:100%;background:#1565c0;width:0%;transition:width 0.3s;border-radius:3px;"></div>
+<div style="position:absolute;top:0;bottom:0;left:50%;width:2px;background:#000;opacity:0.5;"></div>
+</div>
+<div style="text-align:right;font-size:10px;color:#555;margin-top:2px;">24hr Density: <strong id="bb24-ib-density">\u2014</strong></div>
+</div>
+<div>
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+<span style="font-size:11px;font-weight:600;color:#e65100;">OUTBOUND</span>
+<span style="font-size:11px;" id="bb24-ob-text">\u2014</span>
+</div>
+<div style="position:relative;background:#e0e0e0;border-radius:3px;height:12px;overflow:hidden;">
+<div id="bb24-ob-bar" style="height:100%;background:#e65100;width:0%;transition:width 0.3s;border-radius:3px;"></div>
+<div style="position:absolute;top:0;bottom:0;left:50%;width:2px;background:#000;opacity:0.5;"></div>
+</div>
+<div style="text-align:right;font-size:10px;color:#555;margin-top:2px;">24hr Density: <strong id="bb24-ob-density">\u2014</strong></div>
 </div>
 </div>
 <div class="targets-panel"><h3 class="panel-title" style="display:flex;justify-content:space-between;align-items:center;">Shift Plan Targets <button id="btn-clear-targets" class="btn btn-small btn-danger">Clear</button></h3>
@@ -714,6 +997,7 @@ function buildHTML(){return `
 <tr><td>IB GOAL</td><td><input type="number" id="ib-goal-input" class="target-input"></td><td><span id="ib-goal-pct">\u2014</span></td></tr>
 <tr><td>STOW RATE</td><td><input type="number" id="ib-rate-target" class="target-input"></td><td><span id="ib-rate-pct">\u2014</span></td></tr>
 <tr><td>IB CPLH</td><td><input type="number" id="ib-cplh-target" class="target-input"></td><td><span id="ib-cplh-pct">\u2014</span></td></tr>
+<tr><td>PLANNED DENSITY</td><td><input type="number" id="ib-density-target" class="target-input" step="0.01"></td><td><span id="ib-density-pct">\u2014</span></td></tr>
 <tr><td>SOS FAST START</td><td><input type="number" id="ib-fast-sos" class="target-input" value="13" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ib-fast-sos-pct">\u2014</span></td></tr>
 <tr><td>EOL FAST START</td><td><input type="number" id="ib-fast-eol" class="target-input" value="18" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ib-fast-eol-pct">\u2014</span></td></tr>
 </tbody></table></div>
@@ -722,6 +1006,7 @@ function buildHTML(){return `
 <tr><td>DA GOAL</td><td><input type="number" id="ob-goal-input" class="target-input"></td><td><span id="ob-goal-pct">\u2014</span></td></tr>
 <tr><td>PICK RATE</td><td><input type="number" id="ob-rate-target" class="target-input"></td><td><span id="ob-rate-pct">\u2014</span></td></tr>
 <tr><td>DA CPLH</td><td><input type="number" id="ob-cplh-target" class="target-input"></td><td><span id="ob-cplh-pct">\u2014</span></td></tr>
+<tr><td>PLANNED DENSITY</td><td><input type="number" id="ob-density-target" class="target-input" step="0.01"></td><td><span id="ob-density-pct">\u2014</span></td></tr>
 <tr><td>SOS FAST START</td><td><input type="number" id="ob-fast-sos" class="target-input" value="13" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ob-fast-sos-pct">\u2014</span></td></tr>
 <tr><td>EOL FAST START</td><td><input type="number" id="ob-fast-eol" class="target-input" value="18" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ob-fast-eol-pct">\u2014</span></td></tr>
 </tbody></table></div>
@@ -1006,7 +1291,7 @@ function renderHourlyTables(hourlyData,totalHours){
 
     function ibRow(label,getter,target,decimals=0){
         let total=0;const cells=hourlyData.map((h,i)=>{const v=getter(h,i);if(typeof v==='number')total+=v;const display=fv(v,decimals);const style=target?condBg(v,target):'';return`<td style="${style}">${display}</td>`;}).join('');
-        return`<tr><td>${label}</td>${cells}<td style="font-weight:700;"></td></tr>`;
+        return`<tr><td>${label}</td>${cells}<td style="font-weight:700;">${total>0?fv(total,decimals):''}</td></tr>`;
     }
     function ibRateRow(label,getter,target){
         const cells=hourlyData.map(h=>{const v=getter(h);const display=fv(v,1);const style=target?condBg(v,target):'';return`<td style="${style}">${display}</td>`;}).join('');
@@ -1088,6 +1373,35 @@ function renderHourlyTables(hourlyData,totalHours){
             });
         });
     });
+
+    // Apply LP-based conditional formatting to hourly Rate and CPLH rows
+    const lp=loadLPValues();
+    const lpCti=parseFloat(lp.ctiRate)||0;
+    const lpTop=parseFloat(lp.topRate)||0;
+    const lpIbCplh=parseFloat(lp.ibCplh)||0;
+    const lpObCplh=parseFloat(lp.obCplh)||0;
+    function colorCells(sectionClass,rowLabel,lpVal){
+        if(lpVal<=0)return;
+        const section=container.querySelector('.'+sectionClass);if(!section)return;
+        const rows=section.querySelectorAll('tbody tr');
+        rows.forEach(row=>{
+            const label=row.querySelector('td');if(!label)return;
+            if(label.textContent.trim().startsWith(rowLabel)){
+                const cells=row.querySelectorAll('td');
+                for(let i=1;i<cells.length;i++){
+                    const v=parseFloat(cells[i].textContent)||0;
+                    if(v<=0){continue;}
+                    if(v>=lpVal)cells[i].style.background='rgba(52,211,153,0.15)';
+                    else if(v>=lpVal*0.95)cells[i].style.background='rgba(251,191,36,0.1)';
+                    else cells[i].style.background='rgba(220,38,38,0.12)';
+                }
+            }
+        });
+    }
+    colorCells('ib-hourly','Stow Rate',lpCti);
+    colorCells('ib-hourly','CPLH',lpIbCplh);
+    colorCells('ob-hourly','Pick Rate',lpTop);
+    colorCells('ob-hourly','CPLH',lpObCplh);
 }
 
 // === BOOT ===
@@ -1125,6 +1439,11 @@ function clearBoard(){
     ['ib-progress-bar','ob-progress-bar','sort-progress-bar'].forEach(id=>{const el=document.getElementById(id);if(el){el.style.width='0%';el.className='goal-progress-bar green';}});
     // Clear site CPLH
     ['site-cplh-value','site-throughput-vol','site-throughput-hrs'].forEach(id=>{const el=document.getElementById(id);if(el){el.textContent='\u2014';el.style.color='';}});
+    // Clear TOT
+    const totEl=document.getElementById('tot-value');if(totEl)totEl.textContent='\u2014';
+    // Clear 24hr goal tracker
+    ['bb24-ib-text','bb24-ob-text','bb24-ib-density','bb24-ob-density'].forEach(id=>{const el=document.getElementById(id);if(el)el.textContent='\u2014';});
+    ['bb24-ib-bar','bb24-ob-bar'].forEach(id=>{const el=document.getElementById(id);if(el)el.style.width='0%';});
     // Clear hourly tables
     const hourlyContainer=document.getElementById('hourly-tables');if(hourlyContainer)hourlyContainer.innerHTML='';
     // Clear charts
@@ -1143,7 +1462,7 @@ function initBoard(){
     document.getElementById('shift-select').value=config.shiftType;
     // Load targets
     const t=config.targets||{};
-    ['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','site-cplh-target'].forEach(id=>{const el=document.getElementById(id);if(el&&t[id])el.value=t[id];});
+    ['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','site-cplh-target'].forEach(id=>{const el=document.getElementById(id);if(el&&t[id])el.value=t[id];});
     // Load settings
     const ds=config.days,ns=config.nights;
     ['ds-full-sh','ds-full-sm','ds-full-eh','ds-full-em','ds-p1-sh','ds-p1-sm','ds-p1-eh','ds-p1-em','ds-p2-sh','ds-p2-sm','ds-p2-eh','ds-p2-em','ds-p3-sh','ds-p3-sm','ds-p3-eh','ds-p3-em'].forEach((id,i)=>{const vals=[ds.full.sh,ds.full.sm,ds.full.eh,ds.full.em,ds.p1.sh,ds.p1.sm,ds.p1.eh,ds.p1.em,ds.p2.sh,ds.p2.sm,ds.p2.eh,ds.p2.em,ds.p3.sh,ds.p3.sm,ds.p3.eh,ds.p3.em];const el=document.getElementById(id);if(el)el.value=vals[i];});
@@ -1156,10 +1475,10 @@ function initBoard(){
     document.getElementById('btn-snip').onclick=doSnip;
     document.getElementById('btn-fetch-hourly')?.addEventListener('click',fetchHourlyData);
     document.getElementById('btn-clear-targets')?.addEventListener('click',()=>{
-        ['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','sort-goal','sort-rate-target'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
+        ['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-density-target','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-density-target','sort-goal','sort-rate-target'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
         saveTargetsUI();updateTargetRows();
         // Clear the % column displays
-        ['ib-goal-pct','ib-rate-pct','ib-cplh-pct','ob-goal-pct','ob-rate-pct','ob-cplh-pct','sort-goal-pct','sort-rate-pct'].forEach(id=>{const el=document.getElementById(id);if(el){el.textContent='\u2014';el.classList.remove('pct-good','pct-warn','pct-bad');}});
+        ['ib-goal-pct','ib-rate-pct','ib-cplh-pct','ib-density-pct','ob-goal-pct','ob-rate-pct','ob-cplh-pct','ob-density-pct','sort-goal-pct','sort-rate-pct'].forEach(id=>{const el=document.getElementById(id);if(el){el.textContent='\u2014';el.classList.remove('pct-good','pct-warn','pct-bad');}});
     });
     document.getElementById('btn-add-action')?.addEventListener('click',()=>{const a=loadActions();a.push({item:'',owner:'',status:'Open'});saveActions(a);renderActions();});
     document.getElementById('btn-clear-actions')?.addEventListener('click',()=>{if(confirm('Clear all actions?')){saveActions([]);renderActions();}});
@@ -1171,6 +1490,9 @@ function initBoard(){
     const sup=loadSupport();Object.keys(sup).forEach(id=>{const el=document.getElementById(id);if(el)el.value=sup[id];});
     document.querySelectorAll('.support-input,.callout-textarea').forEach(el=>el.addEventListener('change',()=>{const d={};document.querySelectorAll('.support-input,.callout-textarea').forEach(e=>{d[e.id]=e.value;});saveSupport(d);}));
     renderActions();updatePeriodDots();setInterval(updatePeriodDots,60000);
+    // Start period notification reminders
+    requestNotificationPermission();
+    startPeriodReminders();
 }
 
 function refreshSettingsInputs(){
@@ -1247,9 +1569,33 @@ async function doFetch(){
         setEl('site-throughput-hrs',tHrs>0?fmt(tHrs,2):'\u2014');
         // Site CPLH % to target
         if(siteCplhTarget>0&&siteCplh>0){const p=(siteCplh/siteCplhTarget)*100;const el=setEl('site-cplh-pct',fmtPct(p));setPctClass(el,p);}
+        // Render TOT (Time Off Task) from FC Summary
+        const totHrs=pprFull.totHrs||0;
+        if(totHrs>0){const hrs=Math.floor(totHrs);const mins=Math.round((totHrs-hrs)*60);setEl('tot-value',hrs+'h '+mins+'m');}else{setEl('tot-value','\u2014');}
+        // Render 24hr BB Goal Tracker
+        const ibBBGoal=parseFloat(document.getElementById('ib-bb-goal')?.value)||0;
+        const obBBGoal=parseFloat(document.getElementById('ob-bb-goal')?.value)||0;
+        const ib24=raw.data24?.ibVol24||0;
+        const ob24=raw.data24?.obVol24||0;
+        if(ibBBGoal>0){const pct=(ib24/ibBBGoal)*100;setEl('bb24-ib-text',fmt(ib24)+' / '+fmt(ibBBGoal)+' ('+pct.toFixed(1)+'%)');const bar=document.getElementById('bb24-ib-bar');if(bar){bar.style.width=Math.min(pct,100)+'%';bar.style.background=pct>=100?'#2e7d32':pct>=75?'#1565c0':'#1565c0';}}else{setEl('bb24-ib-text',ib24>0?fmt(ib24)+' (no goal set)':'\u2014');const bar=document.getElementById('bb24-ib-bar');if(bar)bar.style.width='0%';}
+        if(obBBGoal>0){const pct=(ob24/obBBGoal)*100;setEl('bb24-ob-text',fmt(ob24)+' / '+fmt(obBBGoal)+' ('+pct.toFixed(1)+'%)');const bar=document.getElementById('bb24-ob-bar');if(bar){bar.style.width=Math.min(pct,100)+'%';bar.style.background=pct>=100?'#2e7d32':pct>=75?'#e65100':'#e65100';}}else{setEl('bb24-ob-text',ob24>0?fmt(ob24)+' (no goal set)':'\u2014');const bar=document.getElementById('bb24-ob-bar');if(bar)bar.style.width='0%';}
+        // 24hr Density
+        const ibD24=raw.data24?.ibDensity24||0;
+        const obD24=raw.data24?.obDensity24||0;
+        setEl('bb24-ib-density',ibD24>0?fmt(ibD24,2):'\u2014');
+        setEl('bb24-ob-density',obD24>0?fmt(obD24,2):'\u2014');
         // Fetch Learning Curve data from ADAPT
         fetchLearningCurve(config.site,'1003035','ib-lc-display'); // Stow
         fetchLearningCurve(config.site,'1003065','ob-lc-display'); // Pick
+        // Fetch LP CPLH from GalaxyBI (auto), then render % to LP
+        fetchLPDataAuto(config.site).then(lp=>{
+            if(lp&&(lp.ibCplh>0||lp.obCplh>0)){
+                console.log('[SB-LP] Auto-fetched LP values:',lp);
+            }else{
+                console.log('[SB-LP] Auto-fetch failed, using saved LP values');
+            }
+            renderLPPercents(currentMetrics);
+        });
         // Retry charts if Chart.js wasn't ready yet
         if(typeof Chart==='undefined'){setTimeout(()=>{if(typeof Chart!=='undefined'&&currentMetrics)renderCharts(currentMetrics);},2000);}
     }catch(err){console.error(err);setStatus('\u26A0\uFE0F '+err.message);alert('Fetch failed: '+err.message+'\n\nMake sure you are on Amazon network and authenticated to Midway.');}
@@ -1257,8 +1603,13 @@ async function doFetch(){
 }
 
 function saveTargetsUI(){
-    const t={};['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','site-cplh-target'].forEach(id=>{t[id]=document.getElementById(id)?.value||'';});
+    const t={};['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','site-cplh-target'].forEach(id=>{t[id]=document.getElementById(id)?.value||'';});
     config.targets=t;saveConfig(config);
+    // Save LP values separately
+    const lp={ibCplh:document.getElementById('lp-ib-cplh')?.value||'',obCplh:document.getElementById('lp-ob-cplh')?.value||'',siteCplh:document.getElementById('lp-site-cplh')?.value||''};
+    saveLPValues(lp);
+    // Re-render LP percentages if we have metrics
+    if(currentMetrics)renderLPPercents(currentMetrics);
 }
 
 function saveSettingsUI(){
@@ -1266,6 +1617,69 @@ function saveSettingsUI(){
     config.nights={full:{sh:+document.getElementById('ns-full-sh').value,sm:+document.getElementById('ns-full-sm').value,eh:+document.getElementById('ns-full-eh').value,em:+document.getElementById('ns-full-em').value},p1:{sh:+document.getElementById('ns-p1-sh').value,sm:+document.getElementById('ns-p1-sm').value,eh:+document.getElementById('ns-p1-eh').value,em:+document.getElementById('ns-p1-em').value},p2:{sh:+document.getElementById('ns-p2-sh').value,sm:+document.getElementById('ns-p2-sm').value,eh:+document.getElementById('ns-p2-eh').value,em:+document.getElementById('ns-p2-em').value},p3:{sh:+document.getElementById('ns-p3-sh').value,sm:+document.getElementById('ns-p3-sm').value,eh:+document.getElementById('ns-p3-eh').value,em:+document.getElementById('ns-p3-em').value}};
     config.schedType=document.getElementById('settings-sched-type').value;
     saveTargetsUI();saveConfig(config);alert('Settings saved!');
+}
+
+// === PERIOD REMINDER NOTIFICATIONS ===
+function requestNotificationPermission(){
+    if('Notification' in window && Notification.permission==='default'){
+        Notification.requestPermission();
+    }
+}
+let reminderInterval=null;
+const firedReminders=new Set();
+function startPeriodReminders(){
+    if(reminderInterval)clearInterval(reminderInterval);
+    firedReminders.clear();
+    reminderInterval=setInterval(checkPeriodReminders,30000);
+    checkPeriodReminders();
+}
+function checkPeriodReminders(){
+    if(!boardActive)return;
+    const cfg=loadConfig();
+    const sched=cfg.shiftType==='Nights'?cfg.nights:cfg.days;
+    const now=new Date(),cm=now.getHours()*60+now.getMinutes();
+    const periods=[{name:'P1',end:sched.p1.eh*60+sched.p1.em},{name:'P2',end:sched.p2.eh*60+sched.p2.em},{name:'P3',end:sched.p3.eh*60+sched.p3.em}];
+    periods.forEach(p=>{
+        let endMin=p.end;
+        let currentMin=cm;
+        if(cfg.shiftType==='Nights'){
+            const shiftStart=sched.p1.sh*60+sched.p1.sm;
+            if(endMin<shiftStart)endMin+=1440;
+            if(currentMin<shiftStart)currentMin+=1440;
+        }
+        const diff=endMin-currentMin;
+        const key5=p.name+'-5min';
+        const key0=p.name+'-end';
+        if(diff<=5&&diff>0&&!firedReminders.has(key5)){
+            firedReminders.add(key5);
+            fireReminder('\u23F0 '+p.name+' ending in 5 min','Get ready to post your '+p.name+' update!','warn');
+        }
+        if(diff<=0&&diff>=-2&&!firedReminders.has(key0)){
+            firedReminders.add(key0);
+            fireReminder('\u{1F6A8} '+p.name+' ended \u2014 POST NOW','Time to post your '+p.name+' update! Updates are late!','urgent');
+        }
+    });
+}
+function fireReminder(title,body,severity){
+    if('Notification' in window && Notification.permission==='granted'){
+        const n=new Notification(title,{body,requireInteraction:true,tag:title});
+        setTimeout(()=>n.close(),60000);
+    }
+    showReminderBanner(title,body,severity);
+}
+function showReminderBanner(title,body,severity){
+    let banner=document.getElementById('sb-reminder-banner');
+    if(!banner){
+        banner=document.createElement('div');
+        banner.id='sb-reminder-banner';
+        banner.style.cssText='position:fixed;top:0;left:0;right:0;z-index:999999;padding:10px 20px;display:flex;align-items:center;justify-content:space-between;font:bold 13px sans-serif;box-shadow:0 2px 8px rgba(0,0,0,0.3);transition:transform 0.3s;';
+        document.body.appendChild(banner);
+    }
+    banner.style.background=severity==='urgent'?'#c62828':'#e65100';
+    banner.style.color='#fff';
+    banner.innerHTML=`<span>${title} \u2014 ${body}</span><button onclick="this.parentElement.style.display='none'" style="background:rgba(255,255,255,0.2);border:none;color:#fff;padding:4px 10px;border-radius:4px;cursor:pointer;font-weight:bold;">Dismiss</button>`;
+    banner.style.display='flex';
+    setTimeout(()=>{if(banner)banner.style.display='none';},60000);
 }
 
 addLaunchBtn();
