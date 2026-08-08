@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      6.0.0
+// @version      7.7.7
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -190,7 +190,22 @@ function fetchLPDataAuto(site){
 function attemptLPFetch(site,resolve,isRetry){
         const now=new Date();
         const day=now.getDay();
-        const sun=new Date(now);sun.setDate(now.getDate()-(day===0?0:day));sun.setHours(0,0,0,0);
+        const cfg=loadConfig();
+        // Determine which Sunday to use for LP data
+        // Night shift on Saturday (day=6) or Sunday before day shift starts: use PREVIOUS Sunday
+        // Day shift on Sunday or later: use THIS Sunday (new week)
+        let sundayOffset=day===0?0:day; // default: most recent Sunday
+        if(cfg.shiftType==='Nights'&&day===6){
+            // Saturday night shift — still use last week's plan (previous Sunday)
+            sundayOffset=6; // goes back to last Sunday
+        }else if(cfg.shiftType==='Nights'&&day===0){
+            // Sunday night shift hasn't started the new week yet on nights
+            // Night shift on Sunday evening = new week, but if we're in AM (still on Sat night shift), use old
+            if(now.getHours()<12){
+                sundayOffset=7; // still on Saturday night shift, use previous Sunday
+            }
+        }
+        const sun=new Date(now);sun.setDate(now.getDate()-sundayOffset);sun.setHours(0,0,0,0);
         const sundayStr=sun.getFullYear()+'-'+String(sun.getMonth()+1).padStart(2,'0')+'-'+String(sun.getDate()).padStart(2,'0');
         const end=new Date(sun);end.setDate(end.getDate()+14);
         const endStr=end.getFullYear()+'-'+String(end.getMonth()+1).padStart(2,'0')+'-'+String(end.getDate()).padStart(2,'0');
@@ -211,8 +226,8 @@ function attemptLPFetch(site,resolve,isRetry){
                     if(!finalReport||!finalReport.planId){console.warn('[SB-LP] No Final report found');resolve(null);return;}
                     const planId=finalReport.planId;
                     console.log('[SB-LP] Found:',finalReport.reportName,'planId=',planId);
-                    let done=0;const results={ibCplh:0,obCplh:0,siteCplh:0,ctiRate:0,topRate:0,ibDensityLP:0,obDensityLP:0};
-                    const checkDone=()=>{if(done>=7){saveLPValues(results);resolve(results);}};
+                    let done=0;const results={ibCplh:0,obCplh:0,siteCplh:0,ctiRate:0,topRate:0,ibDensityLP:0,obDensityLP:0,ibBBGoal:0,obBBGoal:0};
+                    const checkDone=()=>{if(done>=9){saveLPValues(results);resolve(results);}};
                     fetchLPPageAuto(planId,'IB',sundayStr,'key','IB Total CPLH',(v)=>{results.ibCplh=v;done++;checkDone();});
                     fetchLPPageAuto(planId,'DA',sundayStr,'key','DA Bldg to Bldg Total - CPLH',(v)=>{results.obCplh=v;done++;checkDone();});
                     fetchLPPageAuto(planId,'UnderatedRatesAndHours',sundayStr,'lineItem','Total Building CPLH Inc Support',(v)=>{results.siteCplh=v;done++;checkDone();});
@@ -220,6 +235,9 @@ function attemptLPFetch(site,resolve,isRetry){
                     fetchLPPageAutoRate(planId,'UnderatedRatesAndHours',sundayStr,'Transfer Out Pick - Small',(v)=>{results.topRate=v;done++;checkDone();});
                     fetchLPPageAutoRate(planId,'Density',sundayStr,'Case Transfer In',(v)=>{results.ibDensityLP=v;done++;checkDone();});
                     fetchLPPageAutoRate(planId,'Density',sundayStr,'DA Bldg to Bldg Transfer TOTAL',(v)=>{results.obDensityLP=v;done++;checkDone();});
+                    // BB Goals: Week Capacity (Cartons) for today's day from IB and DA
+                    fetchBBGoalFromLP(planId,'IB',sundayStr,(v)=>{results.ibBBGoal=v;done++;checkDone();});
+                    fetchBBGoalFromLP(planId,'DA',sundayStr,(v)=>{results.obBBGoal=v;done++;checkDone();});
                 }catch(e){console.warn('[SB-LP] Parse error:',e);resolve(null);}
             },
             onerror:function(e){
@@ -330,6 +348,52 @@ function fetchLPPageAutoRate(planId,pageName,sundayStr,targetLineItem,callback){
     });
 }
 
+function fetchBBGoalFromLP(planId,pageName,sundayStr,callback){
+    const site=loadConfig().site;
+    const url=`https://galaxybi.aka.corp.amazon.com/api/metadata/pageUrl?pageName=${pageName}&planId=${planId}&site=${site}`;
+    // Determine today's day name
+    const days=['SUNDAY','MONDAY','TUESDAY','WEDNESDAY','THURSDAY','FRIDAY','SATURDAY'];
+    const todayDay=days[new Date().getDay()];
+    GM_xmlhttpRequest({method:'GET',url,headers:{'Accept':'*/*','Content-Type':'application/json'},
+        onload:function(resp){
+            try{
+                const text=resp.responseText.trim();
+                if(!text.startsWith('{')){callback(0);return;}
+                const s3Url=JSON.parse(text).url;
+                if(!s3Url){callback(0);return;}
+                GM_xmlhttpRequest({method:'GET',url:s3Url,headers:{'Accept':'*/*'},
+                    onload:function(s3Resp){
+                        try{
+                            const rows=JSON.parse(s3Resp.responseText);
+                            let val=0;
+                            // Look for "Week Capacity (Cartons)" type with today's day key
+                            for(const row of rows){
+                                const t=(row.type||'').trim();
+                                const k=(row.key||'').trim();
+                                if(t.includes('Week Capacity')&&t.includes('Cartons')&&k.includes(todayDay)&&row.date===sundayStr){
+                                    val=parseFloat(row.value)||0;break;
+                                }
+                            }
+                            // Fallback: just match key containing today's day in Cartons type
+                            if(val===0){
+                                for(const row of rows){
+                                    const t=(row.type||'').trim();
+                                    const k=(row.key||'').trim();
+                                    if(t.includes('Cartons')&&k.includes(todayDay)&&row.value&&parseFloat(row.value)>0){
+                                        val=parseFloat(row.value);break;
+                                    }
+                                }
+                            }
+                            console.log(`[SB-LP] BB Goal ${pageName} (${todayDay}) = ${val}`);
+                            callback(val);
+                        }catch(e){callback(0);}
+                    },onerror:function(){callback(0);},ontimeout:function(){callback(0);}
+                });
+            }catch(e){callback(0);}
+        },onerror:function(){callback(0);},ontimeout:function(){callback(0);}
+    });
+}
+
 function renderLPPercents(metrics){
     if(!metrics)return;
     const lp=loadLPValues();
@@ -353,7 +417,16 @@ function renderLPPercents(metrics){
     }
     if(siteLpCplh>0){
         const siteCplhVal=parseFloat(document.getElementById('site-cplh-value')?.textContent)||0;
-        if(siteCplhVal>0){const siteLP=(siteCplhVal/siteLpCplh)*100;const pctEl=setEl('site-cplh-pct',fmtPct(siteLP));setPctClass(pctEl,siteLP);}
+        if(siteCplhVal>0){
+            const siteLP=(siteCplhVal/siteLpCplh)*100;
+            const pctEl=setEl('site-cplh-pct',fmtPct(siteLP));setPctClass(pctEl,siteLP);
+            // Set % to LP in the Site CPLH panel
+            const lpPctEl=document.getElementById('site-cplh-lp-pct');
+            if(lpPctEl){lpPctEl.textContent=siteLP.toFixed(1)+'%';lpPctEl.style.color=siteLP>=100?'#2e7d32':siteLP>=95?'#e65100':'#c62828';}
+            // Conditional format the site CPLH value itself
+            const valEl=document.getElementById('site-cplh-value');
+            if(valEl){valEl.style.color=siteLP>=100?'#2e7d32':siteLP>=95?'#e65100':'#c62828';}
+        }
     }
     // Update the LP display values
     const ibDispEl=document.getElementById('lp-ib-cplh-display');if(ibDispEl)ibDispEl.textContent=ibLpCplh>0?ibLpCplh.toFixed(2):'\u2014';
@@ -717,8 +790,13 @@ function renderTargets(m){
         if(fullEnd>fullStart){shiftDuration=fullEnd-fullStart;elapsed=cm-fullStart;}
         else{shiftDuration=(1440-fullStart)+fullEnd;elapsed=cm>=fullStart?cm-fullStart:(1440-fullStart)+cm;}
         if(elapsed<0)elapsed=0;
+        // If shift is complete, just check if goal was met
+        if(elapsed>=shiftDuration){
+            if(actualPct>=100)return 'green';
+            if(actualPct>=95)return 'amber';
+            return 'red';
+        }
         const pctElapsed=(elapsed/shiftDuration)*100;
-        // If ahead of pace: green. Within 10% of pace: amber. Behind by >10%: red
         if(actualPct>=pctElapsed)return 'green';
         if(actualPct>=pctElapsed-10)return 'amber';
         return 'red';
@@ -953,8 +1031,9 @@ function buildHTML(){return `
 </div>
 <div class="site-cplh-panel" id="site-cplh-panel" style="background:#fff;border:2px solid #000;border-radius:4px;padding:10px 14px;">
 <h3 style="font-size:11px;font-weight:700;margin-bottom:6px;">Site CPLH <span style="margin-left:16px;font-size:11px;background:#e8f5e9;color:#2e7d32;padding:2px 8px;border-radius:4px;font-weight:700;">LP Target = <span id="lp-site-cplh-display">\u2014</span></span></h3>
-<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:12px;">
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;font-size:12px;">
 <div><span style="color:#333;font-size:10px;">SITE CPLH</span><br><strong id="site-cplh-value" style="font-size:16px;">\u2014</strong></div>
+<div><span style="color:#333;font-size:10px;">% TO LP</span><br><strong id="site-cplh-lp-pct" style="font-size:16px;">\u2014</strong></div>
 <div><span style="color:#333;font-size:10px;">THROUGHPUT VOL</span><br><strong id="site-throughput-vol">\u2014</strong></div>
 <div><span style="color:#333;font-size:10px;">THROUGHPUT HRS</span><br><strong id="site-throughput-hrs">\u2014</strong></div>
 </div>
@@ -993,7 +1072,7 @@ function buildHTML(){return `
 <div class="targets-panel"><h3 class="panel-title" style="display:flex;justify-content:space-between;align-items:center;">Shift Plan Targets <button id="btn-clear-targets" class="btn btn-small btn-danger">Clear</button></h3>
 <div class="target-groups-row">
 <div class="tg-compact"><h4>INBOUND</h4><table class="target-table"><thead><tr><th></th><th>Target</th><th>%</th></tr></thead><tbody>
-<tr><td>24 HR BB GOAL</td><td><input type="number" id="ib-bb-goal" class="target-input"></td><td></td></tr>
+<tr><td>24 HR BB GOAL</td><td><span id="ib-bb-goal" style="font-weight:bold;">\u2014</span></td><td></td></tr>
 <tr><td>IB GOAL</td><td><input type="number" id="ib-goal-input" class="target-input"></td><td><span id="ib-goal-pct">\u2014</span></td></tr>
 <tr><td>STOW RATE</td><td><input type="number" id="ib-rate-target" class="target-input"></td><td><span id="ib-rate-pct">\u2014</span></td></tr>
 <tr><td>IB CPLH</td><td><input type="number" id="ib-cplh-target" class="target-input"></td><td><span id="ib-cplh-pct">\u2014</span></td></tr>
@@ -1002,7 +1081,7 @@ function buildHTML(){return `
 <tr><td>EOL FAST START</td><td><input type="number" id="ib-fast-eol" class="target-input" value="18" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ib-fast-eol-pct">\u2014</span></td></tr>
 </tbody></table></div>
 <div class="tg-compact"><h4>OUTBOUND</h4><table class="target-table"><thead><tr><th></th><th>Target</th><th>%</th></tr></thead><tbody>
-<tr><td>24 HR BB GOAL</td><td><input type="number" id="ob-bb-goal" class="target-input"></td><td></td></tr>
+<tr><td>24 HR BB GOAL</td><td><span id="ob-bb-goal" style="font-weight:bold;">\u2014</span></td><td></td></tr>
 <tr><td>DA GOAL</td><td><input type="number" id="ob-goal-input" class="target-input"></td><td><span id="ob-goal-pct">\u2014</span></td></tr>
 <tr><td>PICK RATE</td><td><input type="number" id="ob-rate-target" class="target-input"></td><td><span id="ob-rate-pct">\u2014</span></td></tr>
 <tr><td>DA CPLH</td><td><input type="number" id="ob-cplh-target" class="target-input"></td><td><span id="ob-cplh-pct">\u2014</span></td></tr>
@@ -1573,12 +1652,19 @@ async function doFetch(){
         const totHrs=pprFull.totHrs||0;
         if(totHrs>0){const hrs=Math.floor(totHrs);const mins=Math.round((totHrs-hrs)*60);setEl('tot-value',hrs+'h '+mins+'m');}else{setEl('tot-value','\u2014');}
         // Render 24hr BB Goal Tracker
-        const ibBBGoal=parseFloat(document.getElementById('ib-bb-goal')?.value)||0;
-        const obBBGoal=parseFloat(document.getElementById('ob-bb-goal')?.value)||0;
+        // Try LP cached BB goals first, then fall back to span text
+        const lpCached=loadLPValues();
+        const ibBBGoal=parseFloat(document.getElementById('ib-bb-goal')?.textContent?.replace(/,/g,''))||parseFloat(lpCached.ibBBGoal)||0;
+        const obBBGoal=parseFloat(document.getElementById('ob-bb-goal')?.textContent?.replace(/,/g,''))||parseFloat(lpCached.obBBGoal)||0;
         const ib24=raw.data24?.ibVol24||0;
         const ob24=raw.data24?.obVol24||0;
-        if(ibBBGoal>0){const pct=(ib24/ibBBGoal)*100;setEl('bb24-ib-text',fmt(ib24)+' / '+fmt(ibBBGoal)+' ('+pct.toFixed(1)+'%)');const bar=document.getElementById('bb24-ib-bar');if(bar){bar.style.width=Math.min(pct,100)+'%';bar.style.background=pct>=100?'#2e7d32':pct>=75?'#1565c0':'#1565c0';}}else{setEl('bb24-ib-text',ib24>0?fmt(ib24)+' (no goal set)':'\u2014');const bar=document.getElementById('bb24-ib-bar');if(bar)bar.style.width='0%';}
-        if(obBBGoal>0){const pct=(ob24/obBBGoal)*100;setEl('bb24-ob-text',fmt(ob24)+' / '+fmt(obBBGoal)+' ('+pct.toFixed(1)+'%)');const bar=document.getElementById('bb24-ob-bar');if(bar){bar.style.width=Math.min(pct,100)+'%';bar.style.background=pct>=100?'#2e7d32':pct>=75?'#e65100':'#e65100';}}else{setEl('bb24-ob-text',ob24>0?fmt(ob24)+' (no goal set)':'\u2014');const bar=document.getElementById('bb24-ob-bar');if(bar)bar.style.width='0%';}
+        // Save 24hr volumes for LP re-render
+        const lpSaved=loadLPValues();lpSaved._ib24Vol=ib24;lpSaved._ob24Vol=ob24;saveLPValues(lpSaved);
+        // If we have cached BB goals, use them immediately
+        if(ibBBGoal>0){const el=document.getElementById('ib-bb-goal');if(el&&!el.textContent.match(/\d/))el.textContent=Math.round(ibBBGoal).toLocaleString();}
+        if(obBBGoal>0){const el=document.getElementById('ob-bb-goal');if(el&&!el.textContent.match(/\d/))el.textContent=Math.round(obBBGoal).toLocaleString();}
+        if(ibBBGoal>0){const pct=(ib24/ibBBGoal)*100;setEl('bb24-ib-text',fmt(ib24)+' / '+fmt(Math.round(ibBBGoal))+' ('+pct.toFixed(1)+'%)');const bar=document.getElementById('bb24-ib-bar');if(bar){bar.style.width=Math.min(pct,100)+'%';bar.style.background=pct>=100?'#2e7d32':'#1565c0';}}else{setEl('bb24-ib-text',ib24>0?fmt(ib24)+' (loading goal...)':'\u2014');const bar=document.getElementById('bb24-ib-bar');if(bar)bar.style.width='0%';}
+        if(obBBGoal>0){const pct=(ob24/obBBGoal)*100;setEl('bb24-ob-text',fmt(ob24)+' / '+fmt(Math.round(obBBGoal))+' ('+pct.toFixed(1)+'%)');const bar=document.getElementById('bb24-ob-bar');if(bar){bar.style.width=Math.min(pct,100)+'%';bar.style.background=pct>=100?'#2e7d32':'#e65100';}}else{setEl('bb24-ob-text',ob24>0?fmt(ob24)+' (loading goal...)':'\u2014');const bar=document.getElementById('bb24-ob-bar');if(bar)bar.style.width='0%';}
         // 24hr Density
         const ibD24=raw.data24?.ibDensity24||0;
         const obD24=raw.data24?.obDensity24||0;
@@ -1591,6 +1677,15 @@ async function doFetch(){
         fetchLPDataAuto(config.site).then(lp=>{
             if(lp&&(lp.ibCplh>0||lp.obCplh>0)){
                 console.log('[SB-LP] Auto-fetched LP values:',lp);
+                // Auto-populate BB goals from LP
+                if(lp.ibBBGoal>0){const el=document.getElementById('ib-bb-goal');if(el)el.textContent=Math.round(lp.ibBBGoal).toLocaleString();}
+                if(lp.obBBGoal>0){const el=document.getElementById('ob-bb-goal');if(el)el.textContent=Math.round(lp.obBBGoal).toLocaleString();}
+                // Re-render 24hr goal tracker with LP BB goals
+                const savedLP2=loadLPValues();
+                const ib24Vol=savedLP2._ib24Vol||0;
+                const ob24Vol=savedLP2._ob24Vol||0;
+                if(lp.ibBBGoal>0&&ib24Vol>0){const pct=(ib24Vol/lp.ibBBGoal)*100;setEl('bb24-ib-text',fmt(ib24Vol)+' / '+fmt(Math.round(lp.ibBBGoal))+' ('+pct.toFixed(1)+'%)');const bar=document.getElementById('bb24-ib-bar');if(bar){bar.style.width=Math.min(pct,100)+'%';bar.style.background=pct>=100?'#2e7d32':'#1565c0';}}
+                if(lp.obBBGoal>0&&ob24Vol>0){const pct=(ob24Vol/lp.obBBGoal)*100;setEl('bb24-ob-text',fmt(ob24Vol)+' / '+fmt(Math.round(lp.obBBGoal))+' ('+pct.toFixed(1)+'%)');const bar=document.getElementById('bb24-ob-bar');if(bar){bar.style.width=Math.min(pct,100)+'%';bar.style.background=pct>=100?'#2e7d32':'#e65100';}}
             }else{
                 console.log('[SB-LP] Auto-fetch failed, using saved LP values');
             }
