@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      7.7.7
+// @version      8.0.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -898,8 +898,10 @@ function renderCharts(m){
 function renderActions(){
     const actions=loadActions(),tbody=document.getElementById('actions-body');if(!tbody)return;
     tbody.innerHTML='';
-    actions.forEach((a,i)=>{const tr=document.createElement('tr');tr.innerHTML=`<td><input type="text" value="${a.time||''}" data-i="${i}" data-f="time" style="width:50px;text-align:center;" placeholder="HH:MM"></td><td><input type="text" value="${a.item||''}" data-i="${i}" data-f="item"></td><td><input type="text" value="${a.owner||''}" data-i="${i}" data-f="owner" style="width:80px"></td><td><select data-i="${i}" data-f="status"><option ${a.status==='Open'?'selected':''}>Open</option><option ${a.status==='In Progress'?'selected':''}>In Progress</option><option ${a.status==='Done'?'selected':''}>Done</option></select></td><td><span class="action-delete" data-i="${i}">\u2715</span></td>`;tbody.appendChild(tr);});
-    tbody.querySelectorAll('input,select').forEach(el=>el.addEventListener('change',()=>{const a=loadActions(),i=+el.dataset.i;if(a[i]){a[i][el.dataset.f]=el.value;saveActions(a);renderTimeline();}}));
+    actions.forEach((a,i)=>{const tr=document.createElement('tr');tr.innerHTML=`<td><input type="text" value="${a.time||''}" data-i="${i}" data-f="time" style="width:50px;text-align:center;" placeholder="HH:MM"></td><td><textarea data-i="${i}" data-f="item" rows="2" style="width:100%;min-width:300px;resize:none;font-family:inherit;word-wrap:break-word;white-space:pre-wrap;">${a.item||''}</textarea></td><td><input type="text" value="${a.owner||''}" data-i="${i}" data-f="owner" style="width:80px"></td><td><select data-i="${i}" data-f="status"><option ${a.status==='Open'?'selected':''}>Open</option><option ${a.status==='In Progress'?'selected':''}>In Progress</option><option ${a.status==='Done'?'selected':''}>Done</option></select></td><td><span class="action-delete" data-i="${i}">\u2715</span></td>`;tbody.appendChild(tr);});
+    tbody.querySelectorAll('input,select,textarea').forEach(el=>el.addEventListener('change',()=>{const a=loadActions(),i=+el.dataset.i;if(a[i]){a[i][el.dataset.f]=el.value;saveActions(a);renderTimeline();}}));
+    // Auto-resize textareas to fit content
+    tbody.querySelectorAll('textarea').forEach(ta=>{ta.style.height='auto';ta.style.height=ta.scrollHeight+'px';ta.addEventListener('input',()=>{ta.style.height='auto';ta.style.height=ta.scrollHeight+'px';});});
     tbody.querySelectorAll('.action-delete').forEach(el=>el.addEventListener('click',()=>{const a=loadActions();a.splice(+el.dataset.i,1);saveActions(a);renderActions();renderTimeline();}));
     renderTimeline();
 }
@@ -969,7 +971,7 @@ function buildHTML(){return `
 
 <section class="metrics-section"><div class="section-header"><h2>SYNC Actions</h2><div><button id="btn-add-action" class="btn btn-small">+ Add</button> <button id="btn-clear-actions" class="btn btn-small btn-danger">Clear</button></div></div>
 <div class="shift-timeline" id="shift-timeline"></div>
-<table class="actions-table" style="margin-top:8px;"><thead><tr><th>Time</th><th>Action Item</th><th>Owner</th><th>Status</th><th></th></tr></thead><tbody id="actions-body"></tbody></table></section>
+<table class="actions-table" style="margin-top:8px;width:100%;"><thead><tr><th style="width:55px;">Time</th><th>Action Item</th><th style="width:100px;">Owner</th><th style="width:90px;">Status</th><th style="width:20px;"></th></tr></thead><tbody id="actions-body"></tbody></table></section>
 
 <section class="metrics-section ib-section"><div class="section-header"><h2>INBOUND | NTP</h2><span class="fclm-timestamp" id="ib-timestamp">\u2014</span></div>
 <table class="metrics-table"><thead><tr><th></th><th>P1</th><th>P2</th><th>P3</th><th>Total</th></tr></thead><tbody>
@@ -1206,7 +1208,7 @@ function buildCSS(){return `
 `;}
 
 function buildCSS2(){return `
-.metrics-section{background:#fff;border-radius:4px;border:2px solid #000;padding:14px 18px;margin-bottom:12px;}
+.metrics-section{background:#fff;border-radius:4px;border:2px solid #000;padding:14px 18px 20px 18px;margin-bottom:12px;overflow:visible;}
 .metrics-section.ib-section{border-left:4px solid #1565c0;}
 .metrics-section.ob-section{border-left:4px solid #e65100;}
 .metrics-section.sort-section{border-left:4px solid #6a1b9a;}
@@ -1219,9 +1221,10 @@ function buildCSS2(){return `
 .table-input::-webkit-outer-spin-button,.table-input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
 .wip-eos{font-size:9px;color:#666;margin-right:4px;}
 .pct-good{color:#2e7d32!important;font-weight:700;}.pct-warn{color:#e65100!important;font-weight:700;}.pct-bad{color:#c62828!important;font-weight:700;}
-.actions-table{width:100%;border-collapse:collapse;font-size:12px;}.actions-table th{text-align:left;padding:4px 8px;border-bottom:2px solid #000;color:#000;font-weight:700;}.actions-table td{padding:4px 8px;border-bottom:1px solid #ccc;}
-.actions-table input{width:100%;background:#fff;border:1px solid #000;color:#000;padding:3px 6px;border-radius:4px;font-size:12px;}
-.actions-table select{background:#fff;border:1px solid #000;color:#000;padding:3px 6px;border-radius:4px;font-size:11px;}.action-delete{cursor:pointer;color:#c62828;font-size:14px;}
+.actions-table{width:100%;border-collapse:collapse;font-size:12px;}.actions-table th{text-align:left;padding:4px 8px;border-bottom:2px solid #000;color:#000;font-weight:700;}.actions-table td{padding:10px 8px;border-bottom:1px solid #ccc;vertical-align:middle;overflow:visible;}
+.actions-table input{width:100%;background:#fff;border:1px solid #000;color:#000;padding:6px 6px;border-radius:4px;font-size:12px;box-sizing:border-box;min-width:0;line-height:1.4;}
+.actions-table textarea{width:100%;background:#fff;border:1px solid #000;color:#000;padding:6px 6px;border-radius:4px;font-size:12px;box-sizing:border-box;line-height:1.4;overflow:auto;word-wrap:break-word;white-space:pre-wrap;resize:none;min-height:50px;height:auto;}
+.actions-table select{background:#fff;border:1px solid #000;color:#000;padding:8px 8px;border-radius:4px;font-size:12px;line-height:1.6;height:auto;min-height:34px;}.action-delete{cursor:pointer;color:#c62828;font-size:14px;}
 .shift-timeline{display:flex;gap:1px;height:32px;border-radius:4px;overflow:hidden;background:#ccc;margin-bottom:6px;border:1px solid #000;}
 .timeline-hour{flex:1;background:#f5f5f5;display:flex;align-items:center;justify-content:center;font-size:9px;color:#333;cursor:pointer;position:relative;transition:background .15s;}
 .timeline-hour:hover{background:#e0e0e0;}
@@ -1597,8 +1600,20 @@ function doSnip(){
     const style=document.createElement('style');style.id='snip-fix';
     style.textContent='#sb-root,#sb-root *{color:#000 !important;}#sb-root .pct-good{color:#2e7d32 !important;}#sb-root .pct-warn{color:#e65100 !important;}#sb-root .pct-bad{color:#c62828 !important;}#sb-root .row-fast td{color:#e65100 !important;}#sb-root .goal-title{color:#333 !important;}#sb-root .goal-stats{color:#333 !important;}#sb-root .goal-stats strong{color:#000 !important;}#sb-root .fclm-timestamp{color:#333 !important;}#sb-root .meta-text{color:#333 !important;}#sb-root .target-input{color:#000 !important;padding:4px 6px !important;font-size:13px !important;line-height:1.3 !important;}#sb-root .table-input{color:#000 !important;}#sb-root .panel-title{color:#333 !important;}#sb-root .tg-compact h4{color:#1565c0 !important;}#sb-root .tg-compact:last-child h4{color:#2e7d32 !important;}#sb-root .fixed-target{color:#2e7d32 !important;}#sb-root .row-hc td{color:#666 !important;}#sb-root .section-header h2{color:#000 !important;}#sb-root .metrics-table .bold{color:#000 !important;}#sb-root .nav-tab{color:#333 !important;}#sb-root .nav-tab.active{color:#fff !important;}#sb-root .target-table td{padding:4px 6px !important;line-height:1.4 !important;}';
     document.head.appendChild(style);
+    // Replace textareas with divs for html2canvas (textareas don't render wrapped text)
+    const textareaBackups=[];
+    root.querySelectorAll('textarea').forEach(ta=>{
+        const div=document.createElement('div');
+        div.textContent=ta.value;
+        div.style.cssText=window.getComputedStyle(ta).cssText;
+        div.style.whiteSpace='pre-wrap';div.style.wordWrap='break-word';div.style.overflow='visible';div.style.height='auto';div.style.minHeight='32px';div.style.display='block';div.style.padding='6px';div.style.border='1px solid #000';div.style.borderRadius='4px';div.style.fontSize='12px';div.style.lineHeight='1.4';div.style.background='#fff';div.style.width=ta.offsetWidth+'px';div.style.boxSizing='border-box';
+        textareaBackups.push({ta,parent:ta.parentNode,next:ta.nextSibling});
+        ta.parentNode.replaceChild(div,ta);
+    });
     setTimeout(()=>{
         html2canvas(root,{backgroundColor:'#ffffff',scale:1.5,useCORS:true,logging:false,windowHeight:root.scrollHeight,height:root.scrollHeight}).then(canvas=>{
+            // Restore textareas
+            textareaBackups.forEach(b=>{const div=b.parent.querySelector('div');if(div&&!div.querySelector){}b.next?b.parent.insertBefore(b.ta,b.next):b.parent.appendChild(b.ta);if(div&&div.parentNode)div.parentNode.removeChild(div);});
             // Restore styles
             document.head.removeChild(style);
             if(rightPanel){rightPanel.style.position=origStyles.rPos;rightPanel.style.maxHeight=origStyles.rMax;rightPanel.style.overflow=origStyles.rOvf;rightPanel.style.top=origStyles.rTop;rightPanel.style.minHeight=origStyles.rMinH||'';}
