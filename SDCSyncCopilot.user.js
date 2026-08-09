@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      8.0.0
+// @version      9.0.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -24,7 +24,7 @@ const SUPPORT_KEY = 'syncboard_support';
 const SITES = ['KRB3','KRB1','KRB2','KRB4','KRB6','ATL7','AVP8','HGR5','QXX6','SAV7'];
 
 const SITE_SCHEDULES = {
-    KRB3: { days:{full:{sh:5,sm:45,eh:17,em:30},p1:{sh:6,sm:15,eh:9,em:45},p2:{sh:9,sm:46,eh:13,em:15},p3:{sh:13,sm:45,eh:16,em:45}}, nights:{full:{sh:17,sm:45,eh:5,em:30},p1:{sh:18,sm:15,eh:21,em:45},p2:{sh:21,sm:46,eh:1,em:15},p3:{sh:1,sm:45,eh:4,em:45}} },
+    KRB3: { days:{full:{sh:5,sm:45,eh:17,em:30},p1:{sh:6,sm:15,eh:9,em:45},p2:{sh:10,sm:15,eh:13,em:15},p3:{sh:13,sm:15,eh:16,em:45}}, nights:{full:{sh:17,sm:45,eh:5,em:30},p1:{sh:18,sm:15,eh:21,em:45},p2:{sh:22,sm:15,eh:1,em:15},p3:{sh:1,sm:15,eh:4,em:45}} },
     KRB1: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:18,sm:0,eh:5,em:45},p1:{sh:18,sm:30,eh:22,em:0},p2:{sh:22,sm:1,eh:1,em:30},p3:{sh:1,sm:30,eh:5,em:0}} },
     KRB2: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:18,sm:30,eh:6,em:15},p1:{sh:19,sm:0,eh:22,em:30},p2:{sh:22,sm:31,eh:2,em:0},p3:{sh:2,sm:0,eh:5,em:30}} },
     KRB4: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:18,sm:0,eh:5,em:45},p1:{sh:18,sm:30,eh:22,em:0},p2:{sh:22,sm:1,eh:1,em:30},p3:{sh:1,sm:30,eh:5,em:0}} },
@@ -38,12 +38,15 @@ const SITE_SCHEDULES = {
 const PROCESS_IDS = { stow:'1003035', palletStow:'1003041', pick:'1003065', sort:'1003009', obDock:'1003021' };
 const DEFAULT_CONFIG = {
     site:'KRB3', shiftType:'Days', schedType:'3P',
-    days:{ full:{sh:5,sm:45,eh:17,em:30}, p1:{sh:6,sm:15,eh:9,em:45}, p2:{sh:9,sm:46,eh:13,em:15}, p3:{sh:13,sm:45,eh:16,em:45} },
-    nights:{ full:{sh:17,sm:45,eh:5,em:30}, p1:{sh:18,sm:15,eh:21,em:45}, p2:{sh:21,sm:46,eh:1,em:15}, p3:{sh:1,sm:45,eh:4,em:45} },
+    days:{ full:{sh:5,sm:45,eh:17,em:30}, p1:{sh:6,sm:15,eh:9,em:45}, p2:{sh:10,sm:15,eh:13,em:15}, p3:{sh:13,sm:15,eh:16,em:45} },
+    nights:{ full:{sh:17,sm:45,eh:5,em:30}, p1:{sh:18,sm:15,eh:21,em:45}, p2:{sh:22,sm:15,eh:1,em:15}, p3:{sh:1,sm:15,eh:4,em:45} },
     targets:{}
 };
 
-function loadConfig(){try{const s=localStorage.getItem(STORAGE_KEY);return s?{...DEFAULT_CONFIG,...JSON.parse(s)}:{...DEFAULT_CONFIG};}catch(e){return{...DEFAULT_CONFIG};}}
+function loadConfig(){try{const s=localStorage.getItem(STORAGE_KEY);if(s){const c={...DEFAULT_CONFIG,...JSON.parse(s)};
+    // Always use SITE_SCHEDULES for the selected site's period times (source of truth)
+    const siteSched=SITE_SCHEDULES[c.site];if(siteSched){c.days=siteSched.days;c.nights=siteSched.nights;}
+    return c;}return{...DEFAULT_CONFIG};}catch(e){return{...DEFAULT_CONFIG};}}
 function saveConfig(c){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(c));}catch(e){}}
 function loadActions(){try{const s=localStorage.getItem(ACTIONS_KEY);return s?JSON.parse(s):[];}catch(e){return[];}}
 function saveActions(a){try{localStorage.setItem(ACTIONS_KEY,JSON.stringify(a));}catch(e){}}
@@ -68,11 +71,13 @@ function buildPPRUrl(site,sd,sh,sm,ed,eh,em){return`/reports/processPathRollup?r
 function parseFnRollup(html){
     const doc=new DOMParser().parseFromString(html,'text/html');
     const tr=doc.querySelector('tfoot tr.total.empl-all')||doc.querySelector('tr.total.empl-all')||doc.querySelector('tfoot tr.total')||doc.querySelector('tfoot tr');
-    let units=0,hours=0,rate=0,hc=0,eachUnits=0,caseUnits=0;
+    let units=0,hours=0,rate=0,hc=0,eachUnits=0,caseUnits=0,fluidLoadToteJobs=0;
     if(tr){const cells=tr.querySelectorAll('td.numeric');if(cells.length>=3){hours=parseFloat(cells[0].textContent.replace(/,/g,''))||0;units=parseInt(cells[1].textContent.replace(/,/g,''),10)||0;rate=parseFloat(cells[2].textContent.replace(/,/g,''))||0;}
     // EACH UNIT is index 3, CASE UNIT is index 5 (if present)
     if(cells.length>=4){eachUnits=parseInt(cells[3].textContent.replace(/,/g,''),10)||0;}
-    if(cells.length>=6){caseUnits=parseInt(cells[5].textContent.replace(/,/g,''),10)||0;}}
+    if(cells.length>=6){caseUnits=parseInt(cells[5].textContent.replace(/,/g,''),10)||0;}
+    // FluidLoadTote Jobs is index 7 in OB Dock report tfoot
+    if(cells.length>=8){fluidLoadToteJobs=parseInt(cells[7].textContent.replace(/,/g,''),10)||0;}}
     const links=doc.querySelectorAll('a[href*="employeeId="]');const ids=new Set();links.forEach(l=>{const m=l.href.match(/employeeId=([^&]+)/);if(m)ids.add(m[1]);});hc=ids.size;
     // For palletStow: get CASE_UNIT from "Pallet Transfer In" Total row (6th numeric = index 5)
     let palletCases=0;
@@ -82,7 +87,9 @@ function parseFnRollup(html){
         if(foundPTI){const cellTexts=Array.from(row.querySelectorAll('td')).map(c=>c.textContent.trim());
             if(cellTexts.includes('Total')){const nums=[];cellTexts.forEach(c=>{const v=parseFloat(c.replace(/,/g,''));if(!isNaN(v))nums.push(v);});if(nums.length>=6)palletCases=Math.round(nums[5]);break;}}
     }
-    return{totalUnits:units,directHours:hours,rate,headcount:hc,palletCases,eachUnits,caseUnits};
+    // For OB Dock: Fluid Load Jobs = FluidLoadCase Jobs (tfoot index 1) + FluidLoadTote Jobs (tfoot index 7)
+    const fluidLoadJobs=units+fluidLoadToteJobs;
+    return{totalUnits:units,directHours:hours,rate,headcount:hc,palletCases,eachUnits,caseUnits,fluidLoadJobs};
 }
 
 function parsePPR(html){
@@ -127,17 +134,35 @@ async function fetchPeriod(site,startDate,sched){
 async function fetchAllData(config){
     const site=config.site,sched=config.shiftType==='Nights'?config.nights:config.days,{startDate}=getShiftDates(config);
     setStatus('Fetching all periods...');
+    // Build TOT time window: 30 min before SOS to 15 min after EOS
+    const totSched={sh:sched.full.sh,sm:sched.full.sm-30,eh:sched.full.eh,em:sched.full.em+15};
+    if(totSched.sm<0){totSched.sh--;totSched.sm+=60;}
+    if(totSched.sh<0)totSched.sh+=24;
+    if(totSched.em>=60){totSched.eh++;totSched.em-=60;}
+    if(totSched.eh>=24)totSched.eh-=24;
     // Fetch all periods in parallel for speed
-    const [full,p1,p2,p3,fastStart,data24]=await Promise.all([
+    const [full,p1,p2,p3,fastStart,data24,totPpr]=await Promise.all([
         fetchPeriod(site,startDate,sched.full),
         fetchPeriod(site,startDate,sched.p1),
         fetchPeriod(site,startDate,sched.p2),
         fetchPeriod(site,startDate,sched.p3),
         fetchFastStart(site,config.shiftType),
-        fetch24hrData(site)
+        fetch24hrData(site),
+        fetchTOTPpr(site,startDate,totSched,config.shiftType)
     ]);
     setStatus('\u2713 Updated '+new Date().toLocaleTimeString());
-    return{full,p1,p2,p3,fastStart,data24};
+    return{full,p1,p2,p3,fastStart,data24,totPpr};
+}
+
+async function fetchTOTPpr(site,startDate,sched,shiftType){
+    try{
+        let sDate=new Date(startDate);
+        if(sched.sh<12&&startDate.getHours()>=12){sDate.setDate(sDate.getDate()+1);}
+        let eDate=new Date(sDate);if(sched.eh<sched.sh)eDate.setDate(eDate.getDate()+1);
+        const url=buildPPRUrl(site,sDate,sched.sh,sched.sm,eDate,sched.eh,sched.em);
+        const html=await fetchHTML(url);
+        return parsePPR(html);
+    }catch(e){console.warn('[SB] TOT PPR fetch error:',e.message);return{totHrs:0};}
 }
 
 function fetchFastStart(site,shiftType){
@@ -170,7 +195,7 @@ async function fetch24hrData(site){
         const obDock=parseFnRollup(obDockHtml);
         const ibDensity24=(stow.caseUnits||0)>0?(stow.eachUnits||0)/(stow.caseUnits||1):0;
         const obDensity24=(obDock.caseUnits||0)>0?(obDock.eachUnits||0)/(obDock.caseUnits||1):0;
-        return{ibVol24:stow.totalUnits||0,obVol24:obDock.totalUnits||0,ibDensity24,obDensity24};
+        return{ibVol24:stow.totalUnits||0,obVol24:obDock.fluidLoadJobs||0,ibDensity24,obDensity24};
     }catch(e){console.warn('[SB] 24hr data fetch error:',e.message);return{ibVol24:0,obVol24:0,ibDensity24:0,obDensity24:0};}
 }
 
@@ -579,11 +604,13 @@ function processData(raw){
         const ibU=(stow.totalUnits||0)+palletCases;
         const ibPPRHrs=ppr.ibActualHrs||0;
         const caseStowReserve=ppr.caseStowReserveHrs||0;
-        const ibDH=stow.directHours||0;
+        // Direct Hours = Case Transfer In + Case Stow to Reserve + Pallet Transfer In
+        const ibDH=(stow.directHours||0)+caseStowReserve+(pStow.directHours||0);
         const ibTotalHrs=ibPPRHrs>0?ibPPRHrs:ibDH;
-        const ibIndirect=ibTotalHrs>ibDH?ibTotalHrs-ibDH:0;
-        // CPLH uses IB Total minus Case Stow to Reserve (matching Oculus)
-        const cplhHrs=ibTotalHrs-caseStowReserve;
+        // Indirect Hours = Total IB - Direct Hours
+        const ibIndirect=Math.max(ibTotalHrs-ibDH,0);
+        // CPLH = total volume / total hours (IB PPR total)
+        const cplhHrs=ibTotalHrs;
         const dur=pDurations[p]||1;
         m.ib[p]={totalStow:ibU,stowUnits:stow.totalUnits||0,palletUnits:pStow.totalUnits||0,palletCases,
             directHours:ibDH,indirectHours:ibIndirect,totalHours:ibTotalHrs,
@@ -594,16 +621,19 @@ function processData(raw){
             directHC:dur>0?ibDH/dur:0,indirectHC:dur>0?ibIndirect/dur:0,
             pprPlannedHrs:ppr.ibPlannedHrs||0,pprActualHrs:ibPPRHrs,
             pctToOP:(ppr.ibPlannedHrs||0)>0?(ibPPRHrs/ppr.ibPlannedHrs)*100:0};
+        // OB: Total Hours = DA Bldg to Bldg Transfer TOTAL, Direct = Transfer Out Pick (pick fn rollup), Indirect = Total - Direct
         const daHrs=ppr.daTransferHrs||0;
         const obPickDH=pick.directHours||0;
-        const obTotalHrs=daHrs>0?daHrs:obPickDH;
-        const obIndirect=obTotalHrs>obPickDH?obTotalHrs-obPickDH:0;
+        const obTotalHrs=daHrs;
+        const obIndirect=Math.max(obTotalHrs-obPickDH,0);
         const daPlan=ppr.daTransferPlan||0;
-        m.ob[p]={pickUnits:pick.totalUnits||0,loadedUnits:obDock.totalUnits||0,
+        // Loaded = Fluid Load Case jobs + Fluid Load Tote jobs
+        const loadedUnits=obDock.fluidLoadJobs||0;
+        m.ob[p]={pickUnits:pick.totalUnits||0,loadedUnits:loadedUnits,
             directHours:obPickDH,indirectHours:obIndirect,totalHours:obTotalHrs,
             directPct:obTotalHrs>0?(obPickDH/obTotalHrs)*100:0,indirectPct:obTotalHrs>0?(obIndirect/obTotalHrs)*100:0,
             pickRate:pick.rate||0,pickHC:pick.headcount||0,dockHC:obDock.headcount||0,
-            cplh:daHrs>0?(obDock.totalUnits||0)/daHrs:(obPickDH>0?(obDock.totalUnits||0)/obPickDH:0),
+            cplh:obTotalHrs>0?loadedUnits/obTotalHrs:0,
             density:(obDock.caseUnits||0)>0?(obDock.eachUnits||0)/(obDock.caseUnits||1):0,
             directHC:dur>0?obPickDH/dur:0,indirectHC:dur>0?obIndirect/dur:0,
             pprPlannedHrs:daPlan,pprActualHrs:daHrs,
@@ -614,13 +644,13 @@ function processData(raw){
     if(m.ib.p1&&m.ib.p2&&(raw.p2?.stow?.totalUnits>0||raw.p2?.palletStow?.palletCases>0)){
         m.ib.p2.totalStow=(m.ib.p1.totalStow||0)+((raw.p2?.stow?.totalUnits||0)+(raw.p2?.palletStow?.palletCases||0));
         m.ob.p2.pickUnits=(m.ob.p1.pickUnits||0)+(raw.p2?.pick?.totalUnits||0);
-        m.ob.p2.loadedUnits=(m.ob.p1.loadedUnits||0)+(raw.p2?.obDock?.totalUnits||0);
+        m.ob.p2.loadedUnits=(m.ob.p1.loadedUnits||0)+(raw.p2?.obDock?.fluidLoadJobs||0);
         m.sort.p2.totalUnits=(m.sort.p1.totalUnits||0)+(raw.p2?.sort?.totalUnits||0);
     }
     if(m.ib.p2&&m.ib.p3&&(raw.p3?.stow?.totalUnits>0||raw.p3?.palletStow?.palletCases>0||raw.p3?.pick?.totalUnits>0)){
         m.ib.p3.totalStow=m.ib.full?.totalStow||(m.ib.p2.totalStow||0)+((raw.p3?.stow?.totalUnits||0)+(raw.p3?.palletStow?.palletCases||0));
         m.ob.p3.pickUnits=m.ob.full?.pickUnits||(m.ob.p2.pickUnits||0)+(raw.p3?.pick?.totalUnits||0);
-        m.ob.p3.loadedUnits=m.ob.full?.loadedUnits||(m.ob.p2.loadedUnits||0)+(raw.p3?.obDock?.totalUnits||0);
+        m.ob.p3.loadedUnits=m.ob.full?.loadedUnits||(m.ob.p2.loadedUnits||0)+(raw.p3?.obDock?.fluidLoadJobs||0);
         m.sort.p3.totalUnits=m.sort.full?.totalUnits||(m.sort.p2.totalUnits||0)+(raw.p3?.sort?.totalUnits||0);
     }
     return m;
@@ -964,7 +994,7 @@ function buildHTML(){return `
 <div class="nav-tabs"><button class="nav-tab active" data-tab="sync">Sync IB-OB</button><button class="nav-tab" data-tab="hourly">Hourly</button><button class="nav-tab" data-tab="settings">Settings</button></div></div>
 <div class="topnav-right"><select id="site-select" class="select-input"></select><select id="shift-select" class="select-input"><option value="Days">Days</option><option value="Nights">Nights</option></select>
 <div class="period-indicator"><span class="period-dot" id="dot-p1">P1</span><span class="period-dot" id="dot-p2">P2</span><span class="period-dot" id="dot-p3">P3</span></div>
-<button id="btn-fetch" class="btn btn-primary">\u25B6 Get Data</button><button id="btn-snip" class="btn btn-snip">\uD83D\uDCF7 Snip</button><button id="btn-exit" class="btn btn-danger">\u2715 Exit</button><span id="last-update" class="meta-text">Ready</span></div></nav>
+<button id="btn-fetch" class="btn btn-primary">\u25B6 Get Data</button><button id="btn-snip" class="btn btn-snip">\uD83D\uDCF7 Snip</button><button id="btn-dark" class="btn" style="background:#333;color:#fff;border-color:#333;">\u263D</button><button id="btn-exit" class="btn btn-danger">\u2715 Exit</button><span id="last-update" class="meta-text">Ready</span></div></nav>
 
 <main id="tab-sync" class="tab-content active"><div class="sync-layout">
 <div class="sync-left">
@@ -1251,6 +1281,26 @@ function buildCSS2(){return `
 .hourly-section.ib-hourly{border-left:4px solid #1565c0;}
 .hourly-section.ob-hourly{border-left:4px solid #e65100;}
 .hourly-section.sort-hourly{border-left:4px solid #6a1b9a;}
+/* Dark Mode */
+#sb-root.dark-mode{background:#1a1a2e!important;color:#e0e0e0!important;}
+#sb-root.dark-mode .topnav{background:#16213e!important;border-color:#333!important;}
+#sb-root.dark-mode .metrics-section,#sb-root.dark-mode .goal-card,#sb-root.dark-mode .site-cplh-panel,#sb-root.dark-mode .targets-panel,#sb-root.dark-mode .chart-card,#sb-root.dark-mode .hourly-section,#sb-root.dark-mode #bb-24hr-panel{background:#0f3460!important;border-color:#444!important;color:#e0e0e0!important;}
+#sb-root.dark-mode .metrics-table th,#sb-root.dark-mode .metrics-table td,#sb-root.dark-mode .target-table td,#sb-root.dark-mode .actions-table th,#sb-root.dark-mode .actions-table td{color:#e0e0e0!important;border-color:#444!important;}
+#sb-root.dark-mode .metrics-table td{border-bottom-color:#333!important;}
+#sb-root.dark-mode .section-header h2,#sb-root.dark-mode .bold,#sb-root.dark-mode h3,#sb-root.dark-mode h4,#sb-root.dark-mode .panel-title{color:#e0e0e0!important;}
+#sb-root.dark-mode .target-input,#sb-root.dark-mode .actions-table input,#sb-root.dark-mode .actions-table textarea,#sb-root.dark-mode .actions-table select,#sb-root.dark-mode .select-input{background:#1a1a2e!important;color:#e0e0e0!important;border-color:#555!important;}
+#sb-root.dark-mode .goal-title{color:#ccc!important;}
+#sb-root.dark-mode .goal-stats,#sb-root.dark-mode .goal-stats strong{color:#e0e0e0!important;}
+#sb-root.dark-mode .fclm-timestamp,#sb-root.dark-mode .meta-text{color:#aaa!important;}
+#sb-root.dark-mode .row-target td{background:rgba(255,235,59,0.1)!important;}
+#sb-root.dark-mode .row-sync td{background:rgba(255,183,77,0.08)!important;}
+#sb-root.dark-mode .goal-progress{background:#333!important;}
+#sb-root.dark-mode .nav-tab{color:#aaa!important;background:#1a1a2e!important;}
+#sb-root.dark-mode .nav-tab.active{color:#fff!important;background:#2e7d32!important;}
+#sb-root.dark-mode .shift-timeline{background:#333!important;}
+#sb-root.dark-mode .timeline-hour{background:#1a1a2e!important;color:#aaa!important;}
+#sb-root.dark-mode .pace-insight{color:#ccc!important;border-color:#444!important;}
+#sb-root.dark-mode .tg-compact h4{color:#64b5f6!important;}
 `;}
 
 // === HOURLY TAB ===
@@ -1314,18 +1364,20 @@ async function fetchHourlyData(){
             const stow=raw.stow||{},pStow=raw.palletStow||{},pick=raw.pick||{},obDock=raw.obDock||{},sort=raw.sort||{},ppr=raw.ppr||{};
             const palletCases=pStow.palletCases||0;
             const ibU=(stow.totalUnits||0)+palletCases;
-            const ibDH=stow.directHours||0;
-            const ibTotalHrs=ppr.ibActualHrs||ibDH;
-            const ibIndirect=ibTotalHrs>ibDH?ibTotalHrs-ibDH:0;
             const caseStowReserve=ppr.caseStowReserveHrs||0;
-            const cplhHrs=ibTotalHrs-caseStowReserve;
+            // Direct Hours = Case Transfer In + Case Stow to Reserve + Pallet Transfer In
+            const ibDH=(stow.directHours||0)+caseStowReserve+(pStow.directHours||0);
+            const ibTotalHrs=ppr.ibActualHrs||ibDH;
+            // Indirect Hours = Total IB - Direct Hours
+            const ibIndirect=Math.max(ibTotalHrs-ibDH,0);
+            const cplhHrs=ibTotalHrs;
             const obPickDH=pick.directHours||0;
             const daHrs=ppr.daTransferHrs||obPickDH;
             const obIndirect=daHrs>obPickDH?daHrs-obPickDH:0;
             return{
                 label:hours[i].label,
                 ib:{totalStow:ibU,stowUnits:stow.totalUnits||0,palletUnits:pStow.totalUnits||0,rate:stow.rate||0,directHours:ibDH,indirectHours:ibIndirect,totalHours:ibTotalHrs,directPct:ibTotalHrs>0?(ibDH/ibTotalHrs)*100:0,indirectPct:ibTotalHrs>0?(ibIndirect/ibTotalHrs)*100:0,cplh:cplhHrs>0?ibU/cplhHrs:0,pctToOP:(ppr.ibPlannedHrs||0)>0?(ibTotalHrs/ppr.ibPlannedHrs)*100:0},
-                ob:{pickUnits:pick.totalUnits||0,loadedUnits:obDock.totalUnits||0,pickRate:pick.rate||0,directHours:obPickDH,indirectHours:obIndirect,totalHours:daHrs,directPct:daHrs>0?(obPickDH/daHrs)*100:0,indirectPct:daHrs>0?(obIndirect/daHrs)*100:0,cplh:daHrs>0?(obDock.totalUnits||0)/daHrs:0,pctToOP:(ppr.daTransferPlan||0)>0?(daHrs/ppr.daTransferPlan)*100:0},
+                ob:{pickUnits:pick.totalUnits||0,loadedUnits:obDock.fluidLoadJobs||0,pickRate:pick.rate||0,directHours:obPickDH,indirectHours:obIndirect,totalHours:daHrs,directPct:daHrs>0?(obPickDH/daHrs)*100:0,indirectPct:daHrs>0?(obIndirect/daHrs)*100:0,cplh:daHrs>0?(obDock.fluidLoadJobs||0)/daHrs:0,pctToOP:(ppr.daTransferPlan||0)>0?(daHrs/ppr.daTransferPlan)*100:0},
                 sort:{totalUnits:sort.totalUnits||0,rate:sort.rate||0,directHours:sort.directHours||0,cplh:(sort.directHours||0)>0?sort.totalUnits/sort.directHours:0}
             };
         });
@@ -1555,6 +1607,9 @@ function initBoard(){
     document.getElementById('btn-fetch').onclick=doFetch;
     document.getElementById('btn-exit').onclick=exitBoard;
     document.getElementById('btn-snip').onclick=doSnip;
+    document.getElementById('btn-dark').onclick=()=>{const root=document.getElementById('sb-root');root.classList.toggle('dark-mode');const isDark=root.classList.contains('dark-mode');localStorage.setItem('syncboard_dark',isDark?'1':'0');document.getElementById('btn-dark').textContent=isDark?'\u2600':'\u263D';};
+    // Restore dark mode preference
+    if(localStorage.getItem('syncboard_dark')==='1'){document.getElementById('sb-root').classList.add('dark-mode');document.getElementById('btn-dark').textContent='\u2600';}
     document.getElementById('btn-fetch-hourly')?.addEventListener('click',fetchHourlyData);
     document.getElementById('btn-clear-targets')?.addEventListener('click',()=>{
         ['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-density-target','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-density-target','sort-goal','sort-rate-target'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
@@ -1640,6 +1695,13 @@ async function doFetch(){
     const btn=document.getElementById('btn-fetch');btn.disabled=true;btn.textContent='\u23F3 Fetching...';
     try{
         const raw=await fetchAllData(config);
+        // Detect session expiry: if all data comes back as zeros, FCLM auth likely expired
+        const stowU=raw.full?.stow?.totalUnits||0;const pickU=raw.full?.pick?.totalUnits||0;const stowH=raw.full?.stow?.directHours||0;
+        if(stowU===0&&pickU===0&&stowH===0&&raw.full?.ppr?.ibActualHrs===0){
+            setStatus('\u26A0\uFE0F Session expired');
+            alert('\u26A0\uFE0F FCLM session expired — no data returned.\n\nPlease refresh this page (F5) to re-authenticate, then try Get Data again.');
+            btn.disabled=false;btn.textContent='\u25B6 Get Data';return;
+        }
         currentMetrics=processData(raw);
         renderIB(currentMetrics);renderOB(currentMetrics);renderSort(currentMetrics);
         renderTargets(currentMetrics);renderCharts(currentMetrics);
@@ -1663,8 +1725,8 @@ async function doFetch(){
         setEl('site-throughput-hrs',tHrs>0?fmt(tHrs,2):'\u2014');
         // Site CPLH % to target
         if(siteCplhTarget>0&&siteCplh>0){const p=(siteCplh/siteCplhTarget)*100;const el=setEl('site-cplh-pct',fmtPct(p));setPctClass(el,p);}
-        // Render TOT (Time Off Task) from FC Summary
-        const totHrs=pprFull.totHrs||0;
+        // Render TOT (Time Off Task) from separate PPR fetch (30min before SOS to 15min after EOS)
+        const totHrs=raw.totPpr?.totHrs||0;
         if(totHrs>0){const hrs=Math.floor(totHrs);const mins=Math.round((totHrs-hrs)*60);setEl('tot-value',hrs+'h '+mins+'m');}else{setEl('tot-value','\u2014');}
         // Render 24hr BB Goal Tracker
         // Try LP cached BB goals first, then fall back to span text
@@ -1703,6 +1765,15 @@ async function doFetch(){
                 if(lp.obBBGoal>0&&ob24Vol>0){const pct=(ob24Vol/lp.obBBGoal)*100;setEl('bb24-ob-text',fmt(ob24Vol)+' / '+fmt(Math.round(lp.obBBGoal))+' ('+pct.toFixed(1)+'%)');const bar=document.getElementById('bb24-ob-bar');if(bar){bar.style.width=Math.min(pct,100)+'%';bar.style.background=pct>=100?'#2e7d32':'#e65100';}}
             }else{
                 console.log('[SB-LP] Auto-fetch failed, using saved LP values');
+                // Show reminder if no LP data cached
+                const cached=loadLPValues();
+                if(!cached.ibCplh&&!cached.obCplh){
+                    const banner=document.getElementById('sb-reminder-banner')||document.createElement('div');
+                    banner.id='sb-reminder-banner';
+                    banner.style.cssText='position:fixed;top:0;left:0;right:0;z-index:999999;padding:10px 20px;display:flex;align-items:center;justify-content:space-between;font:bold 13px sans-serif;box-shadow:0 2px 8px rgba(0,0,0,0.3);background:#e65100;color:#fff;';
+                    banner.innerHTML='<span>\u26A0\uFE0F LP data unavailable — please visit <a href="https://galaxybi.aka.corp.amazon.com" target="_blank" style="color:#fff;text-decoration:underline;">GalaxyBI</a> once to authenticate, then refresh and try again.</span><button onclick="this.parentElement.style.display=\'none\'" style="background:rgba(255,255,255,0.2);border:none;color:#fff;padding:4px 10px;border-radius:4px;cursor:pointer;font-weight:bold;">Dismiss</button>';
+                    document.body.appendChild(banner);
+                }
             }
             renderLPPercents(currentMetrics);
         });
