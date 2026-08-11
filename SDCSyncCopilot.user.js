@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      10.0.0
+// @version      11.0.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -216,19 +216,11 @@ function attemptLPFetch(site,resolve,isRetry){
         const now=new Date();
         const day=now.getDay();
         const cfg=loadConfig();
-        // Determine which Sunday to use for LP data
-        // Night shift on Saturday (day=6) or Sunday before day shift starts: use PREVIOUS Sunday
-        // Day shift on Sunday or later: use THIS Sunday (new week)
-        let sundayOffset=day===0?0:day; // default: most recent Sunday
+        // Determine which Sunday to use for LP data (Galaxy BI weeks start Sunday)
+        let sundayOffset=day; // days since last Sunday (Sun=0, Mon=1, Tue=2...)
         if(cfg.shiftType==='Nights'&&day===6){
-            // Saturday night shift — still use last week's plan (previous Sunday)
-            sundayOffset=6; // goes back to last Sunday
-        }else if(cfg.shiftType==='Nights'&&day===0){
-            // Sunday night shift hasn't started the new week yet on nights
-            // Night shift on Sunday evening = new week, but if we're in AM (still on Sat night shift), use old
-            if(now.getHours()<12){
-                sundayOffset=7; // still on Saturday night shift, use previous Sunday
-            }
+            // Saturday night shift — new week hasn't started yet for nights
+            sundayOffset=6; // go back to last Sunday
         }
         const sun=new Date(now);sun.setDate(now.getDate()-sundayOffset);sun.setHours(0,0,0,0);
         const sundayStr=sun.getFullYear()+'-'+String(sun.getMonth()+1).padStart(2,'0')+'-'+String(sun.getDate()).padStart(2,'0');
@@ -255,8 +247,20 @@ function attemptLPFetch(site,resolve,isRetry){
                     const checkDone=()=>{if(done>=9){saveLPValues(results);resolve(results);}};
                     fetchLPPageAuto(planId,'IB',sundayStr,'key','IB Total CPLH',(v)=>{results.ibCplh=v;done++;checkDone();});
                     fetchLPPageAuto(planId,'DA',sundayStr,'key','DA Bldg to Bldg Total - CPLH',(v)=>{results.obCplh=v;done++;checkDone();});
-                    fetchLPPageAuto(planId,'UnderatedRatesAndHours',sundayStr,'lineItem','Total Building CPLH Inc Support',(v)=>{results.siteCplh=v;done++;checkDone();});
-                    fetchLPPageAutoRate(planId,'UnderatedRatesAndHours',sundayStr,'Case Transfer In',(v)=>{results.ctiRate=v;done++;checkDone();});
+                    fetchLPPageAuto(planId,'DeratedRates',sundayStr,'lineItem','Total Building CPLH Inc Support',(v,allRows)=>{
+                        results.siteCplh=v;
+                        // Extract CTI rate from DeratedRates (Forecast + Cartons)
+                        if(allRows&&allRows.length>0){
+                            for(const row of allRows){
+                                if((row.lineItem||'').trim()==='Case Transfer In'&&row.date===sundayStr&&row.type==='Forecast'&&row.packType==='Cartons'&&parseFloat(row.value)>0){
+                                    results.ctiRate=parseFloat(row.value)||0;break;
+                                }
+                            }
+                        }
+                        console.log('[SB-LP] DeratedRates final: CTI='+results.ctiRate+' SiteCPLH='+results.siteCplh);
+                        done+=2;checkDone();
+                    });
+                    // Pick rate from UnderatedRatesAndHours (Cartons value is the diluted rate)
                     fetchLPPageAutoRate(planId,'UnderatedRatesAndHours',sundayStr,'Transfer Out Pick - Small',(v)=>{results.topRate=v;done++;checkDone();});
                     fetchLPPageAutoRate(planId,'Density',sundayStr,'Case Transfer In',(v)=>{results.ibDensityLP=v;done++;checkDone();});
                     fetchLPPageAutoRate(planId,'Density',sundayStr,'DA Bldg to Bldg Transfer TOTAL',(v)=>{results.obDensityLP=v;done++;checkDone();});
@@ -304,20 +308,13 @@ function fetchLPPageAuto(planId,pageName,sundayStr,fieldName,targetKey,callback)
                         try{
                             const rows=JSON.parse(s3Resp.responseText);
                             console.log('[SB-LP]',pageName,'data:',rows.length,'rows');
-                            if(pageName==='UnderatedRatesAndHours'){
-                                console.log('[SB-LP] Sample row keys:',rows.length>0?Object.keys(rows[0]):[]);
-                                console.log('[SB-LP] Sample row 0:',JSON.stringify(rows[0]).substring(0,200));
-                                const found=rows.filter(r=>JSON.stringify(r).toLowerCase().includes('building cplh'));
-                                console.log('[SB-LP] ALL "Building CPLH" rows (',found.length,'):');
-                                found.forEach((r,i)=>console.log('[SB-LP]  ',i,r.type,r.lineItem,r.date,r.packType,'=',r.value));
-                            }
                             let val=0;
                             for(const row of rows){
                                 const name=(row[fieldName]||'').trim();
                                 const matches=name===targetKey||name.includes(targetKey);
                                 if(matches&&row.date===sundayStr){
-                                    // For UnderatedRatesAndHours, look for Forecast + Cartons
-                                    if(pageName==='UnderatedRatesAndHours'){
+                                    // For DeratedRates/UnderatedRatesAndHours, look for Forecast + Cartons
+                                    if(pageName==='DeratedRates'||pageName==='UnderatedRatesAndHours'){
                                         if(row.type!=='Forecast'||row.packType!=='Cartons')continue;
                                     }else{
                                         if(row.packType&&row.packType!=='Units')continue;
@@ -326,9 +323,9 @@ function fetchLPPageAuto(planId,pageName,sundayStr,fieldName,targetKey,callback)
                                 }
                             }
                             // Fallback
-                            if(val===0){for(const row of rows){const name=(row[fieldName]||'').trim();const matches=name===targetKey||name.includes(targetKey);if(matches&&row.value&&parseFloat(row.value)>0){if(pageName==='UnderatedRatesAndHours'){if(row.type!=='Forecast'||row.packType!=='Cartons')continue;}val=parseFloat(row.value);break;}}}
+                            if(val===0){for(const row of rows){const name=(row[fieldName]||'').trim();const matches=name===targetKey||name.includes(targetKey);if(matches&&row.value&&parseFloat(row.value)>0){if(pageName==='DeratedRates'||pageName==='UnderatedRatesAndHours'){if(row.type!=='Forecast'||row.packType!=='Cartons')continue;}val=parseFloat(row.value);break;}}}
                             console.log(`[SB-LP] ${pageName} → ${targetKey} = ${val}`);
-                            callback(val);
+                            callback(val,rows);
                         }catch(e){console.warn('[SB-LP] S3 parse error:',pageName,e);callback(0);}
                     },onerror:function(e){console.warn('[SB-LP] S3 fetch error:',pageName,e);callback(0);},ontimeout:function(){callback(0);}
                 });
@@ -352,18 +349,31 @@ function fetchLPPageAutoRate(planId,pageName,sundayStr,targetLineItem,callback){
                         try{
                             const rows=JSON.parse(s3Resp.responseText);
                             let val=0;
+                            // Debug: log all matching lineItem rows for the target date
+                            if(pageName==='DeratedRates'){
+                                const dbg=rows.filter(r=>(r.lineItem||'').trim()===targetLineItem&&r.date===sundayStr);
+                                console.log(`[SB-LP] DeratedRates debug: ${targetLineItem} date=${sundayStr} matches:`,dbg.map(r=>r.type+'/'+r.packType+'='+r.value));
+                            }
                             for(const row of rows){
                                 if((row.lineItem||'').trim()===targetLineItem&&row.date===sundayStr&&row.type==='Forecast'&&row.packType==='Cartons'){
                                     val=parseFloat(row.value)||0;break;
                                 }
                             }
+                            // Fallback for DeratedRates: try Forecast + Units if Cartons not found (for CPLH values only, NOT rates)
+                            if(val===0&&pageName==='DeratedRates'&&(targetLineItem.includes('CPLH')||targetLineItem.includes('Total'))){
+                                for(const row of rows){
+                                    if((row.lineItem||'').trim()===targetLineItem&&row.date===sundayStr&&row.type==='Forecast'&&row.packType==='Units'){
+                                        val=parseFloat(row.value)||0;break;
+                                    }
+                                }
+                            }
                             // Debug: if no match, try includes
                             if(val===0&&targetLineItem.includes('Transfer Out')){
                                 const matches=rows.filter(r=>r.lineItem&&r.lineItem.includes('Transfer Out Pick')&&r.type==='Forecast'&&r.date===sundayStr&&r.packType==='Cartons'&&parseFloat(r.value)>0);
-                                console.log('[SB-LP] Transfer Out Pick matches:',matches.map(r=>r.lineItem+'='+r.value));
+                                console.log('[SB-LP] Transfer Out Pick matches:',matches.map(r=>r.lineItem+'/'+r.packType+'='+r.value));
                                 if(matches.length>0){val=parseFloat(matches[0].value)||0;}
                             }
-                            console.log(`[SB-LP] Rate: ${targetLineItem} = ${val}`);
+                            console.log(`[SB-LP] Rate[${pageName}]: ${targetLineItem} = ${val}`);
                             callback(val);
                         }catch(e){callback(0);}
                     },onerror:function(){callback(0);},ontimeout:function(){callback(0);}
@@ -1001,7 +1011,7 @@ function updatePeriodDots(){
 
 // === HTML ===
 function buildHTML(){return `
-<nav class="topnav"><div class="topnav-left"><span class="logo"><svg width="28" height="28" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="46" fill="#333A44" stroke="#4a9eff" stroke-width="4"/><path d="M25 65 L25 40 L50 28 L75 40 L75 65 Z" fill="none" stroke="#E8EAED" stroke-width="3" stroke-linejoin="round"/><line x1="25" y1="65" x2="75" y2="65" stroke="#E8EAED" stroke-width="3"/><rect x="30" y="45" width="16" height="20" fill="none" stroke="#E8EAED" stroke-width="2"/><line x1="30" y1="50" x2="46" y2="50" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="55" x2="46" y2="55" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="60" x2="46" y2="60" stroke="#E8EAED" stroke-width="1.5"/><rect x="54" y="48" width="14" height="17" fill="none" stroke="#E8EAED" stroke-width="2"/><rect x="57" y="52" width="4" height="5" fill="#E8EAED"/><rect x="62" y="55" width="3" height="4" fill="#E8EAED"/></svg></span><h1 class="site-title" style="color:#fff;">FC Sync Board<span style="display:block;font-size:10px;font-weight:400;color:#aaa;margin-top:-2px;">by snodgtyl</span></h1>
+<nav class="topnav"><div class="topnav-left"><span class="logo"><svg width="28" height="28" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="46" fill="#333A44" stroke="#4a9eff" stroke-width="4"/><path d="M25 65 L25 40 L50 28 L75 40 L75 65 Z" fill="none" stroke="#E8EAED" stroke-width="3" stroke-linejoin="round"/><line x1="25" y1="65" x2="75" y2="65" stroke="#E8EAED" stroke-width="3"/><rect x="30" y="45" width="16" height="20" fill="none" stroke="#E8EAED" stroke-width="2"/><line x1="30" y1="50" x2="46" y2="50" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="55" x2="46" y2="55" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="60" x2="46" y2="60" stroke="#E8EAED" stroke-width="1.5"/><rect x="54" y="48" width="14" height="17" fill="none" stroke="#E8EAED" stroke-width="2"/><rect x="57" y="52" width="4" height="5" fill="#E8EAED"/><rect x="62" y="55" width="3" height="4" fill="#E8EAED"/></svg></span><h1 class="site-title">FC Sync Board<span style="display:block;font-size:10px;font-weight:400;color:#aaa;margin-top:-2px;">by snodgtyl</span></h1>
 <div class="nav-tabs"><button class="nav-tab active" data-tab="sync">Sync IB-OB</button><button class="nav-tab" data-tab="hourly">Hourly</button><button class="nav-tab" data-tab="settings">Settings</button></div></div>
 <div class="topnav-right"><select id="site-select" class="select-input"></select><select id="shift-select" class="select-input"><option value="Days">Days</option><option value="Nights">Nights</option></select>
 <div class="period-indicator"><span class="period-dot" id="dot-p1">P1</span><span class="period-dot" id="dot-p2">P2</span><span class="period-dot" id="dot-p3">P3</span></div>
@@ -1298,7 +1308,7 @@ function buildCSS2(){return `
 #sb-root.dark-mode .metrics-section,#sb-root.dark-mode .goal-card,#sb-root.dark-mode .site-cplh-panel,#sb-root.dark-mode .targets-panel,#sb-root.dark-mode .chart-card,#sb-root.dark-mode .hourly-section,#sb-root.dark-mode #bb-24hr-panel{background:#0f3460!important;border-color:#444!important;color:#e0e0e0!important;}
 #sb-root.dark-mode .metrics-table th,#sb-root.dark-mode .metrics-table td,#sb-root.dark-mode .target-table td,#sb-root.dark-mode .actions-table th,#sb-root.dark-mode .actions-table td{color:#e0e0e0!important;border-color:#444!important;}
 #sb-root.dark-mode .metrics-table td{border-bottom-color:#333!important;}
-#sb-root.dark-mode .section-header h2,#sb-root.dark-mode .bold,#sb-root.dark-mode h3,#sb-root.dark-mode h4,#sb-root.dark-mode .panel-title{color:#e0e0e0!important;}
+#sb-root.dark-mode .section-header h2,#sb-root.dark-mode .bold,#sb-root.dark-mode h3,#sb-root.dark-mode h4,#sb-root.dark-mode .panel-title,#sb-root.dark-mode .site-title{color:#e0e0e0!important;}
 #sb-root.dark-mode .target-input,#sb-root.dark-mode .actions-table input,#sb-root.dark-mode .actions-table textarea,#sb-root.dark-mode .actions-table select,#sb-root.dark-mode .select-input{background:#1a1a2e!important;color:#e0e0e0!important;border-color:#555!important;}
 #sb-root.dark-mode .goal-title{color:#ccc!important;}
 #sb-root.dark-mode .goal-stats,#sb-root.dark-mode .goal-stats strong{color:#e0e0e0!important;}
@@ -1737,9 +1747,15 @@ async function doFetch(){
     const btn=document.getElementById('btn-fetch');btn.disabled=true;btn.textContent='\u23F3 Fetching...';
     try{
         const raw=await fetchAllData(config);
-        // Detect session expiry: if all data comes back as zeros, FCLM auth likely expired
+        // Detect session expiry: if all data comes back as zeros AND we're within the shift window, auth likely expired
         const stowU=raw.full?.stow?.totalUnits||0;const pickU=raw.full?.pick?.totalUnits||0;const stowH=raw.full?.stow?.directHours||0;
-        if(stowU===0&&pickU===0&&stowH===0&&raw.full?.ppr?.ibActualHrs===0){
+        const ibPPRHrs=raw.full?.ppr?.ibActualHrs||0;
+        // Only show session expired if we're currently within the shift time window (data should exist)
+        const now=new Date(),cm=now.getHours()*60+now.getMinutes();
+        const sched=config.shiftType==='Nights'?config.nights:config.days;
+        const p1Start=sched.p1.sh*60+sched.p1.sm;
+        const shiftActive=config.shiftType==='Nights'?(cm>=p1Start||cm<sched.full.eh*60+sched.full.em):(cm>=p1Start&&cm<=sched.full.eh*60+sched.full.em);
+        if(stowU===0&&pickU===0&&stowH===0&&ibPPRHrs===0&&shiftActive){
             setStatus('\u26A0\uFE0F Session expired');
             alert('\u26A0\uFE0F FCLM session expired — no data returned.\n\nPlease refresh this page (F5) to re-authenticate, then try Get Data again.');
             btn.disabled=false;btn.textContent='\u25B6 Get Data';return;
