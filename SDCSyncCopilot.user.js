@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      11.0.0
+// @version      12.0.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -140,18 +140,26 @@ async function fetchAllData(config){
     if(totSched.sh<0)totSched.sh+=24;
     if(totSched.em>=60){totSched.eh++;totSched.em-=60;}
     if(totSched.eh>=24)totSched.eh-=24;
+    // Build Site CPLH time window: 15 min before SOS to 15 min before next shift SOS
+    // Days: P1 start - 15 min to next night P1 start - 15 min (approx 06:00-18:00)
+    // Nights: P1 start - 15 min to next day P1 start - 15 min (approx 18:00-06:00)
+    const p1Start=sched.p1.sh*60+sched.p1.sm;
+    const cplhSh=Math.floor((p1Start-15)/60);const cplhSm=(p1Start-15)%60;
+    const cplhEh=(cplhSh+12)%24;const cplhEm=cplhSm;
+    const cplhSched={sh:cplhSh<0?cplhSh+24:cplhSh,sm:cplhSm<0?cplhSm+60:cplhSm,eh:cplhEh,em:cplhEm};
     // Fetch all periods in parallel for speed
-    const [full,p1,p2,p3,fastStart,data24,totPpr]=await Promise.all([
+    const [full,p1,p2,p3,fastStart,data24,totPpr,cplhData]=await Promise.all([
         fetchPeriod(site,startDate,sched.full),
         fetchPeriod(site,startDate,sched.p1),
         fetchPeriod(site,startDate,sched.p2),
         fetchPeriod(site,startDate,sched.p3),
         fetchFastStart(site,config.shiftType),
         fetch24hrData(site),
-        fetchTOTPpr(site,startDate,totSched,config.shiftType)
+        fetchTOTPpr(site,startDate,totSched,config.shiftType),
+        fetchPeriod(site,startDate,cplhSched)
     ]);
     setStatus('\u2713 Updated '+new Date().toLocaleTimeString());
-    return{full,p1,p2,p3,fastStart,data24,totPpr};
+    return{full,p1,p2,p3,fastStart,data24,totPpr,cplhData};
 }
 
 async function fetchTOTPpr(site,startDate,sched,shiftType){
@@ -187,15 +195,19 @@ async function fetch24hrData(site){
         const today=new Date();
         const startDate=new Date(today);startDate.setHours(0,0,0,0);
         const endDate=new Date(today);
-        // Stow (Case Transfer In) and OB Dock (Transfer Out) function rollups for full day
+        // Stow (Case Transfer In), Pallet Stow, and OB Dock function rollups for full day
         const stowUrl=buildFnUrl(site,PROCESS_IDS.stow,startDate,0,0,endDate,23,59);
+        const palletStowUrl=buildFnUrl(site,PROCESS_IDS.palletStow,startDate,0,0,endDate,23,59);
         const obDockUrl=buildFnUrl(site,PROCESS_IDS.obDock,startDate,0,0,endDate,23,59);
-        const [stowHtml,obDockHtml]=await Promise.all([fetchHTML(stowUrl),fetchHTML(obDockUrl)]);
+        const [stowHtml,palletStowHtml,obDockHtml]=await Promise.all([fetchHTML(stowUrl),fetchHTML(palletStowUrl),fetchHTML(obDockUrl)]);
         const stow=parseFnRollup(stowHtml);
+        const pStow=parseFnRollup(palletStowHtml);
         const obDock=parseFnRollup(obDockHtml);
+        const palletCases=pStow.palletCases||0;
+        const ibVol24=(stow.totalUnits||0)+palletCases;
         const ibDensity24=(stow.caseUnits||0)>0?(stow.eachUnits||0)/(stow.caseUnits||1):0;
         const obDensity24=(obDock.caseUnits||0)>0?(obDock.eachUnits||0)/(obDock.caseUnits||1):0;
-        return{ibVol24:stow.totalUnits||0,obVol24:obDock.fluidLoadJobs||0,ibDensity24,obDensity24};
+        return{ibVol24,obVol24:obDock.fluidLoadJobs||0,ibDensity24,obDensity24};
     }catch(e){console.warn('[SB] 24hr data fetch error:',e.message);return{ibVol24:0,obVol24:0,ibDensity24:0,obDensity24:0};}
 }
 
@@ -1343,6 +1355,7 @@ function buildCSS2(){return `
 #sb-root.dark-mode .goal-progress-bar.amber{background:#ff9800!important;}
 #sb-root.dark-mode .goal-progress-bar.red{background:#f44336!important;}
 #sb-root.dark-mode span[style*="background"]{color:#000!important;}
+#sb-root.dark-mode span[style*="background"] span{color:#000!important;}
 #sb-root.dark-mode .btn{color:#000!important;}
 #sb-root.dark-mode .btn-primary{color:#fff!important;}
 #sb-root.dark-mode .btn-danger{color:#fff!important;}
@@ -1765,14 +1778,14 @@ async function doFetch(){
         renderTargets(currentMetrics);renderCharts(currentMetrics);
         renderFastStart(raw.fastStart,config);
         blankFuturePeriods(config);
-        // Render Site CPLH: (Stow EACH units + OB Dock/Transfer Out EACH units) / THROUGHPUT hours
-        // For sort sites use eachUnits, for non-sort (case) sites use caseUnits
-        const pprFull=raw.full?.ppr||{};
-        const hasSortData=(currentMetrics.sort.full?.totalUnits||0)>0;
-        const stowVol=hasSortData?(raw.full?.stow?.eachUnits||0):(raw.full?.stow?.caseUnits||0);
-        const obDockVol=hasSortData?(raw.full?.obDock?.eachUnits||0):(raw.full?.obDock?.caseUnits||0);
-        const tHrs=pprFull.throughputHrs||0;
-        const siteThroughputVol=stowVol+obDockVol;
+        // Render Site CPLH: (Fluid Load Case + Fluid Load Tote + Case Transfer In + Pallet Transfer In cases) / THROUGHPUT hours
+        // Uses separate 12hr window (15 min before SOS to 15 min before next shift SOS)
+        const cplhPpr=raw.cplhData?.ppr||{};
+        const stowJobs=raw.cplhData?.stow?.totalUnits||0;
+        const palletCases24=raw.cplhData?.palletStow?.palletCases||0;
+        const obDockFluid=raw.cplhData?.obDock?.fluidLoadJobs||0;
+        const tHrs=cplhPpr.throughputHrs||0;
+        const siteThroughputVol=obDockFluid+stowJobs+palletCases24;
         const siteCplh=tHrs>0?siteThroughputVol/tHrs:0;
         setEl('site-cplh-value',siteCplh>0?fmt(siteCplh,2):'\u2014');
         // Color Site CPLH based on target
