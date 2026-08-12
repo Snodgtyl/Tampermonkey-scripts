@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Inbound Operations Copilot
 // @namespace    http://tampermonkey.net/
-// @version      8.7.0
+// @version      9.0.0
 // @description  Adds a formatted summary dashboard to Oculus transship pages with AFT pending cases, items, and case density — VRIDs link to YMS — AI-powered anomaly detection and smart trailer prioritization
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
@@ -29,6 +29,8 @@
 // @connect      maple-syrup.corp.amazon.com
 // @connect      stowmap-na.amazon.com
 // @connect      adapt-iad.amazon.com
+// @connect      script.google.com
+// @connect      script.googleusercontent.com
 // ==/UserScript==
 
 (function () {
@@ -1607,6 +1609,17 @@
                                     }
                                 }
                             });
+                            // Fallback: if row scan didn't find it, try tfoot Case UNIT (index 5)
+                            if (totalCases === 0) {
+                                const tfoot = doc.querySelector('tfoot tr.total.empl-all') || doc.querySelector('tr.total.empl-all') || doc.querySelector('tfoot tr.total') || doc.querySelector('tfoot tr');
+                                if (tfoot) {
+                                    const cells = tfoot.querySelectorAll('td.numeric');
+                                    if (cells.length >= 6) {
+                                        totalCases = parseInt(cells[5].textContent.replace(/,/g, ''), 10) || 0;
+                                        if (totalCases > 0) console.log(`[OculusDash] Pallet Transfer In (tfoot fallback): ${totalCases}`);
+                                    }
+                                }
+                            }
                         } catch (e) { console.log('[OculusDash] fetchTotalCases error:', e); }
                     }
                     console.log('[OculusDash] Pallet Transfer In cases:', totalCases);
@@ -2211,6 +2224,157 @@
         try { return JSON.parse(GM_getValue(key, '[]')); } catch(e) { return []; }
     }
 
+    // ─── Shift-Level History for Charts ─────────────────────────────────────
+    const SHIFT_HISTORY_KEY = 'shiftHistory_';
+    const MAX_SHIFT_HISTORY = 60; // ~30 days of day+night shifts
+    // *** REPLACE THIS URL with your deployed Google Apps Script Web App URL ***
+    const METRICS_API_URL = 'YOUR_GOOGLE_APPS_SCRIPT_URL_HERE';
+
+    function postMetricsToCloud(dashboard, entry) {
+        if (!METRICS_API_URL || METRICS_API_URL.includes('YOUR_GOOGLE')) return; // Not configured yet
+        try {
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: METRICS_API_URL,
+                headers: { 'Content-Type': 'application/json' },
+                data: JSON.stringify({ dashboard, ...entry }),
+                onload: (resp) => { console.log('[OculusDash] Metrics saved to cloud:', resp.status); },
+                onerror: (err) => { console.warn('[OculusDash] Cloud metrics error:', err); },
+                timeout: 10000
+            });
+        } catch(e) { /* silent fail — cloud storage is nice-to-have */ }
+    }
+
+    function fetchMetricsFromCloud(dashboard, fc, days = 7) {
+        if (!METRICS_API_URL || METRICS_API_URL.includes('YOUR_GOOGLE')) return Promise.resolve([]);
+        return new Promise((resolve) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: `${METRICS_API_URL}?dashboard=${dashboard}&fc=${fc}&days=${days}`,
+                onload: (resp) => {
+                    try {
+                        const json = JSON.parse(resp.responseText);
+                        resolve(json.data || []);
+                    } catch(e) { resolve([]); }
+                },
+                onerror: () => resolve([]),
+                timeout: 15000
+            });
+        });
+    }
+
+    function saveShiftHistory(fc, metrics) {
+        const key = SHIFT_HISTORY_KEY + fc;
+        let history = [];
+        try { history = JSON.parse(GM_getValue(key, '[]')); } catch(e) { history = []; }
+
+        const now = new Date();
+        const shift = getShiftConfig(fc);
+        const timeVal = now.getHours() * 60 + now.getMinutes();
+        const nightStart = shift.nightStartH * 60 + shift.nightStartM;
+        const shiftLabel = timeVal >= nightStart || timeVal < (shift.nightEndH * 60 + shift.nightEndM) ? 'Night' : 'Day';
+        const dateStr = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
+        // Use previous day's date for night shift after midnight
+        const shiftDate = (shiftLabel === 'Night' && now.getHours() < 12) ?
+            (() => { const d = new Date(now); d.setDate(d.getDate() - 1); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; })() :
+            dateStr;
+        const shiftKey = `${shiftDate}_${shiftLabel}`;
+
+        // Update existing entry for this shift or add new
+        const existingIdx = history.findIndex(h => h.shiftKey === shiftKey);
+        const entry = {
+            shiftKey,
+            date: shiftDate,
+            shift: shiftLabel,
+            ts: Date.now(),
+            cplh: metrics.cplh || 0,
+            stowRate: metrics.stowRate || 0,
+            totalStows: metrics.totalStows || 0,
+            stowers: metrics.activeStowers || 0,
+        };
+
+        if (existingIdx >= 0) {
+            // Always update with latest values (end-of-shift will have the most complete data)
+            history[existingIdx] = entry;
+        } else {
+            history.push(entry);
+        }
+
+        if (history.length > MAX_SHIFT_HISTORY) history = history.slice(-MAX_SHIFT_HISTORY);
+        GM_setValue(key, JSON.stringify(history));
+
+        // Push to Google Sheets only near End of Shift (last 30 min)
+        const nowMs = Date.now();
+        const shiftEndMs = (() => {
+            const s = getShiftConfig(fc);
+            const n = new Date();
+            const tv = n.getHours() * 60 + n.getMinutes();
+            const ns = s.nightStartH * 60 + s.nightStartM;
+            if (shiftLabel === 'Night') {
+                const end = new Date(n);
+                if (n.getHours() >= s.nightStartH) { end.setDate(end.getDate() + 1); }
+                end.setHours(s.nightEndH, s.nightEndM, 0, 0);
+                return end.getTime();
+            } else {
+                const end = new Date(n);
+                end.setHours(s.dayEndH, s.dayEndM, 0, 0);
+                return end.getTime();
+            }
+        })();
+        const minsToEOS = (shiftEndMs - nowMs) / 60000;
+        if (minsToEOS >= 0 && minsToEOS <= 30) {
+            // Only post once per shift — check if already posted
+            const postKey = 'cloudPosted_' + shiftKey;
+            if (!GM_getValue(postKey, false)) {
+                postMetricsToCloud('Inbound', { fc, shift: shiftLabel, date: shiftDate, cplh: entry.cplh, stowRate: entry.stowRate, totalStows: entry.totalStows, stowers: entry.stowers });
+                GM_setValue(postKey, true);
+                console.log('[OculusDash] EOS metrics posted to cloud for', shiftKey);
+            }
+        }
+
+        return history;
+    }
+
+    function getShiftHistory(fc) {
+        const key = SHIFT_HISTORY_KEY + fc;
+        try { return JSON.parse(GM_getValue(key, '[]')); } catch(e) { return []; }
+    }
+
+    // ─── Render Shift Comparison (yesterday vs today) ────────────────────────
+    function renderShiftComparison(fc) {
+        const history = getShiftHistory(fc);
+        if (history.length < 2) return ''; // Need at least 2 entries
+
+        const now = new Date();
+        const shift = getShiftConfig(fc);
+        const timeVal = now.getHours() * 60 + now.getMinutes();
+        const nightStart = shift.nightStartH * 60 + shift.nightStartM;
+        const currentShiftType = timeVal >= nightStart || timeVal < (shift.nightEndH * 60 + shift.nightEndM) ? 'Night' : 'Day';
+
+        // Find yesterday's same shift
+        const today = history[history.length - 1]; // Latest
+        const yesterday = history.slice(0, -1).reverse().find(h => h.shift === currentShiftType);
+
+        if (!yesterday || !today) return '';
+
+        const cplhDiff = today.cplh && yesterday.cplh ? (today.cplh - yesterday.cplh).toFixed(2) : null;
+        const rateDiff = today.stowRate && yesterday.stowRate ? (today.stowRate - yesterday.stowRate).toFixed(2) : null;
+
+        let html = '<span style="font-size:12px;color:#a6adc8;margin-left:12px;">';
+        if (cplhDiff !== null) {
+            const color = parseFloat(cplhDiff) >= 0 ? '#a6e3a1' : '#f38ba8';
+            const arrow = parseFloat(cplhDiff) >= 0 ? '▲' : '▼';
+            html += `<span style="color:${color};" title="vs last ${currentShiftType} shift CPLH: ${yesterday.cplh.toFixed(2)}">${arrow}${Math.abs(cplhDiff)} CPLH</span>`;
+        }
+        if (rateDiff !== null) {
+            const color = parseFloat(rateDiff) >= 0 ? '#a6e3a1' : '#f38ba8';
+            const arrow = parseFloat(rateDiff) >= 0 ? '▲' : '▼';
+            html += `<span style="color:${color};margin-left:8px;" title="vs last ${currentShiftType} shift rate: ${yesterday.stowRate} JPH">${arrow}${Math.abs(rateDiff)} JPH</span>`;
+        }
+        html += '</span>';
+        return html;
+    }
+
     // ─── Statistical helpers ────────────────────────────────────────────────
     function mean(arr) { return arr.length === 0 ? 0 : arr.reduce((a, b) => a + b, 0) / arr.length; }
     function stdDev(arr) {
@@ -2613,7 +2777,7 @@
                 <div class="title">Inbound Operations Copilot — ${fc} &nbsp; <span id="oc-backlog" style="color:#ffffff;font-size:18px;font-weight:bold;">⏳ Backlog</span></div>
                 <div class="meta">${meta.fc} &nbsp;|&nbsp; ${meta.tz} &nbsp;|&nbsp; Updated: ${meta.refresh}</div>
                 <div id="oc-stow-line" style="margin-top:6px;">
-                    <div style="font-size:18px;font-weight:bold;color:#ffffff;padding:6px 12px;background:#1e2233;border:1px solid #3a4060;border-radius:6px;display:inline-block;"><span style="color:#888;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;margin-right:8px;">Performance</span><span id="oc-active-stowers" style="color:#ffffff;">Stowers: ⏳</span> <span style="color:#555;"> • </span> <span id="oc-ib-cplh" style="color:#ffffff;"></span><span id="oc-total-stows" style="color:#ffffff;">Total Stows: ⏳</span> <span style="color:#555;"> • </span> <span id="oc-stow-rate" style="color:#ffffff;">Stow Rate: ⏳ JPH</span></div>
+                    <div style="font-size:18px;font-weight:bold;color:#ffffff;padding:6px 12px;background:#1e2233;border:1px solid #3a4060;border-radius:6px;display:inline-block;"><span style="color:#888;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;margin-right:8px;">Performance</span><span id="oc-active-stowers" style="color:#ffffff;">Stowers: ⏳</span> <span style="color:#555;"> • </span> <span id="oc-ib-cplh" style="color:#ffffff;"></span><span id="oc-total-stows" style="color:#ffffff;">Total Stows: ⏳</span> <span style="color:#555;"> • </span> <span id="oc-stow-rate" style="color:#ffffff;">Stow Rate: ⏳ JPH</span><span id="oc-shift-compare"></span></div>
                     <div style="font-size:15px;margin-top:6px;padding:6px 12px;background:#1e2233;border:1px solid #3a4060;border-radius:6px;display:inline-block;"><span id="oc-lc-display" style="color:#C3CAD7;">Learning Curve Mix: ⏳</span></div>
                 </div>
             </div>
@@ -2987,13 +3151,34 @@
 
             const pendingCases = aft && aft.totalCases ? aft.totalCases : parseInt(sum(arrived, 'totalCartons').replace(/,/g,''),10) || 0;
 
+            // Read CPLH from the display element
+            const cplhEl = document.getElementById('oc-ib-cplh');
+            const cplhMatch = cplhEl ? cplhEl.textContent.match(/CPLH:\s*([\d.]+)/) : null;
+            const currentCPLH = cplhMatch ? parseFloat(cplhMatch[1]) : 0;
+
+            // Read total stows
+            const totalStowsEl = document.getElementById('oc-total-stows');
+            const totalStowsMatch = totalStowsEl ? totalStowsEl.textContent.match(/([\d,]+)/) : null;
+            const currentTotalStows = totalStowsMatch ? parseInt(totalStowsMatch[1].replace(/,/g, ''), 10) : 0;
+
             const currentMetrics = {
                 stowRate: currentStowRate,
                 activeStowers: currentStowers,
                 pendingCases: pendingCases,
                 kipsCount: kipsCount,
                 trailerCount: arrived.length,
+                cplh: currentCPLH,
+                totalStows: currentTotalStows,
             };
+
+            // Save shift-level history for charts
+            saveShiftHistory(fc, currentMetrics);
+
+            // Render shift-over-shift comparison
+            const compareEl = document.getElementById('oc-shift-compare');
+            if (compareEl) {
+                compareEl.innerHTML = renderShiftComparison(fc);
+            }
 
             // Record snapshot and detect anomalies
             const history = recordMetricSnapshot(fc, currentMetrics);
