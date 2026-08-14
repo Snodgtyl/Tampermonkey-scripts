@@ -1,16 +1,20 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      13.0.0
+// @version      13.2.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_openInTab
 // @connect      fc-benchmarking.amazon.com
 // @connect      adapt-iad.amazon.com
 // @connect      galaxybi.aka.corp.amazon.com
 // @connect      galaxybiprintfile-prod.s3.us-west-2.amazonaws.com
 // @connect      midway-auth.amazon.com
+// @connect      guided-coaching.corp.amazon.com
+// @connect      fcmenu-iad-regionalized.corp.amazon.com
+// @connect      alps-iad.iad.proxy.amazon.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -35,7 +39,10 @@ const SITE_SCHEDULES = {
     QXX6: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:18,sm:30,eh:6,em:15},p1:{sh:19,sm:0,eh:22,em:30},p2:{sh:22,sm:31,eh:2,em:0},p3:{sh:2,sm:0,eh:5,em:30}} },
     SAV7: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:18,sm:30,eh:6,em:15},p1:{sh:19,sm:0,eh:22,em:30},p2:{sh:22,sm:31,eh:2,em:0},p3:{sh:2,sm:0,eh:5,em:30}} },
 };
-const PROCESS_IDS = { stow:'1003035', palletStow:'1003041', pick:'1003065', sort:'1003009', obDock:'1003021' };
+const PROCESS_IDS = { stow:'1003035', palletStow:'1003041', pick:'1003065', sort:'1003009', obDock:'1003021', icqa:'1003030' };
+// Line items (Function names) that count as "Direct Count" for ICQA DC% —
+// SBC - Library Deep + SBC - Pallet Single + Other Library Deep + Other Pallet Single
+const DC_PERCENT_FUNCTIONS=['SBC - Library Deep','SBC - Pallet Single','Other Library Deep','Other Pallet Single'];
 const DEFAULT_CONFIG = {
     site:'KRB3', shiftType:'Days', schedType:'3P',
     days:{ full:{sh:5,sm:45,eh:17,em:30}, p1:{sh:6,sm:15,eh:9,em:45}, p2:{sh:10,sm:15,eh:13,em:15}, p3:{sh:13,sm:15,eh:16,em:45} },
@@ -116,7 +123,28 @@ function parsePPR(html){
     if(totRow){const cells=totRow.querySelectorAll('td');cells.forEach(c=>{const cls=c.className;const div=c.querySelector('div.original');const txt=(div?div.textContent:c.textContent).trim().replace(/,/g,'');const v=parseFloat(txt);if(cls.includes('actualTimeSeconds')&&!isNaN(v))totHrs=v;});}
     // Fallback: search rows for "Time Off Task" text if ID selector didn't match
     if(totHrs===0){for(const row of rows){const cells=row.querySelectorAll('td,th');for(let ci=0;ci<cells.length;ci++){const ct=cells[ci].textContent.trim();if(ct==='Time Off Task'){const hrsCell=row.querySelector('td.actualTimeSeconds')||row.querySelector('td.numeric.actualTimeSeconds');if(hrsCell){const div=hrsCell.querySelector('div.original');const txt=(div?div.textContent:hrsCell.textContent).trim().replace(/,/g,'');totHrs=parseFloat(txt)||0;}break;}}if(totHrs>0)break;}}
-    return{ibPlannedHrs:ibPlan,ibActualHrs:ibAct,obPlannedHrs:obPlan,obActualHrs:obAct,daTransferHrs,daTransferPlan,caseStowReserveHrs,throughputVol,throughputHrs,totHrs};
+    // IC/QA/CS row (ICQA RO Rate) — same row shown on the Standard PPR report
+    const icqa=parseICQARow(doc);
+    return{ibPlannedHrs:ibPlan,ibActualHrs:ibAct,obPlannedHrs:obPlan,obActualHrs:obAct,daTransferHrs,daTransferPlan,caseStowReserveHrs,throughputVol,throughputHrs,totHrs,icqaVol:icqa.vol,icqaHrs:icqa.hrs,icqaRate:icqa.rate};
+}
+// Parses the "IC/QA/CS" line item row (id="ppr.detail.support.support.ICQACS") off a
+// PPR (processPathRollup) report page — its Rate column is the ICQA "RO Rate".
+function parseICQARow(doc){
+    const row=doc.getElementById('ppr.detail.support.support.ICQACS');
+    if(!row)return{vol:0,hrs:0,rate:0};
+    let vol=0,hrs=0,rate=0;
+    row.querySelectorAll('td').forEach(c=>{
+        const cls=c.className;
+        const div=c.querySelector('div.original');
+        const txt=(div?div.textContent:c.textContent).trim().replace(/,/g,'');
+        const v=parseFloat(txt);
+        if(isNaN(v))return;
+        if(cls.includes('actualVolume'))vol=v;
+        else if(cls.includes('actualTimeSeconds'))hrs=v;
+        else if(cls.includes('actualProductivity'))rate=v;
+    });
+    if(rate===0&&hrs>0)rate=vol/hrs;
+    return{vol,hrs,rate};
 }
 
 async function fetchPeriod(site,startDate,sched){
@@ -171,6 +199,283 @@ async function fetchTOTPpr(site,startDate,sched,shiftType){
         const html=await fetchHTML(url);
         return parsePPR(html);
     }catch(e){console.warn('[SB] TOT PPR fetch error:',e.message);return{totHrs:0};}
+}
+
+// === ICQA: % to RO (RO Rate vs target) ===
+// RO Rate is read straight off the IC/QA/CS row of the standard PPR
+// (processPathRollup) report (see parseICQARow/parsePPR above) — same report already
+// used for IB/OB actuals. Shift reuses the "full" period PPR fetch the board already
+// makes (same start/end window as the rest of the board, no extra request needed).
+// Week needs one extra fetch, with the report's own Week span.
+function buildPPRUrlWeek(site,weekStartDate){
+    return'/reports/processPathRollup?reportFormat=HTML&warehouseId='+site+'&spanType=Week&startDateWeek='+encodeURIComponent(fmtDate(weekStartDate))+'&_adjustPlanHours=on&_hideEmptyLineItems=on&employmentType=AllEmployees';
+}
+// Function Rollup report scoped to the report's own Week span (used for ICQA DC% week view)
+function buildFnUrlWeek(site,pid,weekStartDate){
+    return'/reports/functionRollup?reportFormat=HTML&warehouseId='+site+'&processId='+pid+'&spanType=Week&startDateWeek='+encodeURIComponent(fmtDate(weekStartDate));
+}
+// Walks a Function Rollup page's body rows and pulls the "Total Paid Hours" value for
+// each named Function line item. The Function name cell uses rowspan across its
+// Small/Medium/Large/HeavyBulky/Total sub-rows, so it only appears once in the DOM —
+// track it as "current" until we hit that function's own "Total" sub-row.
+function parseFunctionHoursByName(doc,names){
+    const rows=doc.querySelectorAll('tbody tr');
+    const result={};
+    names.forEach(n=>result[n]=0);
+    let current=null;
+    rows.forEach(row=>{
+        const cells=Array.from(row.querySelectorAll('th,td'));
+        const cellTexts=cells.map(c=>c.textContent.trim());
+        for(const name of names){if(cellTexts.includes(name)){current=name;break;}}
+        if(current&&cellTexts.includes('Total')){
+            const numCell=row.querySelector('td.numeric');
+            if(numCell){result[current]=parseFloat(numCell.textContent.trim().replace(/,/g,''))||0;current=null;}
+        }
+    });
+    return result;
+}
+// DC% (Direct Count %) = (SBC - Library Deep + SBC - Pallet Single + Other Library Deep
+// + Other Pallet Single hours) / Total Paid Hours, off the ICQA process Function Rollup.
+// The ICQA Function Rollup groups columns by Method (CycleCount/SimpleBinCount/
+// AndonInspection/SidelineApp), a different table layout than the plain stow/pick
+// reports — parseFnRollup's tfoot-based selectors don't reliably match it, so the
+// grand total here is found directly: it's always the very last row in the table,
+// and its Function column literally reads "Total" (unlike each function's own
+// per-size "Total" sub-row, whose Function cell is blank due to rowspan).
+function calcDCPercent(html){
+    const doc=new DOMParser().parseFromString(html,'text/html');
+    const byName=parseFunctionHoursByName(doc,DC_PERCENT_FUNCTIONS);
+    const dcHours=DC_PERCENT_FUNCTIONS.reduce((s,n)=>s+(byName[n]||0),0);
+    let totalHours=0;
+    const allRows=doc.querySelectorAll('table tr');
+    for(let i=allRows.length-1;i>=0;i--){
+        const row=allRows[i];
+        const cells=row.querySelectorAll('th,td');
+        if(cells.length&&cells[0].textContent.trim()==='Total'){
+            const numCell=row.querySelector('td.numeric');
+            if(numCell)totalHours=parseFloat(numCell.textContent.trim().replace(/,/g,''))||0;
+            break;
+        }
+    }
+    const pct=totalHours>0?(dcHours/totalHours)*100:0;
+    return{dcHours,totalHours,pct};
+}
+function getWeekSunday(){
+    const now=new Date();
+    const sun=new Date(now);sun.setDate(now.getDate()-now.getDay());sun.setHours(0,0,0,0);
+    return sun;
+}
+function isoDate(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
+// Walks the ALPS getPlanSelectionData response (array of {Metric:[...]} sections, each
+// Metric row optionally having nested subRows) to find a row by its "header" label,
+// regardless of exact nesting/index — the ALPS grid groups rows differently depending
+// on selection, so matching by label is more robust than hardcoding array positions.
+function findAlpsRow(node,headerName){
+    if(!node)return null;
+    if(Array.isArray(node)){
+        for(const item of node){const f=findAlpsRow(item,headerName);if(f)return f;}
+        return null;
+    }
+    if(typeof node==='object'){
+        if(node.header&&String(node.header).toLowerCase()===headerName.toLowerCase())return node;
+        if(node.Metric){const f=findAlpsRow(node.Metric,headerName);if(f)return f;}
+        if(node.subRows){const f=findAlpsRow(node.subRows,headerName);if(f)return f;}
+    }
+    return null;
+}
+// Fetches this week's ICQA "Loaded Rates" value from ALPS Basecamp: first resolves the
+// current Live plan's planId, then pulls that plan's weekly "support" (ICQA) grid and
+// reads the current week's Sunday column. Runs entirely in the background via
+// GM_xmlhttpRequest (uses your existing ALPS session cookies, same as the GCA fetch).
+function fetchAlpsLoadedRate(site,isRetry){
+    return new Promise(resolve=>{
+        const sunday=getWeekSunday();
+        const sundayStr=isoDate(sunday);
+        const endDate=new Date(sunday);endDate.setDate(endDate.getDate()+6);
+        const planUrl='https://alps-iad.iad.proxy.amazon.com/api/site/'+site+'/latest-completed-plan-by-tag?tagName=Live&siteType=FULFILLMENT_CENTER&polling=true';
+        const retryOrFail=(reason)=>{
+            if(!isRetry){refreshAlpsSessionAndRetry(site,resolve);return;}
+            console.warn('[SB] ALPS:',reason);resolve(null);
+        };
+        GM_xmlhttpRequest({method:'GET',url:planUrl,headers:{'Accept':'application/json'},
+            onload:function(resp){
+                let planId=null;
+                try{planId=JSON.parse(resp.responseText).planId;}catch(e){}
+                if(!planId){retryOrFail('no planId in response (session likely expired)');return;}
+                const dataUrl='https://alps-iad.iad.proxy.amazon.com/api/report/FULFILLMENT_CENTER/'+site+'/getPlanSelectionData?view=weeklyView&selection=support&planId='+encodeURIComponent(planId)+'&withUserOverrides=false&startDate='+sundayStr+'&endDate='+isoDate(endDate);
+                GM_xmlhttpRequest({method:'GET',url:dataUrl,headers:{'Accept':'application/json'},
+                    onload:function(resp2){
+                        try{
+                            const data=JSON.parse(resp2.responseText);
+                            const row=findAlpsRow(data,'Loaded Rates');
+                            const cell=row&&row[sundayStr];
+                            // The value shape varies by request — sometimes a plain number,
+                            // sometimes {source, parsedValue}. Handle both.
+                            let val=null;
+                            if(cell&&cell.value!=null){
+                                if(typeof cell.value==='number')val=cell.value;
+                                else if(typeof cell.value==='object'&&typeof cell.value.parsedValue==='number')val=cell.value.parsedValue;
+                            }
+                            resolve(val);
+                        }catch(e){retryOrFail('plan data parse error: '+e.message);}
+                    },
+                    onerror:function(){retryOrFail('plan data fetch error');},
+                    ontimeout:function(){retryOrFail('plan data fetch timeout');}
+                });
+            },
+            onerror:function(){retryOrFail('planId fetch error');},
+            ontimeout:function(){retryOrFail('planId fetch timeout');}
+        });
+    });
+}
+// Same silent-session-refresh trick as attemptLPFetch's GalaxyBI retry and the GCA
+// retry above: load ALPS Basecamp in a hidden iframe to pick up a fresh session cookie
+// off any still-valid Midway session, then retry once.
+function refreshAlpsSessionAndRetry(site,resolve){
+    console.log('[SB] ALPS auth failed, refreshing session via iframe...');
+    const iframe=document.createElement('iframe');
+    iframe.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;';
+    iframe.src='https://iad.alps-basecamp.lamps.amazon.dev/'+site;
+    document.body.appendChild(iframe);
+    setTimeout(()=>{
+        if(iframe.parentNode)iframe.parentNode.removeChild(iframe);
+        console.log('[SB] Retrying ALPS fetch after auth...');
+        fetchAlpsLoadedRate(site,true).then(resolve);
+    },5000);
+}
+async function fetchIcqaRO(config,raw){
+    try{
+        let target=parseFloat(document.getElementById('icqa-ro-target')?.value)||0;
+        // Auto-fetch this week's target from ALPS; fill the input unless the user is
+        // actively editing it (manual entry still works as a fallback/override).
+        const alpsRate=await fetchAlpsLoadedRate(config.site);
+        if(alpsRate>0){
+            target=alpsRate;
+            const tEl=document.getElementById('icqa-ro-target');
+            if(tEl&&document.activeElement!==tEl){tEl.value=alpsRate;saveTargetsUI();}
+        }
+        setEl('icqa-ro-target-display',target>0?fmt(target):'\u2014');
+        // Shift: from the PPR fetch the board already made for the "full" shift period
+        const shiftRate=raw?.full?.ppr?.icqaRate||0;
+        setEl('icqa-ro-shift-actual',shiftRate>0?fmt(shiftRate,2):'\u2014');
+        if(target>0&&shiftRate>0){const p=(shiftRate/target)*100;const el=setEl('icqa-ro-shift-pct',fmtPct(p));setPctClass(el,p);}
+        else setEl('icqa-ro-shift-pct','\u2014');
+        // Week: one extra PPR fetch using the report's own Week span
+        const weekUrl=buildPPRUrlWeek(config.site,getWeekSunday());
+        const weekHtml=await fetchHTML(weekUrl);
+        const weekIcqa=parseICQARow(new DOMParser().parseFromString(weekHtml,'text/html'));
+        setEl('icqa-ro-week-actual',weekIcqa.rate>0?fmt(weekIcqa.rate,2):'\u2014');
+        if(target>0&&weekIcqa.rate>0){const p=(weekIcqa.rate/target)*100;const el=setEl('icqa-ro-week-pct',fmtPct(p));setPctClass(el,p);}
+        else setEl('icqa-ro-week-pct','\u2014');
+    }catch(e){console.warn('[SB] ICQA RO fetch error:',e.message);}
+}
+
+// === ICQA: DC% (Direct Count %, target 70%) ===
+// DC% = (SBC - Library Deep + SBC - Pallet Single + Other Library Deep + Other Pallet
+// Single hours) / Total Paid Hours, read off the ICQA process path's Function Rollup
+// report (processId 1003030) — a different report than the RO Rate's PPR page.
+// Shift uses the same full-shift Intraday window as the rest of the board; Week uses
+// one extra fetch with the report's own Week span (mirrors fetchIcqaRO's week fetch).
+async function fetchIcqaDC(config){
+    try{
+        const target=parseFloat(document.getElementById('icqa-dc-target')?.value)||70;
+        setEl('icqa-dc-target-display',fmt(target)+'%');
+        const site=config.site;
+        const sched=config.shiftType==='Nights'?config.nights:config.days;
+        const {startDate}=getShiftDates(config);
+        let sDate=new Date(startDate);
+        if(sched.full.sh<12&&startDate.getHours()>=12){sDate.setDate(sDate.getDate()+1);}
+        let eDate=new Date(sDate);if(sched.full.eh<sched.full.sh)eDate.setDate(eDate.getDate()+1);
+        const shiftUrl=buildFnUrl(site,PROCESS_IDS.icqa,sDate,sched.full.sh,sched.full.sm,eDate,sched.full.eh,sched.full.em);
+        const shiftHtml=await fetchHTML(shiftUrl);
+        const shiftDC=calcDCPercent(shiftHtml);
+        setEl('icqa-dc-shift-actual',shiftDC.totalHours>0?fmtPct(shiftDC.pct):'\u2014');
+        if(target>0&&shiftDC.totalHours>0){const p=(shiftDC.pct/target)*100;const el=setEl('icqa-dc-shift-pct',fmtPct(p));setPctClass(el,p);}
+        else setEl('icqa-dc-shift-pct','\u2014');
+
+        const weekUrl=buildFnUrlWeek(site,PROCESS_IDS.icqa,getWeekSunday());
+        const weekHtml=await fetchHTML(weekUrl);
+        const weekDC=calcDCPercent(weekHtml);
+        setEl('icqa-dc-week-actual',weekDC.totalHours>0?fmtPct(weekDC.pct):'\u2014');
+        if(target>0&&weekDC.totalHours>0){const p=(weekDC.pct/target)*100;const el=setEl('icqa-dc-week-pct',fmtPct(p));setPctClass(el,p);}
+        else setEl('icqa-dc-week-pct','\u2014');
+    }catch(e){console.warn('[SB] ICQA DC% fetch error:',e.message);}
+}
+
+// === ICQA: GCA's (Coaching to Deliver, target 0) ===
+// Calls Guided Coaching's SearchCoachingInstances API directly in the background
+// (captured via browser devtools network tab). This runs cross-origin via
+// GM_xmlhttpRequest, which sends the browser's existing guided-coaching.corp.amazon.com
+// session cookies automatically — no need to have that tab open, same idea as the
+// Fast Start fetch elsewhere in this file.
+const ICQA_GCA_REASONS=['MANUAL_QUALITY_COACHING_FOR_STOW','MANUAL_PRODUCTIVITY_COACHING_FOR_STOW','TOO_MANY_STOW_MULTIPLE_EVENT_DEFECTS','TOO_MANY_STOW_MULTIPLE_EVENT_NOT_SCANNED_DEFECTS','TOO_MANY_STOW_MULTIPLE_EVENT_WRONG_BIN_DEFECTS','TOO_MANY_NIKE_QUANTITY_STOW_MULTIPLE_EVENT_DEFECTS','TOO_MANY_NIKE_QUANTITY_STOW_OVERAGE_DEFECTS','TOO_MANY_NIKE_QUANTITY_STOW_LOW_UNITS_PER_TRANSACTION_DEFECTS','STOW_QUBIT_RISK_SCORE_TOO_HIGH','TOO_MANY_STOW_MACHINE_GUN_RISK_SIGNATURES','TOO_MANY_STOW_OUT_OF_SEQUENCE_RISK_SIGNATURES','TOO_MANY_STOW_PC99_RISK_SIGNATURES','TOO_MANY_STOW_SWITCH_RISK_SIGNATURES','TOO_MANY_STOW_SHORTAGE_RISK_SIGNATURES','TOO_MANY_STOW_OVERAGE_RISK_SIGNATURES','TOO_MANY_STOW_DAMAGE_RISK_SIGNATURES','TOO_MANY_STOW_BIN_COLLISION_RISK_SIGNATURES','TOO_MANY_STOW_AMNESTY_DIRTY_BIN_RISK_SIGNATURES','TOO_MANY_STOW_SHORTAGE_DEFECTS','TOO_MANY_STOW_OVERAGE_DEFECTS','TOO_MANY_NO_STOW_TURNAWAY_INDICATORS','TOO_MANY_STOW_AMNESTY_LAST_TOUCH_ERROR_INDICATORS','TOO_MANY_SCAN_WHILE_STOW_DEFECTS','TOO_MANY_STOW_HOLDING_MULTIPLE_ITEMS_DEFECTS','TOO_MANY_STOW_BLOCKING_CAMERA_DEFECTS','TOO_MANY_SWEEP_AFTER_STOW_DEFECTS','TOO_MANY_POD_FRICTION_NON_COMPLIANT_STOW_OVERRIDES','TOO_MANY_STOW_FIDO_TRIPS_ERROR_INDICATORS','TOO_MANY_STOW_FIDO_PROMPTS_ERROR_INDICATORS','MANUAL_QUALITY_COACHING_FOR_PICK','MANUAL_PRODUCTIVITY_COACHING_FOR_PICK','TOO_MANY_PICK_ERROR_INDICATORS','TOO_MANY_PICK_OVERAGE_ERROR_INDICATORS','TOO_MANY_PICK_SHORTAGE_ERROR_INDICATORS','TOO_MANY_PICK_DAMAGE_ERROR_INDICATORS','TOO_HIGH_PICK_DPMO','PICK_QUBIT_RISK_SCORE_TOO_HIGH','TOO_MANY_PICK_SHORTAGE_RISK_SIGNATURES','TOO_MANY_PICK_DAMAGE_RISK_SIGNATURES','TOO_MANY_PICK_SCANNED_WRONG_ASIN_RISK_SIGNATURES','TOO_MANY_PICK_REJECT_RISK_SIGNATURES','TOO_MANY_PICK_UNSCANNABLE_RISK_SIGNATURES','TOO_MANY_PICK_WRONG_ADJUSTMENT_DEFECTS','TOO_MANY_PICK_OVERFILLED_TOTE_ERROR_INDICATORS','TOO_MANY_PICK_AMNESTY_DIRTY_BIN_RISK_SIGNATURES','TOO_MANY_PICK_AMNESTY_LAST_TOUCH_ERROR_INDICATORS','TOO_MANY_PICK_FIDO_TRIPS_ERROR_INDICATORS','TOO_MANY_PICK_FIDO_PROMPTS_ERROR_INDICATORS','TOO_MANY_PICK_FALSE_DAMAGE_ERROR_INDICATORS','TOO_MANY_PICK_HIGH_REACH_WITHOUT_STEP_LADDER_DEFECTS','MANUAL_QUALITY_COACHING_FOR_INDUCT','MANUAL_PRODUCTIVITY_COACHING_FOR_INDUCT','TOO_MANY_INDUCT_ERROR_INDICATORS','TOO_MANY_INDUCT_SHORTAGE_ERROR_INDICATORS','TOO_MANY_INDUCT_DAMAGE_ERROR_INDICATORS','TOO_MANY_INDUCT_FALSE_DAMAGE_ERROR_INDICATORS','MANUAL_QUALITY_COACHING_FOR_REBIN','MANUAL_PRODUCTIVITY_COACHING_FOR_REBIN','TOO_MANY_AFE_REBIN_ERROR_INDICATORS','TOO_MANY_AFE_REBIN_SHORTAGE_ERROR_INDICATORS','TOO_MANY_AFE_REBIN_DAMAGE_ERROR_INDICATORS','TOO_HIGH_AFE_REBIN_DPMO','TOO_MANY_AFE_REBIN_FALSE_DAMAGE_ERROR_INDICATORS','TOO_MANY_BATCHY_REBIN_ERROR_INDICATORS','TOO_MANY_BATCHY_REBIN_SHORTAGE_ERROR_INDICATORS','TOO_MANY_BATCHY_REBIN_DAMAGE_ERROR_INDICATORS','TOO_HIGH_BATCHY_REBIN_DPMO','MANUAL_QUALITY_COACHING_FOR_RECEIVE','MANUAL_PRODUCTIVITY_COACHING_FOR_RECEIVE','TOO_MANY_RECEIVE_OVERAGE_ERROR_INDICATORS','TOO_MANY_RECEIVE_SHORTAGE_ERROR_INDICATORS','TOO_MANY_RECEIVE_ERROR_INDICATORS','TOO_MANY_RECEIVE_FALSE_DAMAGE_ERROR_INDICATORS','MANUAL_QUALITY_COACHING_FOR_ICQA','MANUAL_PRODUCTIVITY_COACHING_FOR_ICQA','TOO_MANY_ICQA_AMNESTY_DIRTY_BIN_RISK_SIGNATURES','TOO_MANY_ICQA_AMNESTY_LAST_TOUCH_ERROR_INDICATORS','TOO_MANY_ICQA_FIDO_TRIPS_ERROR_INDICATORS','TOO_MANY_ICQA_FIDO_PROMPTS_ERROR_INDICATORS','TOO_MANY_ICQA_FALSE_DAMAGE_ERROR_INDICATORS','MANUAL_QUALITY_COACHING_FOR_PACK','MANUAL_PRODUCTIVITY_COACHING_FOR_PACK','TOO_MANY_PACK_WRONG_CONTAINER_USED_DEFECTS','TOO_MANY_PACK_WEIGHT_OUT_OF_TOLERANCE_ERROR_INDICATORS','TOO_MANY_PACK_WRONG_CONTAINER_USED_ERROR_INDICATORS','TOO_MANY_PACK_DAMAGE_RISK_SIGNATURES','TOO_MANY_PACK_SHORTAGE_RISK_SIGNATURES','TOO_MANY_PACK_UNSCANNABLE_RISK_SIGNATURES','TOO_MANY_PACK_SERIAL_UNSCANNABLE_RISK_SIGNATURES','TOO_MANY_PACK_NO_SCANNABLE_ID_RISK_SIGNATURES','TOO_MANY_PACK_DUPLICATE_SERIAL_SCAN_RISK_SIGNATURES','TOO_MANY_PACK_NO_PACKING_SLIP_RISK_SIGNATURES','TOO_MANY_PACK_BROKEN_SET_DEFECTS','TOO_MANY_PACK_MASTER_PACK_DEFECTS','TOO_MANY_PACK_DAMAGE_DEFECTS','TOO_MANY_PACK_SHORTAGE_DEFECTS','TOO_MANY_PACK_OVERAGE_DEFECTS','TOO_MANY_PACK_MISSING_DUNNAGE_DEFECTS','TOO_MANY_PACK_INSUFFICIENT_DUNNAGE_DEFECTS','TOO_MANY_PACK_CONCESSION_APPLIED_ERROR_INDICATORS','TOO_MANY_PACK_CONCESSION_DEFECTS','TOO_MANY_PACK_OPEN_BOX_DEFECTS','TOO_MANY_PACK_LABEL_APPLICATION_DEFECTS','TOO_MANY_PACK_LABEL_PRINTING_DEFECTS','TOO_MANY_PACK_WRONG_BOX_MCF_DEFECTS','TOO_MANY_PACK_WRONG_BOX_DEFECTS','TOO_MANY_PACK_PACKAGE_PROTECTION_LEVEL_DEFECTS','TOO_MANY_PACK_FALSE_DAMAGE_ERROR_INDICATORS','MANUAL_QUALITY_COACHING_FOR_REVERSE_LOGISTICS','MANUAL_PRODUCTIVITY_COACHING_FOR_CUSTOMER_RETURNS','TOO_MANY_CUSTOMER_RETURNS_ITEM_MATCH_RISK_SIGNATURES','TOO_MANY_CUSTOMER_RETURNS_ITEM_DAMAGE_REMOVED_RISK_SIGNATURES','MANUAL_QUALITY_COACHING_FOR_SPACE_MANAGEMENT','MANUAL_QUALITY_COACHING_FOR_OUTBOUND_PROBLEM_SOLVE','TOO_MANY_POPS_MARKED_MISSING_ITEMS_FROM_CONTAINER_RISK_SIGNATURES','TOO_MANY_POPS_MARKED_MISSING_ITEMS_FROM_SPOOS_ERROR_INDICATORS','TOO_MANY_POPS_MARKED_MISSING_TOTE_BEFORE_PACK_ERROR_INDICATORS','TOO_MANY_POPS_MARKED_MISSING_TOTE_ERROR_INDICATORS','TOO_MANY_POPS_MARKED_MISSING_SHIPMENT_C15_DEFECTS','TOO_MANY_POPS_MARKED_MISSING_SHIPMENT_C704_DEFECTS','TOO_MANY_POPS_MARKED_MISSING_SHIPMENTS_ERROR_INDICATORS','TOO_MANY_POPS_REPROCESSED_SHIPMENTS_RISK_SIGNATURES','TOO_MANY_SLAM_OPERATOR_CONCESSION_ERROR_INDICATORS','TOO_MANY_OUTBOUND_PROBLEM_SOLVE_FALSE_DAMAGE_ERROR_INDICATORS','MANUAL_QUALITY_COACHING_FOR_INBOUND_PROBLEM_SOLVE','TOO_MANY_INBOUND_PROBLEM_SOLVE_EXCESSIVE_DELETES_DAMAGES','TOO_MANY_INBOUND_PROBLEM_SOLVE_FALSE_DAMAGE_ERROR_INDICATORS','MANUAL_QUALITY_COACHING_FOR_DECANT','MANUAL_PRODUCTIVITY_COACHING_FOR_DECANT','TOO_MANY_DECANT_ERROR_INDICATORS','MANUAL_QUALITY_COACHING_FOR_SHIP','MANUAL_PRODUCTIVITY_COACHING_FOR_SHIP','TOO_MANY_PACKAGE_MISSORTS','TOO_MANY_CONTAINER_MISSORTS','TOO_LOW_AMNESTY_FIND_RATE_RISK_SIGNATURES'];
+function fetchIcqaGCA(config,isRetry){
+    try{
+        const site=(config||loadConfig()).site;
+        const now=new Date();
+        const start=new Date(now.getTime()-14*24*60*60*1000);
+        const body=JSON.stringify({
+            building:{code:site},
+            creationTimeRange:{startTime:start.toISOString(),endTime:now.toISOString()},
+            statuses:'["PENDING"]',
+            filters:[
+                {_filterType:'attribute',attribute:'COACHING_REASON',values:ICQA_GCA_REASONS,negate:false},
+                {_filterType:'coacheePresence'}
+            ]
+        });
+        GM_xmlhttpRequest({
+            method:'POST',
+            url:'https://guided-coaching.corp.amazon.com/api/coaching/SearchCoachingInstances',
+            headers:{'Content-Type':'application/json;charset=utf-8','Accept':'application/json'},
+            data:body,
+            onload:function(resp){
+                try{
+                    const data=JSON.parse(resp.responseText);
+                    const count=(data.coachingInstances?.length||0)+(data.additionalCoachingInstances||0);
+                    setEl('icqa-gca-value',String(count));
+                    const banner=document.getElementById('icqa-gca-banner');
+                    if(banner)banner.style.background=count>0?'#c62828':'#2e7d32';
+                    setEl('icqa-gca-updated','\u2713 Updated '+new Date().toLocaleTimeString());
+                }catch(e){
+                    // Likely got redirected to a login page's HTML instead of JSON (expired session)
+                    if(!isRetry)refreshGcaSessionAndRetry(config);
+                    else setEl('icqa-gca-updated','\u26A0\uFE0F Parse error');
+                }
+            },
+            onerror:function(){
+                if(!isRetry){refreshGcaSessionAndRetry(config);return;}
+                setEl('icqa-gca-value','\u2014');
+                const b=document.getElementById('icqa-gca-banner');if(b)b.style.background='#757575';
+                setEl('icqa-gca-updated','\u26A0\uFE0F Fetch failed (log in to Guided Coaching once)');
+            },
+            ontimeout:function(){
+                if(!isRetry){refreshGcaSessionAndRetry(config);return;}
+                setEl('icqa-gca-value','\u2014');
+                const b=document.getElementById('icqa-gca-banner');if(b)b.style.background='#757575';
+                setEl('icqa-gca-updated','\u26A0\uFE0F Timed out');
+            }
+        });
+    }catch(e){console.warn('[SB] ICQA GCA fetch error:',e.message);}
+}
+// Guided Coaching's SSO login page sends X-Frame-Options: deny, so it can never be
+// loaded in a hidden iframe — that header is a hard browser rule with no userscript
+// workaround. Completing the SSO handshake requires a real top-level navigation, so
+// this opens Guided Coaching in an actual (background, non-focused) tab via
+// GM_openInTab — the same thing as opening it yourself, just automated — waits for the
+// session cookie to land, closes the tab, then retries the original request once.
+function refreshGcaSessionAndRetry(config){
+    if(typeof GM_openInTab!=='function'){
+        console.warn('[SB-GCA] GM_openInTab unavailable — log in to Guided Coaching manually once.');
+        setEl('icqa-gca-updated','\u26A0\uFE0F Log in to Guided Coaching once');
+        return;
+    }
+    console.log('[SB-GCA] Auth failed, opening Guided Coaching in a background tab to refresh session...');
+    const tab=GM_openInTab('https://guided-coaching.corp.amazon.com/',{active:false,insert:true,setParent:true});
+    setTimeout(()=>{
+        try{tab&&tab.close&&tab.close();}catch(e){}
+        console.log('[SB-GCA] Retrying GCA fetch after auth...');
+        fetchIcqaGCA(config,true);
+    },6000);
 }
 
 function fetchFastStart(site,shiftType){
@@ -1094,7 +1399,31 @@ function buildHTML(){return `
 <div class="goal-card ob-card"><div class="goal-header"><span class="goal-title">Outbound</span><span class="goal-pct" id="sum-ob-pct">\u2014</span></div><div class="goal-progress" id="ob-progress-wrap"><div class="goal-progress-bar green" id="ob-progress-bar" style="width:0%"></div><div class="period-marker" id="ob-marker-p1" data-label="P1" style="left:33%"></div><div class="period-marker" id="ob-marker-p2" data-label="P2" style="left:66%"></div></div><div class="goal-stats"><span>Goal <strong id="sum-pick-goal">\u2014</strong></span><span>Actual <strong id="sum-ob-actual">\u2014</strong></span><span>Remaining <strong id="sum-ob-remaining">\u2014</strong></span></div><div class="goal-stats"><span>\u25B2 <strong id="sum-pick-rate">\u2014</strong> Rate</span><span>\u2713 <strong id="sum-ob-cplh">\u2014</strong> CPLH</span></div><div class="pace-insight" id="ob-pace-insight"></div></div>
 <div class="goal-card sort-card" id="sort-summary-card"><div class="goal-header"><span class="goal-title">Sort</span><span class="goal-pct" id="sum-sort-pct">\u2014</span></div><div class="goal-progress"><div class="goal-progress-bar green" id="sort-progress-bar" style="width:0%"></div></div><div class="goal-stats"><span>Goal <strong id="sum-sort-goal">\u2014</strong></span><span>Actual <strong id="sum-sort-actual">\u2014</strong></span><span>Remaining <strong id="sum-sort-remaining">\u2014</strong></span></div><div class="goal-stats"><span>\u25B2 <strong id="sum-sort-rate">\u2014</strong> Rate</span><span>\u2713 <strong id="sum-sort-cplh">\u2014</strong> CPLH</span></div></div>
 </div>
-<div class="site-cplh-panel" id="site-cplh-panel" style="background:#fff;border:2px solid #000;border-radius:4px;padding:10px 14px;">
+<div class="icqa-panel" id="icqa-panel" style="background:#fff;border:2px solid #000;border-radius:4px;padding:10px 14px;">
+<h3 style="font-size:11px;font-weight:700;margin-bottom:6px;">ICQA</h3>
+<div id="icqa-gca-banner" style="background:#757575;border:2px solid #000;border-radius:4px;padding:10px 14px;margin-bottom:10px;">
+<div style="display:flex;align-items:center;justify-content:space-between;">
+<h3 style="font-size:13px;font-weight:700;color:#fff;margin:0;">GCA's <span style="font-weight:400;font-size:11px;">(Target 0 &middot; Coaching to Deliver)</span></h3>
+<strong id="icqa-gca-value" style="font-size:18px;color:#fff;">\u2014</strong>
+</div>
+</div>
+<div style="font-size:10px;font-weight:700;color:#555;margin-bottom:2px;">% to RO <span style="margin-left:8px;font-size:10px;background:#e8f5e9;color:#2e7d32;padding:2px 8px;border-radius:4px;font-weight:700;">RO Target = <span id="icqa-ro-target-display">\u2014</span></span></div>
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;font-size:12px;">
+<div><span style="color:#333;font-size:10px;">SHIFT RO RATE</span><br><strong id="icqa-ro-shift-actual" style="font-size:16px;">\u2014</strong></div>
+<div><span style="color:#333;font-size:10px;">SHIFT % TO RO</span><br><strong id="icqa-ro-shift-pct" style="font-size:16px;">\u2014</strong></div>
+<div><span style="color:#333;font-size:10px;">WEEK RO RATE</span><br><strong id="icqa-ro-week-actual" style="font-size:16px;">\u2014</strong></div>
+<div><span style="color:#333;font-size:10px;">WEEK % TO RO</span><br><strong id="icqa-ro-week-pct" style="font-size:16px;">\u2014</strong></div>
+</div>
+<div style="font-size:10px;font-weight:700;color:#555;margin:8px 0 2px;">DC% <span style="margin-left:8px;font-size:10px;background:#e8f5e9;color:#2e7d32;padding:2px 8px;border-radius:4px;font-weight:700;">DC% Target = <span id="icqa-dc-target-display">\u2014</span></span></div>
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;font-size:12px;">
+<div><span style="color:#333;font-size:10px;">SHIFT DC%</span><br><strong id="icqa-dc-shift-actual" style="font-size:16px;">\u2014</strong></div>
+<div><span style="color:#333;font-size:10px;">SHIFT % TO GOAL</span><br><strong id="icqa-dc-shift-pct" style="font-size:16px;">\u2014</strong></div>
+<div><span style="color:#333;font-size:10px;">WEEK DC%</span><br><strong id="icqa-dc-week-actual" style="font-size:16px;">\u2014</strong></div>
+<div><span style="color:#333;font-size:10px;">WEEK % TO GOAL</span><br><strong id="icqa-dc-week-pct" style="font-size:16px;">\u2014</strong></div>
+</div>
+<div style="text-align:right;font-size:9px;color:#888;margin-top:6px;" id="icqa-gca-updated">\u2014</div>
+</div>
+<div class="site-cplh-panel" id="site-cplh-panel" style="background:#fff;border:2px solid #000;border-radius:4px;padding:10px 14px;margin-top:6px;">
 <h3 style="font-size:11px;font-weight:700;margin-bottom:6px;">Site CPLH <span style="margin-left:16px;font-size:11px;background:#e8f5e9;color:#2e7d32;padding:2px 8px;border-radius:4px;font-weight:700;">LP Target = <span id="lp-site-cplh-display">\u2014</span></span></h3>
 <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;font-size:12px;">
 <div><span style="color:#333;font-size:10px;">SITE CPLH</span><br><strong id="site-cplh-value" style="font-size:16px;">\u2014</strong></div>
@@ -1161,6 +1490,8 @@ function buildHTML(){return `
 </tbody></table></div>
 <div class="sort-tgt" style="margin-top:6px;padding-top:6px;border-top:2px solid #000;"><h4 style="color:#333;">SITE</h4><table class="target-table"><tbody>
 <tr><td>SITE CPLH TARGET</td><td><input type="number" id="site-cplh-target" class="target-input" step="0.01"></td><td><span id="site-cplh-pct">\u2014</span></td></tr>
+<tr><td>ICQA RO TARGET</td><td><input type="number" id="icqa-ro-target" class="target-input" step="1"></td><td></td></tr>
+<tr><td>ICQA DC% TARGET</td><td><input type="number" id="icqa-dc-target" class="target-input" step="1" value="70"></td><td></td></tr>
 </tbody></table></div>
 </div>
 <div class="charts-panel">
@@ -1633,6 +1964,10 @@ function clearBoard(){
     ['ib-progress-bar','ob-progress-bar','sort-progress-bar'].forEach(id=>{const el=document.getElementById(id);if(el){el.style.width='0%';el.className='goal-progress-bar green';}});
     // Clear site CPLH
     ['site-cplh-value','site-throughput-vol','site-throughput-hrs'].forEach(id=>{const el=document.getElementById(id);if(el){el.textContent='\u2014';el.style.color='';}});
+    // Clear ICQA (both are site-dependent; re-fetched on next Get Data / interval tick)
+    ['icqa-ro-shift-actual','icqa-ro-shift-pct','icqa-ro-week-actual','icqa-ro-week-pct'].forEach(id=>{const el=document.getElementById(id);if(el){el.textContent='\u2014';el.classList.remove('pct-good','pct-warn','pct-bad');}});
+    setEl('icqa-gca-value','\u2014');
+    const gcaBanner=document.getElementById('icqa-gca-banner');if(gcaBanner)gcaBanner.style.background='#757575';
     // Clear TOT
     const totEl=document.getElementById('tot-value');if(totEl)totEl.textContent='\u2014';
     // Clear 24hr goal tracker
@@ -1656,7 +1991,7 @@ function initBoard(){
     document.getElementById('shift-select').value=config.shiftType;
     // Load targets
     const t=config.targets||{};
-    ['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','site-cplh-target'].forEach(id=>{const el=document.getElementById(id);if(el&&t[id])el.value=t[id];});
+    ['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','site-cplh-target','icqa-ro-target','icqa-dc-target'].forEach(id=>{const el=document.getElementById(id);if(el&&t[id])el.value=t[id];});
     // Load settings
     const ds=config.days,ns=config.nights;
     ['ds-full-sh','ds-full-sm','ds-full-eh','ds-full-em','ds-p1-sh','ds-p1-sm','ds-p1-eh','ds-p1-em','ds-p2-sh','ds-p2-sm','ds-p2-eh','ds-p2-em','ds-p3-sh','ds-p3-sm','ds-p3-eh','ds-p3-em'].forEach((id,i)=>{const vals=[ds.full.sh,ds.full.sm,ds.full.eh,ds.full.em,ds.p1.sh,ds.p1.sm,ds.p1.eh,ds.p1.em,ds.p2.sh,ds.p2.sm,ds.p2.eh,ds.p2.em,ds.p3.sh,ds.p3.sm,ds.p3.eh,ds.p3.em];const el=document.getElementById(id);if(el)el.value=vals[i];});
@@ -1687,6 +2022,9 @@ function initBoard(){
     const sup=loadSupport();Object.keys(sup).forEach(id=>{const el=document.getElementById(id);if(el)el.value=sup[id];});
     document.querySelectorAll('.support-input,.callout-textarea').forEach(el=>el.addEventListener('change',()=>{const d={};document.querySelectorAll('.support-input,.callout-textarea').forEach(e=>{d[e.id]=e.value;});saveSupport(d);}));
     renderActions();updatePeriodDots();setInterval(updatePeriodDots,60000);
+    // ICQA GCA's is relayed from a separate tab (guided-coaching.corp.amazon.com), so
+    // refresh it on a timer independent of the main "Get Data" fetch.
+    fetchIcqaGCA();setInterval(fetchIcqaGCA,30000);
     // Start period notification reminders
     requestNotificationPermission();
     startPeriodReminders();
@@ -1796,6 +2134,10 @@ async function doFetch(){
         setEl('site-throughput-hrs',tHrs>0?fmt(tHrs,2):'\u2014');
         // Site CPLH % to target
         if(siteCplhTarget>0&&siteCplh>0){const p=(siteCplh/siteCplhTarget)*100;const el=setEl('site-cplh-pct',fmtPct(p));setPctClass(el,p);}
+        // Render ICQA section (GCA's + % to RO)
+        fetchIcqaGCA(config);
+        fetchIcqaRO(config,raw);
+        fetchIcqaDC(config);
         // Render TOT (Time Off Task) from separate PPR fetch (30min before SOS to 15min after EOS)
         const totHrs=raw.totPpr?.totHrs||0;
         if(totHrs>0){const hrs=Math.floor(totHrs);const mins=Math.round((totHrs-hrs)*60);setEl('tot-value',hrs+'h '+mins+'m');}else{setEl('tot-value','\u2014');}
@@ -1855,7 +2197,7 @@ async function doFetch(){
 }
 
 function saveTargetsUI(){
-    const t={};['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','site-cplh-target'].forEach(id=>{t[id]=document.getElementById(id)?.value||'';});
+    const t={};['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','site-cplh-target','icqa-ro-target','icqa-dc-target'].forEach(id=>{t[id]=document.getElementById(id)?.value||'';});
     config.targets=t;saveConfig(config);
     // Save LP values separately
     const lp={ibCplh:document.getElementById('lp-ib-cplh')?.value||'',obCplh:document.getElementById('lp-ob-cplh')?.value||'',siteCplh:document.getElementById('lp-site-cplh')?.value||''};
