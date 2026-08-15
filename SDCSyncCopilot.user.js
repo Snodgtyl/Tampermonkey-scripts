@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      13.4.2
+// @version      13.4.3
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -275,35 +275,28 @@ function calcDCPercent(html){
     const doc=new DOMParser().parseFromString(html,'text/html');
     const byName=parseFunctionHoursByName(doc,DC_PERCENT_FUNCTIONS);
     const dcHours=DC_PERCENT_FUNCTIONS.reduce((s,n)=>s+(byName[n]||0),0);
-    // Grand total: the very last row in the data table. From the visual layout, it has
-    // "Total" in the Function column and the Total Paid Hours value in the next numeric cell.
-    // The table structure uses rowspan for Function names, so the last <tr> in the table
-    // might have varying numbers of <td> elements. Strategy: find the last <tr> that
-    // contains a cell with text exactly "Total" AND a cell with class containing "numeric".
+    // Grand total: the absolute last row in the table that has "Total" text + a numeric value.
+    // Per-function "Total" sub-rows also match "has Total text + no links" because the
+    // function name link lives in a DIFFERENT row (via rowspan). The grand total is
+    // distinguished by being the VERY LAST such row. Scan FORWARD, keep overwriting —
+    // the last one we find is the grand total.
     let totalHours=0;
     const allRows=doc.querySelectorAll('tr');
-    for(let i=allRows.length-1;i>=0;i--){
+    for(let i=0;i<allRows.length;i++){
         const row=allRows[i];
         const tds=row.querySelectorAll('td');
         if(tds.length===0)continue;
         let hasTotal=false;
         let firstNumeric=0;
         for(const td of tds){
-            if(td.textContent.trim()==='Total'&&td.className.indexOf('numeric')===-1)hasTotal=true;
+            const t=td.textContent.trim();
+            if(t==='Total'&&td.className.indexOf('numeric')===-1)hasTotal=true;
             if(td.className.indexOf('numeric')!==-1&&firstNumeric===0){
-                firstNumeric=parseFloat(td.textContent.trim().replace(/,/g,''))||0;
+                firstNumeric=parseFloat(t.replace(/,/g,''))||0;
             }
         }
-        // Grand total row: has "Total" label + numeric value, AND is NOT a size sub-row
-        // (size sub-rows also have "Total" but the grand total is the only one where
-        // "Total" appears in a non-numeric cell that is NOT preceded by a function name link)
         if(hasTotal&&firstNumeric>0){
-            // Verify this isn't a per-function total by checking no <a> link in the row
-            const links=row.querySelectorAll('a');
-            if(links.length===0){
-                totalHours=firstNumeric;
-                break;
-            }
+            totalHours=firstNumeric; // keep overwriting — last match = grand total
         }
     }
     console.log('[SB-DC] byName:',JSON.stringify(byName),'dcHours:',dcHours,'totalHours:',totalHours);
