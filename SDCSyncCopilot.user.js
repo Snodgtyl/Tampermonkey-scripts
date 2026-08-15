@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      13.3.0
+// @version      13.3.1
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -213,49 +213,62 @@ function buildPPRUrlWeek(site,weekStartDate){
 function buildFnUrlWeek(site,pid,weekStartDate){
     return'/reports/functionRollup?reportFormat=HTML&warehouseId='+site+'&processId='+pid+'&spanType=Week&startDateWeek='+encodeURIComponent(fmtDate(weekStartDate));
 }
-// Walks a Function Rollup page's body rows and pulls the "Total Paid Hours" value for
-// each named Function line item. The Function name cell uses rowspan across its
-// Small/Medium/Large/HeavyBulky/Total sub-rows, so it only appears once in the DOM —
-// track it as "current" until we hit that function's own "Total" sub-row.
+// Walks a Function Rollup page and pulls the "Total Paid Hours" (first td.numeric in
+// the "Total" sub-row) for each named Function. The ICQA Function Rollup has the same
+// structure as stow/pick: each function block has multiple size rows (Small/Medium/
+// Large/HeavyBulky) then a "Total" sub-row with class="empl-all" containing aggregated
+// values. The function name appears as link text inside the first size row of each
+// block (via rowspan), so we track "current function" until we hit its Total sub-row.
 function parseFunctionHoursByName(doc,names){
-    const rows=doc.querySelectorAll('tbody tr');
     const result={};
-    names.forEach(n=>result[n]=0);
-    let current=null;
-    rows.forEach(row=>{
-        const cells=Array.from(row.querySelectorAll('th,td'));
-        const cellTexts=cells.map(c=>c.textContent.trim());
-        for(const name of names){if(cellTexts.includes(name)){current=name;break;}}
-        if(current&&cellTexts.includes('Total')){
-            const numCell=row.querySelector('td.numeric');
-            if(numCell){result[current]=parseFloat(numCell.textContent.trim().replace(/,/g,''))||0;current=null;}
+    names.forEach(n=>{result[n]=0;});
+    // Strategy: find each function name in the page text, then find its Total sub-row
+    const allRows=doc.querySelectorAll('tr');
+    let currentFn=null;
+    for(const row of allRows){
+        const text=row.textContent;
+        // Check if this row starts a new function block (has the function name)
+        for(const name of names){
+            if(text.includes(name)&&!text.includes('Total')){
+                currentFn=name;
+                break;
+            }
         }
-    });
+        // Check if this is the "Total" sub-row for the current function
+        if(currentFn){
+            const cells=row.querySelectorAll('td');
+            let hasTotal=false;
+            for(const c of cells){
+                if(c.textContent.trim()==='Total'){hasTotal=true;break;}
+            }
+            if(hasTotal){
+                // First numeric cell = Total Paid Hours
+                const numCells=row.querySelectorAll('td[class*="numeric"]');
+                if(numCells.length>0){
+                    result[currentFn]=parseFloat(numCells[0].textContent.trim().replace(/,/g,''))||0;
+                }
+                currentFn=null;
+            }
+        }
+    }
     return result;
 }
 // DC% (Direct Count %) = (SBC - Library Deep + SBC - Pallet Single + Other Library Deep
 // + Other Pallet Single hours) / Total Paid Hours, off the ICQA process Function Rollup.
-// The ICQA Function Rollup groups columns by Method (CycleCount/SimpleBinCount/
-// AndonInspection/SidelineApp), a different table layout than the plain stow/pick
-// reports — parseFnRollup's tfoot-based selectors don't reliably match it, so the
-// grand total here is found directly: it's always the very last row in the table,
-// and its Function column literally reads "Total" (unlike each function's own
-// per-size "Total" sub-row, whose Function cell is blank due to rowspan).
+// Uses the same tfoot-based grand total selector that works for stow/pick/sort, since
+// it's the same FCLM report type.
 function calcDCPercent(html){
     const doc=new DOMParser().parseFromString(html,'text/html');
     const byName=parseFunctionHoursByName(doc,DC_PERCENT_FUNCTIONS);
     const dcHours=DC_PERCENT_FUNCTIONS.reduce((s,n)=>s+(byName[n]||0),0);
+    // Grand total = tfoot row (same selector proven to work in parseFnRollup)
+    const totalRow=doc.querySelector('tfoot tr.total.empl-all')||doc.querySelector('tr.total.empl-all')||doc.querySelector('tfoot tr.total')||doc.querySelector('tfoot tr');
     let totalHours=0;
-    const allRows=doc.querySelectorAll('table tr');
-    for(let i=allRows.length-1;i>=0;i--){
-        const row=allRows[i];
-        const cells=row.querySelectorAll('th,td');
-        if(cells.length&&cells[0].textContent.trim()==='Total'){
-            const numCell=row.querySelector('td.numeric');
-            if(numCell)totalHours=parseFloat(numCell.textContent.trim().replace(/,/g,''))||0;
-            break;
-        }
+    if(totalRow){
+        const numCells=totalRow.querySelectorAll('td[class*="numeric"]');
+        if(numCells.length>0)totalHours=parseFloat(numCells[0].textContent.trim().replace(/,/g,''))||0;
     }
+    console.log('[SB-DC] byName:',JSON.stringify(byName),'dcHours:',dcHours,'totalHours:',totalHours);
     const pct=totalHours>0?(dcHours/totalHours)*100:0;
     return{dcHours,totalHours,pct};
 }
