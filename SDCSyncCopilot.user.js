@@ -1,12 +1,11 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      13.2.1
+// @version      13.3.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
 // @grant        GM_xmlhttpRequest
-// @grant        GM_openInTab
 // @connect      fc-benchmarking.amazon.com
 // @connect      adapt-iad.amazon.com
 // @connect      galaxybi.aka.corp.amazon.com
@@ -39,7 +38,7 @@ const SITE_SCHEDULES = {
     QXX6: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:18,sm:30,eh:6,em:15},p1:{sh:19,sm:0,eh:22,em:30},p2:{sh:22,sm:31,eh:2,em:0},p3:{sh:2,sm:0,eh:5,em:30}} },
     SAV7: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:18,sm:30,eh:6,em:15},p1:{sh:19,sm:0,eh:22,em:30},p2:{sh:22,sm:31,eh:2,em:0},p3:{sh:2,sm:0,eh:5,em:30}} },
 };
-const PROCESS_IDS = { stow:'1003035', palletStow:'1003041', pick:'1003065', sort:'1003009', obDock:'1003021', icqa:'01003030' };
+const PROCESS_IDS = { stow:'1003035', palletStow:'1003041', pick:'1003065', sort:'1003009', obDock:'1003021', icqa:'1003030' };
 // Line items (Function names) that count as "Direct Count" for ICQA DC% —
 // SBC - Library Deep + SBC - Pallet Single + Other Library Deep + Other Pallet Single
 const DC_PERCENT_FUNCTIONS=['SBC - Library Deep','SBC - Pallet Single','Other Library Deep','Other Pallet Single'];
@@ -387,8 +386,8 @@ async function fetchIcqaDC(config){
         if(sched.full.sh<12&&startDate.getHours()>=12){sDate.setDate(sDate.getDate()+1);}
         let eDate=new Date(sDate);if(sched.full.eh<sched.full.sh)eDate.setDate(eDate.getDate()+1);
         const shiftUrl=buildFnUrl(site,PROCESS_IDS.icqa,sDate,sched.full.sh,sched.full.sm,eDate,sched.full.eh,sched.full.em);
+        console.log('[SB-DC] Fetching shift DC%, URL:',shiftUrl);
         const shiftHtml=await fetchHTML(shiftUrl);
-        console.log('[SB-DC] Shift URL:',shiftUrl);
         console.log('[SB-DC] Shift HTML length:',shiftHtml.length,'first 300:',shiftHtml.substring(0,300));
         const shiftDC=calcDCPercent(shiftHtml);
         console.log('[SB-DC] Shift result:',JSON.stringify(shiftDC));
@@ -402,7 +401,7 @@ async function fetchIcqaDC(config){
         setEl('icqa-dc-week-actual',weekDC.totalHours>0?fmtPct(weekDC.pct):'\u2014');
         if(target>0&&weekDC.totalHours>0){const p=(weekDC.pct/target)*100;const el=setEl('icqa-dc-week-pct',fmtPct(p));setPctClass(el,p);}
         else setEl('icqa-dc-week-pct','\u2014');
-    }catch(e){console.warn('[SB] ICQA DC% fetch error:',e.message);}
+    }catch(e){console.warn('[SB-DC] ICQA DC% fetch error:',e.message,e.stack);}
 }
 
 // === ICQA: GCA's (Coaching to Deliver, target 0) ===
@@ -461,24 +460,33 @@ function fetchIcqaGCA(config,isRetry){
     }catch(e){console.warn('[SB] ICQA GCA fetch error:',e.message);}
 }
 // Guided Coaching's SSO login page sends X-Frame-Options: deny, so it can never be
-// loaded in a hidden iframe — that header is a hard browser rule with no userscript
-// workaround. Completing the SSO handshake requires a real top-level navigation, so
-// this opens Guided Coaching in an actual (background, non-focused) tab via
-// GM_openInTab — the same thing as opening it yourself, just automated — waits for the
-// session cookie to land, closes the tab, then retries the original request once.
+// loaded in a hidden iframe. Opens a small popup window (same pattern as Oculus
+// transship dashboard) for the user to badge in — the popup auto-closes after auth.
 function refreshGcaSessionAndRetry(config){
-    if(typeof GM_openInTab!=='function'){
-        console.warn('[SB-GCA] GM_openInTab unavailable — log in to Guided Coaching manually once.');
-        setEl('icqa-gca-updated','\u26A0\uFE0F Log in to Guided Coaching once');
-        return;
+    console.log('[SB-GCA] Auth failed, opening Guided Coaching login popup...');
+    try{
+        const popup=window.open('https://guided-coaching.corp.amazon.com/','gca_auth','width=500,height=400,left=200,top=200');
+        if(popup){
+            setEl('icqa-gca-updated','\u26A0\uFE0F Badge in to Guided Coaching popup...');
+            // Poll until the popup closes (user badges in and closes, or auto-close after timeout)
+            const poll=setInterval(()=>{
+                try{
+                    if(popup.closed){
+                        clearInterval(poll);
+                        console.log('[SB-GCA] Popup closed, retrying GCA fetch...');
+                        fetchIcqaGCA(config,true);
+                    }
+                }catch(e){}
+            },1000);
+            // Safety timeout: stop polling after 60s and close popup
+            setTimeout(()=>{clearInterval(poll);try{popup.close();}catch(e){}},60000);
+        }else{
+            setEl('icqa-gca-updated','\u26A0\uFE0F Popup blocked \u2014 allow popups for FCLM');
+        }
+    }catch(e){
+        console.warn('[SB-GCA] Could not open popup:',e.message);
+        setEl('icqa-gca-updated','\u26A0\uFE0F Log in to Guided Coaching manually');
     }
-    console.log('[SB-GCA] Auth failed, opening Guided Coaching in a background tab to refresh session...');
-    const tab=GM_openInTab('https://guided-coaching.corp.amazon.com/',{active:false,insert:true,setParent:true});
-    setTimeout(()=>{
-        try{tab&&tab.close&&tab.close();}catch(e){}
-        console.log('[SB-GCA] Retrying GCA fetch after auth...');
-        fetchIcqaGCA(config,true);
-    },6000);
 }
 
 function fetchFastStart(site,shiftType){
