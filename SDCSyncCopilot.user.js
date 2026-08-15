@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      13.3.1
+// @version      13.4.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -213,39 +213,53 @@ function buildPPRUrlWeek(site,weekStartDate){
 function buildFnUrlWeek(site,pid,weekStartDate){
     return'/reports/functionRollup?reportFormat=HTML&warehouseId='+site+'&processId='+pid+'&spanType=Week&startDateWeek='+encodeURIComponent(fmtDate(weekStartDate));
 }
-// Walks a Function Rollup page and pulls the "Total Paid Hours" (first td.numeric in
-// the "Total" sub-row) for each named Function. The ICQA Function Rollup has the same
-// structure as stow/pick: each function block has multiple size rows (Small/Medium/
-// Large/HeavyBulky) then a "Total" sub-row with class="empl-all" containing aggregated
-// values. The function name appears as link text inside the first size row of each
-// block (via rowspan), so we track "current function" until we hit its Total sub-row.
+// Walks a Function Rollup page and pulls the "Total Paid Hours" (first numeric cell in
+// the "Total" sub-row) for each named Function. From the Inspector, each function's
+// Total sub-row is a <tr class=" empl-all"> containing a <td> with text "Total" (the
+// size-total cell) plus <td class="numeric size-total highlighted"> cells.
+// The function name appears as link text in an earlier row of the same function block.
 function parseFunctionHoursByName(doc,names){
     const result={};
     names.forEach(n=>{result[n]=0;});
-    // Strategy: find each function name in the page text, then find its Total sub-row
     const allRows=doc.querySelectorAll('tr');
     let currentFn=null;
-    for(const row of allRows){
-        const text=row.textContent;
-        // Check if this row starts a new function block (has the function name)
+    for(let i=0;i<allRows.length;i++){
+        const row=allRows[i];
+        const rowText=row.textContent;
+        // Check if this row starts a new function block
         for(const name of names){
-            if(text.includes(name)&&!text.includes('Total')){
-                currentFn=name;
-                break;
+            if(rowText.indexOf(name)!==-1){
+                // Make sure it's actually the function name row, not just a coincidence
+                const links=row.querySelectorAll('a');
+                for(const a of links){
+                    if(a.textContent.trim()===name){currentFn=name;break;}
+                }
+                if(currentFn===name)break;
+                // Fallback: check td text directly
+                const tds=row.querySelectorAll('td');
+                for(const td of tds){
+                    if(td.textContent.trim()===name){currentFn=name;break;}
+                }
+                if(currentFn===name)break;
             }
         }
         // Check if this is the "Total" sub-row for the current function
         if(currentFn){
-            const cells=row.querySelectorAll('td');
-            let hasTotal=false;
-            for(const c of cells){
-                if(c.textContent.trim()==='Total'){hasTotal=true;break;}
+            const tds=row.querySelectorAll('td');
+            let isTotalRow=false;
+            for(const td of tds){
+                const t=td.textContent.trim();
+                if(t==='Total'&&td.className.indexOf('size-total')!==-1){isTotalRow=true;break;}
+                if(t==='Total'&&td.className.indexOf('highlighted')!==-1){isTotalRow=true;break;}
+                if(t==='Total'&&!td.className.includes('numeric')){isTotalRow=true;break;}
             }
-            if(hasTotal){
-                // First numeric cell = Total Paid Hours
-                const numCells=row.querySelectorAll('td[class*="numeric"]');
-                if(numCells.length>0){
-                    result[currentFn]=parseFloat(numCells[0].textContent.trim().replace(/,/g,''))||0;
+            if(isTotalRow){
+                // First cell whose class contains "numeric" = Total Paid Hours
+                for(const td of tds){
+                    if(td.className.indexOf('numeric')!==-1){
+                        const val=parseFloat(td.textContent.trim().replace(/,/g,''))||0;
+                        if(val>0){result[currentFn]=val;break;}
+                    }
                 }
                 currentFn=null;
             }
@@ -255,18 +269,33 @@ function parseFunctionHoursByName(doc,names){
 }
 // DC% (Direct Count %) = (SBC - Library Deep + SBC - Pallet Single + Other Library Deep
 // + Other Pallet Single hours) / Total Paid Hours, off the ICQA process Function Rollup.
-// Uses the same tfoot-based grand total selector that works for stow/pick/sort, since
-// it's the same FCLM report type.
+// The ICQA report does NOT use <tfoot> — the grand total is the last <tr class=" empl-all">
+// row whose first cell contains "Total" with class "size-total highlighted".
 function calcDCPercent(html){
     const doc=new DOMParser().parseFromString(html,'text/html');
     const byName=parseFunctionHoursByName(doc,DC_PERCENT_FUNCTIONS);
     const dcHours=DC_PERCENT_FUNCTIONS.reduce((s,n)=>s+(byName[n]||0),0);
-    // Grand total = tfoot row (same selector proven to work in parseFnRollup)
-    const totalRow=doc.querySelector('tfoot tr.total.empl-all')||doc.querySelector('tr.total.empl-all')||doc.querySelector('tfoot tr.total')||doc.querySelector('tfoot tr');
+    // Grand total: find the LAST row that has a td with text "Total" and class containing "size-total"
     let totalHours=0;
-    if(totalRow){
-        const numCells=totalRow.querySelectorAll('td[class*="numeric"]');
-        if(numCells.length>0)totalHours=parseFloat(numCells[0].textContent.trim().replace(/,/g,''))||0;
+    const allRows=doc.querySelectorAll('tr');
+    for(let i=allRows.length-1;i>=0;i--){
+        const row=allRows[i];
+        const tds=row.querySelectorAll('td');
+        let isGrandTotal=false;
+        for(const td of tds){
+            if(td.textContent.trim()==='Total'&&td.className.indexOf('size-total')!==-1){
+                isGrandTotal=true;break;
+            }
+        }
+        if(isGrandTotal){
+            for(const td of tds){
+                if(td.className.indexOf('numeric')!==-1){
+                    totalHours=parseFloat(td.textContent.trim().replace(/,/g,''))||0;
+                    break;
+                }
+            }
+            break;
+        }
     }
     console.log('[SB-DC] byName:',JSON.stringify(byName),'dcHours:',dcHours,'totalHours:',totalHours);
     const pct=totalHours>0?(dcHours/totalHours)*100:0;
