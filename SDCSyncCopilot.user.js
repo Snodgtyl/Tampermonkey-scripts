@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      13.4.3
+// @version      13.5.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -275,11 +275,9 @@ function calcDCPercent(html){
     const doc=new DOMParser().parseFromString(html,'text/html');
     const byName=parseFunctionHoursByName(doc,DC_PERCENT_FUNCTIONS);
     const dcHours=DC_PERCENT_FUNCTIONS.reduce((s,n)=>s+(byName[n]||0),0);
-    // Grand total: the absolute last row in the table that has "Total" text + a numeric value.
-    // Per-function "Total" sub-rows also match "has Total text + no links" because the
-    // function name link lives in a DIFFERENT row (via rowspan). The grand total is
-    // distinguished by being the VERY LAST such row. Scan FORWARD, keep overwriting —
-    // the last one we find is the grand total.
+    // Grand total: find the LARGEST "Total Paid Hours" value among all rows that contain
+    // "Total" text. The grand total is always the sum of all function totals, so it's
+    // guaranteed to be the largest value. This avoids any DOM structure guessing.
     let totalHours=0;
     const allRows=doc.querySelectorAll('tr');
     for(let i=0;i<allRows.length;i++){
@@ -287,16 +285,17 @@ function calcDCPercent(html){
         const tds=row.querySelectorAll('td');
         if(tds.length===0)continue;
         let hasTotal=false;
-        let firstNumeric=0;
         for(const td of tds){
-            const t=td.textContent.trim();
-            if(t==='Total'&&td.className.indexOf('numeric')===-1)hasTotal=true;
-            if(td.className.indexOf('numeric')!==-1&&firstNumeric===0){
-                firstNumeric=parseFloat(t.replace(/,/g,''))||0;
-            }
+            if(td.textContent.trim()==='Total')hasTotal=true;
         }
-        if(hasTotal&&firstNumeric>0){
-            totalHours=firstNumeric; // keep overwriting — last match = grand total
+        if(hasTotal){
+            for(const td of tds){
+                if(td.className.indexOf('numeric')!==-1){
+                    const val=parseFloat(td.textContent.trim().replace(/,/g,''))||0;
+                    if(val>totalHours)totalHours=val;
+                    break; // only check first numeric cell (Total Paid Hours column)
+                }
+            }
         }
     }
     console.log('[SB-DC] byName:',JSON.stringify(byName),'dcHours:',dcHours,'totalHours:',totalHours);
