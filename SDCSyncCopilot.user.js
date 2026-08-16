@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      13.5.6
+// @version      13.5.9
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -793,7 +793,7 @@ function fetchBBGoalFromLP(planId,pageName,sundayStr,callback){
 // Dark mode color helper for conditional formatting
 function cfColors(){
     const dk=document.getElementById('sb-root')?.classList.contains('dark-mode');
-    return dk?{good:'#1b8a4a',warn:'#c77d00',bad:'#d32f2f'}:{good:'rgba(52,211,153,0.15)',warn:'rgba(251,191,36,0.1)',bad:'rgba(220,38,38,0.12)'};
+    return dk?{good:'#1b8a4a',warn:'#c77d00',bad:'#d32f2f',txt:'#fff'}:{good:'rgba(52,211,153,0.15)',warn:'rgba(251,191,36,0.1)',bad:'rgba(220,38,38,0.12)',txt:''};
 }
 function cfDensityColors(){
     const dk=document.getElementById('sb-root')?.classList.contains('dark-mode');
@@ -846,13 +846,13 @@ function renderLPPercents(metrics){
     const ibDenDispEl=document.getElementById('lp-ib-density-display');if(ibDenDispEl)ibDenDispEl.textContent=ibDensityLP>0?ibDensityLP.toFixed(2):'\u2014';
     const obDenDispEl=document.getElementById('lp-ob-density-display');if(obDenDispEl)obDenDispEl.textContent=obDensityLP>0?obDensityLP.toFixed(2):'\u2014';
     // Conditional format IB Stow Rate cells based on LP CTI rate
-    if(ctiRate>0){['ib-rate-p1','ib-rate-p2','ib-rate-p3','ib-rate-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';return;}if(v>=ctiRate)el.style.background=cc.good;else if(v>=ctiRate*0.95)el.style.background=cc.warn;else el.style.background=cc.bad;});}
+    if(ctiRate>0){['ib-rate-p1','ib-rate-p2','ib-rate-p3','ib-rate-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';el.style.color='';return;}if(v>=ctiRate){el.style.background=cc.good;el.style.color=cc.txt;}else if(v>=ctiRate*0.95){el.style.background=cc.warn;el.style.color=cc.txt;}else{el.style.background=cc.bad;el.style.color=cc.txt;}});}
     // Conditional format IB CPLH cells based on LP CPLH
-    if(ibLpCplh>0){['ib-cplh-p1','ib-cplh-p2','ib-cplh-p3','ib-cplh-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';return;}if(v>=ibLpCplh)el.style.background=cc.good;else if(v>=ibLpCplh*0.95)el.style.background=cc.warn;else el.style.background=cc.bad;});}
+    if(ibLpCplh>0){['ib-cplh-p1','ib-cplh-p2','ib-cplh-p3','ib-cplh-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';el.style.color='';return;}if(v>=ibLpCplh){el.style.background=cc.good;el.style.color=cc.txt;}else if(v>=ibLpCplh*0.95){el.style.background=cc.warn;el.style.color=cc.txt;}else{el.style.background=cc.bad;el.style.color=cc.txt;}});}
     // Conditional format OB Pick Rate cells based on LP TOP rate
-    if(topRate>0){['ob-rate-p1','ob-rate-p2','ob-rate-p3','ob-rate-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';return;}if(v>=topRate)el.style.background=cc.good;else if(v>=topRate*0.95)el.style.background=cc.warn;else el.style.background=cc.bad;});}
+    if(topRate>0){['ob-rate-p1','ob-rate-p2','ob-rate-p3','ob-rate-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';el.style.color='';return;}if(v>=topRate){el.style.background=cc.good;el.style.color=cc.txt;}else if(v>=topRate*0.95){el.style.background=cc.warn;el.style.color=cc.txt;}else{el.style.background=cc.bad;el.style.color=cc.txt;}});}
     // Conditional format OB CPLH cells based on LP CPLH
-    if(obLpCplh>0){['ob-cplh-p1','ob-cplh-p2','ob-cplh-p3','ob-cplh-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';return;}if(v>=obLpCplh)el.style.background=cc.good;else if(v>=obLpCplh*0.95)el.style.background=cc.warn;else el.style.background=cc.bad;});}
+    if(obLpCplh>0){['ob-cplh-p1','ob-cplh-p2','ob-cplh-p3','ob-cplh-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';el.style.color='';return;}if(v>=obLpCplh){el.style.background=cc.good;el.style.color=cc.txt;}else if(v>=obLpCplh*0.95){el.style.background=cc.warn;el.style.color=cc.txt;}else{el.style.background=cc.bad;el.style.color=cc.txt;}});}
     // Conditional format IB Density cells based on LP Density
     if(ibDensityLP>0){const dc=cfDensityColors();['ib-density-p1','ib-density-p2','ib-density-p3','ib-density-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';el.style.color='';return;}if(v>=ibDensityLP){el.style.background=dc.goodBg;el.style.color=dc.goodTxt;}else if(v>=ibDensityLP*0.9){el.style.background=dc.warnBg;el.style.color=dc.warnTxt;}else{el.style.background=dc.badBg;el.style.color=dc.badTxt;}});}
     // Conditional format OB Density cells based on LP Density
@@ -1085,7 +1085,7 @@ function renderIB(m){
     const ibG=parseFloat(document.getElementById('ib-goal-input')?.value)||0;
     if(ibG>0){const periods=loadConfig().schedType==='4Q'?4:3;const cc=cfColors();
         [['ib-sync-p1',p1.totalStow,ibG/periods],['ib-sync-p2',p2.totalStow,ibG/periods*2],['ib-sync-p3',p3.totalStow,ibG],['ib-sync-total',f.totalStow,ibG]].forEach(([id,act,tgt])=>{
-            const el=document.getElementById(id);if(!el)return;if(!act||act<=0){el.style.background='';return;}el.style.background=act>=tgt?cc.good:act>=tgt*0.95?cc.warn:cc.bad;});
+            const el=document.getElementById(id);if(!el)return;if(!act||act<=0){el.style.background='';el.style.color='';return;}el.style.background=act>=tgt?cc.good:act>=tgt*0.95?cc.warn:cc.bad;el.style.color=cc.txt||'';});
     }
     setEl('ib-cases-p1',fmt(p1.stowUnits));setEl('ib-cases-p2',fmt(p2.stowUnits));setEl('ib-cases-p3',fmt(p3.stowUnits));setEl('ib-cases-total',fmt(f.stowUnits));
     setEl('ib-pallets-p1',fmt(p1.palletUnits||0));setEl('ib-pallets-p2',fmt(p2.palletUnits||0));setEl('ib-pallets-p3',fmt(p3.palletUnits||0));setEl('ib-pallets-total',fmt(f.palletUnits||0));
@@ -1115,7 +1115,7 @@ function renderOB(m){
     const obG=parseFloat(document.getElementById('ob-goal-input')?.value)||0;
     if(obG>0){const periods=loadConfig().schedType==='4Q'?4:3;const cc=cfColors();
         [['ob-sync-p1',p1.loadedUnits,obG/periods],['ob-sync-p2',p2.loadedUnits,obG/periods*2],['ob-sync-p3',p3.loadedUnits,obG],['ob-sync-total',f.loadedUnits,obG]].forEach(([id,act,tgt])=>{
-            const el=document.getElementById(id);if(!el)return;if(!act||act<=0){el.style.background='';return;}el.style.background=act>=tgt?cc.good:act>=tgt*0.95?cc.warn:cc.bad;});
+            const el=document.getElementById(id);if(!el)return;if(!act||act<=0){el.style.background='';el.style.color='';return;}el.style.background=act>=tgt?cc.good:act>=tgt*0.95?cc.warn:cc.bad;el.style.color=cc.txt||'';});
     }
     setEl('ob-pick-p1',fmt(p1.pickUnits));setEl('ob-pick-p2',fmt(p2.pickUnits));setEl('ob-pick-p3',fmt(p3.pickUnits));setEl('ob-pick-total',fmt(f.pickUnits));
     setEl('ob-cases-p1',fmt(p1.pickUnits));setEl('ob-cases-p2',fmt(p2.pickUnits));setEl('ob-cases-p3',fmt(p3.pickUnits));setEl('ob-cases-total',fmt(f.pickUnits));
@@ -1451,6 +1451,8 @@ function buildHTML(){return `
 <div class="goal-card sort-card" id="sort-summary-card"><div class="goal-header"><span class="goal-title">Sort</span><span class="goal-pct" id="sum-sort-pct">\u2014</span></div><div class="goal-progress"><div class="goal-progress-bar green" id="sort-progress-bar" style="width:0%"></div></div><div class="goal-stats"><span>Goal <strong id="sum-sort-goal">\u2014</strong></span><span>Actual <strong id="sum-sort-actual">\u2014</strong></span><span>Remaining <strong id="sum-sort-remaining">\u2014</strong></span></div><div class="goal-stats"><span>\u25B2 <strong id="sum-sort-rate">\u2014</strong> Rate</span><span>\u2713 <strong id="sum-sort-cplh">\u2014</strong> CPLH</span></div></div>
 </div>
 <div class="icqa-panel" id="icqa-panel" style="background:#fff;border:2px solid #000;border-radius:4px;padding:10px 14px;">
+<input type="hidden" id="icqa-ro-target" value="">
+<input type="hidden" id="icqa-dc-target" value="70">
 <h3 style="font-size:11px;font-weight:700;margin-bottom:6px;">ICQA</h3>
 <div id="icqa-gca-banner" style="background:#757575;border:2px solid #000;border-radius:4px;padding:10px 14px;margin-bottom:10px;">
 <div style="display:flex;align-items:center;justify-content:space-between;">
@@ -1541,8 +1543,6 @@ function buildHTML(){return `
 </tbody></table></div>
 <div class="sort-tgt" style="margin-top:6px;padding-top:6px;border-top:2px solid #000;"><h4 style="color:#333;">SITE</h4><table class="target-table"><tbody>
 <tr><td>SITE CPLH TARGET</td><td><input type="number" id="site-cplh-target" class="target-input" step="0.01"></td><td><span id="site-cplh-pct">\u2014</span></td></tr>
-<tr><td>ICQA RO TARGET</td><td><input type="number" id="icqa-ro-target" class="target-input" step="1"></td><td></td></tr>
-<tr><td>ICQA DC% TARGET</td><td><input type="number" id="icqa-dc-target" class="target-input" step="1" value="70"></td><td></td></tr>
 </tbody></table></div>
 </div>
 </div>
@@ -2037,7 +2037,7 @@ function initBoard(){
     document.getElementById('shift-select').value=config.shiftType;
     // Load targets
     const t=config.targets||{};
-    ['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','site-cplh-target','icqa-ro-target','icqa-dc-target'].forEach(id=>{const el=document.getElementById(id);if(el&&t[id])el.value=t[id];});
+    ['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','site-cplh-target'].forEach(id=>{const el=document.getElementById(id);if(el&&t[id])el.value=t[id];});
     // Load settings
     const ds=config.days,ns=config.nights;
     ['ds-full-sh','ds-full-sm','ds-full-eh','ds-full-em','ds-p1-sh','ds-p1-sm','ds-p1-eh','ds-p1-em','ds-p2-sh','ds-p2-sm','ds-p2-eh','ds-p2-em','ds-p3-sh','ds-p3-sm','ds-p3-eh','ds-p3-em'].forEach((id,i)=>{const vals=[ds.full.sh,ds.full.sm,ds.full.eh,ds.full.em,ds.p1.sh,ds.p1.sm,ds.p1.eh,ds.p1.em,ds.p2.sh,ds.p2.sm,ds.p2.eh,ds.p2.em,ds.p3.sh,ds.p3.sm,ds.p3.eh,ds.p3.em];const el=document.getElementById(id);if(el)el.value=vals[i];});
@@ -2243,7 +2243,7 @@ async function doFetch(){
 }
 
 function saveTargetsUI(){
-    const t={};['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','site-cplh-target','icqa-ro-target','icqa-dc-target'].forEach(id=>{t[id]=document.getElementById(id)?.value||'';});
+    const t={};['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','site-cplh-target'].forEach(id=>{t[id]=document.getElementById(id)?.value||'';});
     config.targets=t;saveConfig(config);
     // Save LP values separately
     const lp={ibCplh:document.getElementById('lp-ib-cplh')?.value||'',obCplh:document.getElementById('lp-ob-cplh')?.value||'',siteCplh:document.getElementById('lp-site-cplh')?.value||''};
