@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      13.5.3
+// @version      13.5.5
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -207,7 +207,7 @@ async function fetchTOTPpr(site,startDate,sched,shiftType){
 // makes (same start/end window as the rest of the board, no extra request needed).
 // Week needs one extra fetch, with the report's own Week span.
 function buildPPRUrlWeek(site,weekStartDate){
-    return'/reports/processPathRollup?reportFormat=HTML&warehouseId='+site+'&spanType=Week&startDateWeek='+encodeURIComponent(fmtDate(weekStartDate))+'&_adjustPlanHours=on&_hideEmptyLineItems=on&employmentType=AllEmployees';
+    return'/reports/processPathRollup?reportFormat=HTML&warehouseId='+site+'&spanType=Week&startDateWeek='+encodeURIComponent(fmtDate(weekStartDate))+'&_adjustPlanHours=on&employmentType=AllEmployees';
 }
 // Function Rollup report scoped to the report's own Week span (used for ICQA DC% week view)
 function buildFnUrlWeek(site,pid,weekStartDate){
@@ -1435,6 +1435,13 @@ function buildHTML(){return `
 <tr class="row-cplh"><td class="bold">CPLH</td><td id="sort-cplh-p1">\u2014</td><td id="sort-cplh-p2">\u2014</td><td id="sort-cplh-p3">\u2014</td><td id="sort-cplh-total">\u2014</td></tr>
 </tbody></table></section>
 
+<div class="charts-panel">
+<div class="chart-card"><h3>Stow (Planned vs Actual) + Rate</h3><canvas id="chart-stow" height="170"></canvas></div>
+<div class="chart-card"><h3>CPLH + Direct vs Indirect</h3><canvas id="chart-cplh-ib" height="170"></canvas></div>
+<div class="chart-card"><h3>Picked (Plan vs Actual) + Rate</h3><canvas id="chart-pick" height="170"></canvas></div>
+<div class="chart-card"><h3>Picked vs Loaded</h3><canvas id="chart-loaded" height="170"></canvas></div>
+</div>
+
 </div><!-- sync-left -->
 
 <div class="sync-right">
@@ -1538,11 +1545,6 @@ function buildHTML(){return `
 <tr><td>ICQA DC% TARGET</td><td><input type="number" id="icqa-dc-target" class="target-input" step="1" value="70"></td><td></td></tr>
 </tbody></table></div>
 </div>
-<div class="charts-panel">
-<div class="chart-card"><h3>Stow (Planned vs Actual) + Rate</h3><canvas id="chart-stow" height="170"></canvas></div>
-<div class="chart-card"><h3>CPLH + Direct vs Indirect</h3><canvas id="chart-cplh-ib" height="170"></canvas></div>
-<div class="chart-card"><h3>Picked (Plan vs Actual) + Rate</h3><canvas id="chart-pick" height="170"></canvas></div>
-<div class="chart-card"><h3>Picked vs Loaded</h3><canvas id="chart-loaded" height="170"></canvas></div>
 </div>
 </div><!-- sync-right -->
 </div></main>
