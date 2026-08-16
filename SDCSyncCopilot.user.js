@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      13.5.9
+// @version      13.6.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -1083,9 +1083,9 @@ function renderIB(m){
     setEl('ib-sync-p1',fmt(p1.totalStow));setEl('ib-sync-p2',fmt(p2.totalStow));setEl('ib-sync-p3',fmt(p3.totalStow));setEl('ib-sync-total',fmt(f.totalStow));
     // Conditional format sync metrics cells vs targets
     const ibG=parseFloat(document.getElementById('ib-goal-input')?.value)||0;
-    if(ibG>0){const periods=loadConfig().schedType==='4Q'?4:3;const cc=cfColors();
+    if(ibG>0){const periods=loadConfig().schedType==='4Q'?4:3;const dc=cfDensityColors();
         [['ib-sync-p1',p1.totalStow,ibG/periods],['ib-sync-p2',p2.totalStow,ibG/periods*2],['ib-sync-p3',p3.totalStow,ibG],['ib-sync-total',f.totalStow,ibG]].forEach(([id,act,tgt])=>{
-            const el=document.getElementById(id);if(!el)return;if(!act||act<=0){el.style.background='';el.style.color='';return;}el.style.background=act>=tgt?cc.good:act>=tgt*0.95?cc.warn:cc.bad;el.style.color=cc.txt||'';});
+            const el=document.getElementById(id);if(!el)return;if(!act||act<=0){el.style.background='';el.style.color='';return;}if(act>=tgt){el.style.background=dc.goodBg;el.style.color=dc.goodTxt;}else if(act>=tgt*0.95){el.style.background=dc.warnBg;el.style.color=dc.warnTxt;}else{el.style.background=dc.badBg;el.style.color=dc.badTxt;}});
     }
     setEl('ib-cases-p1',fmt(p1.stowUnits));setEl('ib-cases-p2',fmt(p2.stowUnits));setEl('ib-cases-p3',fmt(p3.stowUnits));setEl('ib-cases-total',fmt(f.stowUnits));
     setEl('ib-pallets-p1',fmt(p1.palletUnits||0));setEl('ib-pallets-p2',fmt(p2.palletUnits||0));setEl('ib-pallets-p3',fmt(p3.palletUnits||0));setEl('ib-pallets-total',fmt(f.palletUnits||0));
@@ -1113,9 +1113,9 @@ function renderOB(m){
     setEl('ob-sync-p1',fmt(p1.loadedUnits));setEl('ob-sync-p2',fmt(p2.loadedUnits));setEl('ob-sync-p3',fmt(p3.loadedUnits));setEl('ob-sync-total',fmt(f.loadedUnits));
     // Conditional format OB sync metrics cells vs targets (based on loaded)
     const obG=parseFloat(document.getElementById('ob-goal-input')?.value)||0;
-    if(obG>0){const periods=loadConfig().schedType==='4Q'?4:3;const cc=cfColors();
+    if(obG>0){const periods=loadConfig().schedType==='4Q'?4:3;const dc=cfDensityColors();
         [['ob-sync-p1',p1.loadedUnits,obG/periods],['ob-sync-p2',p2.loadedUnits,obG/periods*2],['ob-sync-p3',p3.loadedUnits,obG],['ob-sync-total',f.loadedUnits,obG]].forEach(([id,act,tgt])=>{
-            const el=document.getElementById(id);if(!el)return;if(!act||act<=0){el.style.background='';el.style.color='';return;}el.style.background=act>=tgt?cc.good:act>=tgt*0.95?cc.warn:cc.bad;el.style.color=cc.txt||'';});
+            const el=document.getElementById(id);if(!el)return;if(!act||act<=0){el.style.background='';el.style.color='';return;}if(act>=tgt){el.style.background=dc.goodBg;el.style.color=dc.goodTxt;}else if(act>=tgt*0.95){el.style.background=dc.warnBg;el.style.color=dc.warnTxt;}else{el.style.background=dc.badBg;el.style.color=dc.badTxt;}});
     }
     setEl('ob-pick-p1',fmt(p1.pickUnits));setEl('ob-pick-p2',fmt(p2.pickUnits));setEl('ob-pick-p3',fmt(p3.pickUnits));setEl('ob-pick-total',fmt(f.pickUnits));
     setEl('ob-cases-p1',fmt(p1.pickUnits));setEl('ob-cases-p2',fmt(p2.pickUnits));setEl('ob-cases-p3',fmt(p3.pickUnits));setEl('ob-cases-total',fmt(f.pickUnits));
