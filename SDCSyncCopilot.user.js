@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      13.6.1
+// @version      13.6.2
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -1703,7 +1703,7 @@ function buildCSS2(){return `
 #sb-root.dark-mode .goal-stats,#sb-root.dark-mode .goal-stats strong{color:#e0e0e0!important;}
 #sb-root.dark-mode .fclm-timestamp,#sb-root.dark-mode .meta-text{color:#aaa!important;}
 #sb-root.dark-mode .row-target td{background:rgba(255,235,59,0.15)!important;}
-#sb-root.dark-mode .row-sync td{background:rgba(255,183,77,0.12)!important;}
+#sb-root.dark-mode .row-sync td{}
 #sb-root.dark-mode .goal-progress{background:#333!important;}
 #sb-root.dark-mode .nav-tab{color:#aaa!important;background:#1a1a2e!important;}
 #sb-root.dark-mode .nav-tab.active{color:#fff!important;background:#2e7d32!important;}
