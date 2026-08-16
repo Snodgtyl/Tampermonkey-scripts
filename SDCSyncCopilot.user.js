@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      13.6.0
+// @version      13.6.1
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -797,7 +797,7 @@ function cfColors(){
 }
 function cfDensityColors(){
     const dk=document.getElementById('sb-root')?.classList.contains('dark-mode');
-    return dk?{goodBg:'#1b8a4a',goodTxt:'#fff',warnBg:'#c77d00',warnTxt:'#fff',badBg:'#d32f2f',badTxt:'#fff'}:{goodBg:'rgba(46,125,50,0.12)',goodTxt:'#2e7d32',warnBg:'rgba(230,81,0,0.1)',warnTxt:'#e65100',badBg:'rgba(198,40,40,0.1)',badTxt:'#c62828'};
+    return dk?{goodBg:'#4caf50',goodTxt:'#fff',warnBg:'#ff9800',warnTxt:'#fff',badBg:'#f44336',badTxt:'#fff'}:{goodBg:'rgba(46,125,50,0.12)',goodTxt:'#2e7d32',warnBg:'rgba(230,81,0,0.1)',warnTxt:'#e65100',badBg:'rgba(198,40,40,0.1)',badTxt:'#c62828'};
 }
 
 function renderLPPercents(metrics){
