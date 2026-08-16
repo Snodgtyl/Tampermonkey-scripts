@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      13.5.5
+// @version      13.5.6
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -1694,7 +1694,7 @@ function buildCSS2(){return `
 /* Dark Mode */
 #sb-root.dark-mode{background:#1a1a2e!important;color:#e0e0e0!important;}
 #sb-root.dark-mode .topnav{background:#16213e!important;border-color:#333!important;}
-#sb-root.dark-mode .metrics-section,#sb-root.dark-mode .goal-card,#sb-root.dark-mode .site-cplh-panel,#sb-root.dark-mode .targets-panel,#sb-root.dark-mode .chart-card,#sb-root.dark-mode .hourly-section,#sb-root.dark-mode #bb-24hr-panel{background:#0f3460!important;border-color:#444!important;color:#e0e0e0!important;}
+#sb-root.dark-mode .metrics-section,#sb-root.dark-mode .goal-card,#sb-root.dark-mode .site-cplh-panel,#sb-root.dark-mode .icqa-panel,#sb-root.dark-mode .targets-panel,#sb-root.dark-mode .chart-card,#sb-root.dark-mode .hourly-section,#sb-root.dark-mode #bb-24hr-panel{background:#0f3460!important;border-color:#444!important;color:#e0e0e0!important;}
 #sb-root.dark-mode .metrics-table th,#sb-root.dark-mode .metrics-table td,#sb-root.dark-mode .target-table td,#sb-root.dark-mode .actions-table th,#sb-root.dark-mode .actions-table td{color:#e0e0e0!important;border-color:#444!important;}
 #sb-root.dark-mode .metrics-table td{border-bottom-color:#333!important;}
 #sb-root.dark-mode .section-header h2,#sb-root.dark-mode .bold,#sb-root.dark-mode h3,#sb-root.dark-mode h4,#sb-root.dark-mode .panel-title,#sb-root.dark-mode .site-title{color:#e0e0e0!important;}
@@ -1724,10 +1724,10 @@ function buildCSS2(){return `
 #sb-root.dark-mode .pct-bad{color:#ff5252!important;}
 #sb-root.dark-mode span[style*="color"]{color:inherit!important;}
 #sb-root.dark-mode .table-input{background:#1a1a2e!important;color:#ffd740!important;border-color:#666!important;}
-#sb-root.dark-mode .goal-card *,#sb-root.dark-mode .site-cplh-panel *,#sb-root.dark-mode .targets-panel *,#sb-root.dark-mode #bb-24hr-panel *{color:#e0e0e0!important;}
-#sb-root.dark-mode .goal-card .pct-good,#sb-root.dark-mode .targets-panel .pct-good{color:#69f0ae!important;}
-#sb-root.dark-mode .goal-card .pct-warn,#sb-root.dark-mode .targets-panel .pct-warn{color:#ffd740!important;}
-#sb-root.dark-mode .goal-card .pct-bad,#sb-root.dark-mode .targets-panel .pct-bad{color:#ff5252!important;}
+#sb-root.dark-mode .goal-card *,#sb-root.dark-mode .site-cplh-panel *,#sb-root.dark-mode .icqa-panel *,#sb-root.dark-mode .targets-panel *,#sb-root.dark-mode #bb-24hr-panel *{color:#e0e0e0!important;}
+#sb-root.dark-mode .goal-card .pct-good,#sb-root.dark-mode .targets-panel .pct-good,#sb-root.dark-mode .icqa-panel .pct-good{color:#69f0ae!important;}
+#sb-root.dark-mode .goal-card .pct-warn,#sb-root.dark-mode .targets-panel .pct-warn,#sb-root.dark-mode .icqa-panel .pct-warn{color:#ffd740!important;}
+#sb-root.dark-mode .goal-card .pct-bad,#sb-root.dark-mode .targets-panel .pct-bad,#sb-root.dark-mode .icqa-panel .pct-bad{color:#ff5252!important;}
 #sb-root.dark-mode .goal-progress-bar.green{background:#4caf50!important;}
 #sb-root.dark-mode .goal-progress-bar.amber{background:#ff9800!important;}
 #sb-root.dark-mode .goal-progress-bar.red{background:#f44336!important;}
