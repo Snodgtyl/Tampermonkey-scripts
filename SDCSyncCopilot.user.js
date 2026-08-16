@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      13.5.0
+// @version      13.5.1
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -275,26 +275,51 @@ function calcDCPercent(html){
     const doc=new DOMParser().parseFromString(html,'text/html');
     const byName=parseFunctionHoursByName(doc,DC_PERCENT_FUNCTIONS);
     const dcHours=DC_PERCENT_FUNCTIONS.reduce((s,n)=>s+(byName[n]||0),0);
-    // Grand total: find the LARGEST "Total Paid Hours" value among all rows that contain
-    // "Total" text. The grand total is always the sum of all function totals, so it's
-    // guaranteed to be the largest value. This avoids any DOM structure guessing.
+    // Grand total = sum of ALL per-function "Total" rows' hours. Since the grand total
+    // row's DOM structure is unreliable (colspan, varying positions), and we already know
+    // how to find per-function Total rows, just sum them all up — this equals the grand
+    // total by definition. Reuse parseFunctionHoursByName logic but for ALL functions.
     let totalHours=0;
     const allRows=doc.querySelectorAll('tr');
-    for(let i=0;i<allRows.length;i++){
-        const row=allRows[i];
-        const tds=row.querySelectorAll('td');
-        if(tds.length===0)continue;
-        let hasTotal=false;
-        for(const td of tds){
-            if(td.textContent.trim()==='Total')hasTotal=true;
+    let currentFn=null;
+    let functionNames=new Set();
+    // First pass: discover all function names (they appear as <a> links)
+    for(const row of allRows){
+        const links=row.querySelectorAll('a');
+        for(const a of links){
+            const name=a.textContent.trim();
+            if(name&&name!=='Total'&&!name.startsWith('http'))functionNames.add(name);
         }
-        if(hasTotal){
+    }
+    // Second pass: sum all per-function Total row hours
+    let currentFnAll=null;
+    for(const row of allRows){
+        const rowText=row.textContent;
+        for(const name of functionNames){
+            if(rowText.indexOf(name)!==-1){
+                const links=row.querySelectorAll('a');
+                for(const a of links){if(a.textContent.trim()===name){currentFnAll=name;break;}}
+                if(currentFnAll===name)break;
+                const tds=row.querySelectorAll('td');
+                for(const td of tds){if(td.textContent.trim()===name){currentFnAll=name;break;}}
+                if(currentFnAll===name)break;
+            }
+        }
+        if(currentFnAll){
+            const tds=row.querySelectorAll('td');
+            let isTotalRow=false;
             for(const td of tds){
-                if(td.className.indexOf('numeric')!==-1){
-                    const val=parseFloat(td.textContent.trim().replace(/,/g,''))||0;
-                    if(val>totalHours)totalHours=val;
-                    break; // only check first numeric cell (Total Paid Hours column)
+                const t=td.textContent.trim();
+                if(t==='Total'&&td.className.indexOf('numeric')===-1){isTotalRow=true;break;}
+            }
+            if(isTotalRow){
+                for(const td of tds){
+                    if(td.className.indexOf('numeric')!==-1){
+                        const val=parseFloat(td.textContent.trim().replace(/,/g,''))||0;
+                        if(val>0){totalHours+=val;break;}
+                    }
                 }
+                currentFnAll=null;
             }
         }
     }
