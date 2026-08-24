@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      13.7.0
+// @version      13.8.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -38,7 +38,7 @@ const SITE_SCHEDULES = {
     QXX6: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:18,sm:30,eh:6,em:15},p1:{sh:19,sm:0,eh:22,em:30},p2:{sh:22,sm:31,eh:2,em:0},p3:{sh:2,sm:0,eh:5,em:30}} },
     SAV7: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:18,sm:30,eh:6,em:15},p1:{sh:19,sm:0,eh:22,em:30},p2:{sh:22,sm:31,eh:2,em:0},p3:{sh:2,sm:0,eh:5,em:30}} },
 };
-const PROCESS_IDS = { stow:'1003035', palletStow:'1003041', pick:'1003065', sort:'1003009', obDock:'1003021', icqa:'1003030', vretPack:'1003056', vretPick:'1003034' };
+const PROCESS_IDS = { stow:'1003035', palletStow:'1003041', pick:'1003065', sort:'1003009', obDock:'1003021', icqa:'1003030', vretPack:'1003056', vretPick:'1003034', rsr:'01003012' };
 // ICQA DC% (Direct Count %):
 //   numerator   = "Library Deep" (Direct Count) functions: SBC - Library Deep + Other Library Deep
 //   denominator = report GRAND TOTAL paid hours (all functions), read from summary tfoot total row
@@ -155,7 +155,7 @@ async function fetchPeriod(site,startDate,sched){
     let sDate=new Date(startDate);
     if(sh<12&&startDate.getHours()>=12){sDate.setDate(sDate.getDate()+1);}
     let eDate=new Date(sDate);if(eh<sh)eDate.setDate(eDate.getDate()+1);
-    const urls={ppr:buildPPRUrl(site,sDate,sh,sm,eDate,eh,em),stow:buildFnUrl(site,PROCESS_IDS.stow,sDate,sh,sm,eDate,eh,em),palletStow:buildFnUrl(site,PROCESS_IDS.palletStow,sDate,sh,sm,eDate,eh,em),pick:buildFnUrl(site,PROCESS_IDS.pick,sDate,sh,sm,eDate,eh,em),sort:buildFnUrl(site,PROCESS_IDS.sort,sDate,sh,sm,eDate,eh,em),obDock:buildFnUrl(site,PROCESS_IDS.obDock,sDate,sh,sm,eDate,eh,em)};
+    const urls={ppr:buildPPRUrl(site,sDate,sh,sm,eDate,eh,em),stow:buildFnUrl(site,PROCESS_IDS.stow,sDate,sh,sm,eDate,eh,em),palletStow:buildFnUrl(site,PROCESS_IDS.palletStow,sDate,sh,sm,eDate,eh,em),pick:buildFnUrl(site,PROCESS_IDS.pick,sDate,sh,sm,eDate,eh,em),sort:buildFnUrl(site,PROCESS_IDS.sort,sDate,sh,sm,eDate,eh,em),obDock:buildFnUrl(site,PROCESS_IDS.obDock,sDate,sh,sm,eDate,eh,em),rsr:buildFnUrl(site,PROCESS_IDS.rsr,sDate,sh,sm,eDate,eh,em)};
     const res={};
     await Promise.all(Object.entries(urls).map(async([k,u])=>{try{const h=await fetchHTML(u);res[k]=k==='ppr'?parsePPR(h):parseFnRollup(h);}catch(e){console.warn('[SB]',k,e.message);res[k]=k==='ppr'?{ibPlannedHrs:0,ibActualHrs:0,obPlannedHrs:0,obActualHrs:0,daTransferHrs:0,daTransferPlan:0,caseStowReserveHrs:0,throughputVol:0,throughputHrs:0,totHrs:0}:{totalUnits:0,directHours:0,rate:0,headcount:0};}}));
     return res;
@@ -1059,7 +1059,7 @@ function processData(raw){
 
     ['full','p1','p2','p3'].forEach(p=>{
         const d=raw[p];if(!d)return;
-        const stow=d.stow||{},pStow=d.palletStow||{},pick=d.pick||{},obDock=d.obDock||{},sort=d.sort||{},ppr=d.ppr||{};
+        const stow=d.stow||{},pStow=d.palletStow||{},pick=d.pick||{},obDock=d.obDock||{},sort=d.sort||{},ppr=d.ppr||{},rsr=d.rsr||{};
         // IB: total stow = case transfer in (stow units) + pallet transfer in CASE count
         const palletCases=pStow.palletCases||0;
         const ibU=(stow.totalUnits||0)+palletCases;
@@ -1077,6 +1077,9 @@ function processData(raw){
             directHours:ibDH,indirectHours:ibIndirect,totalHours:ibTotalHrs,
             directPct:ibTotalHrs>0?(ibDH/ibTotalHrs)*100:0,indirectPct:ibTotalHrs>0?(ibIndirect/ibTotalHrs)*100:0,
             rate:stow.rate||0,headcount:(stow.headcount||0)+(pStow.headcount||0),
+            // RSR (Receive Rate) = IDRT JPH Total (process 01003012), read straight off the fn-rollup
+            // total row's JPH column (parseFnRollup.rate). Per period + shift-overall (full window).
+            rsrRate:rsr.rate||0,
             cplh:cplhHrs>0?ibU/cplhHrs:0,
             density:(stow.caseUnits||0)>0?(stow.eachUnits||0)/(stow.caseUnits||1):0,
             directHC:dur>0?ibDH/dur:0,indirectHC:dur>0?ibIndirect/dur:0,
@@ -1091,6 +1094,9 @@ function processData(raw){
         // Loaded = Fluid Load Case jobs + Fluid Load Tote jobs
         const loadedUnits=obDock.fluidLoadJobs||0;
         m.ob[p]={pickUnits:pick.totalUnits||0,loadedUnits:loadedUnits,
+            // periodPick / periodLoaded stay per-period (that time window only). syncLoaded is the
+            // cumulative running total used ONLY by the OB Sync Metrics row.
+            periodPick:pick.totalUnits||0,periodLoaded:loadedUnits,syncLoaded:loadedUnits,
             directHours:obPickDH,indirectHours:obIndirect,totalHours:obTotalHrs,
             directPct:obTotalHrs>0?(obPickDH/obTotalHrs)*100:0,indirectPct:obTotalHrs>0?(obIndirect/obTotalHrs)*100:0,
             pickRate:pick.rate||0,pickHC:pick.headcount||0,dockHC:obDock.headcount||0,
@@ -1101,17 +1107,18 @@ function processData(raw){
             pctToOP:daPlan>0?(daHrs/daPlan)*100:0};
         m.sort[p]={totalUnits:sort.totalUnits||0,directHours:sort.directHours||0,totalHours:sort.directHours||0,rate:sort.rate||0,headcount:sort.headcount||0,cplh:(sort.directHours||0)>0?sort.totalUnits/sort.directHours:0};
     });
-    // Cumulative — only for totalStow (sync metrics). Everything else stays per-period raw.
+    // Cumulative running totals for the SYNC METRICS rows ONLY (IB totalStow, OB syncLoaded,
+    // Sort totalUnits). The per-period rows (CTI/PTI, Pick - Total, Cases Picked, Loaded per
+    // Period) keep their own single-window values (periodStow / periodPick / periodLoaded) and
+    // are never overwritten here.
     if(m.ib.p1&&m.ib.p2&&(raw.p2?.stow?.totalUnits>0||raw.p2?.palletStow?.palletCases>0)){
         m.ib.p2.totalStow=(m.ib.p1.totalStow||0)+((raw.p2?.stow?.totalUnits||0)+(raw.p2?.palletStow?.palletCases||0));
-        m.ob.p2.pickUnits=(m.ob.p1.pickUnits||0)+(raw.p2?.pick?.totalUnits||0);
-        m.ob.p2.loadedUnits=(m.ob.p1.loadedUnits||0)+(raw.p2?.obDock?.fluidLoadJobs||0);
+        m.ob.p2.syncLoaded=(m.ob.p1.syncLoaded||0)+(raw.p2?.obDock?.fluidLoadJobs||0);
         m.sort.p2.totalUnits=(m.sort.p1.totalUnits||0)+(raw.p2?.sort?.totalUnits||0);
     }
     if(m.ib.p2&&m.ib.p3&&(raw.p3?.stow?.totalUnits>0||raw.p3?.palletStow?.palletCases>0||raw.p3?.pick?.totalUnits>0)){
         m.ib.p3.totalStow=m.ib.full?.totalStow||(m.ib.p2.totalStow||0)+((raw.p3?.stow?.totalUnits||0)+(raw.p3?.palletStow?.palletCases||0));
-        m.ob.p3.pickUnits=m.ob.full?.pickUnits||(m.ob.p2.pickUnits||0)+(raw.p3?.pick?.totalUnits||0);
-        m.ob.p3.loadedUnits=m.ob.full?.loadedUnits||(m.ob.p2.loadedUnits||0)+(raw.p3?.obDock?.fluidLoadJobs||0);
+        m.ob.p3.syncLoaded=(m.ob.full?.loadedUnits)||((m.ob.p2.syncLoaded||0)+(raw.p3?.obDock?.fluidLoadJobs||0));
         m.sort.p3.totalUnits=m.sort.full?.totalUnits||(m.sort.p2.totalUnits||0)+(raw.p3?.sort?.totalUnits||0);
     }
     return m;
@@ -1173,6 +1180,8 @@ function renderIB(m){
     // CTI/PTI per period = ONLY that period's production (not the cumulative Sync Metrics running total)
     setEl('ib-cti-p1',fmt(p1.periodStow!=null?p1.periodStow:p1.totalStow));setEl('ib-cti-p2',fmt(p2.periodStow!=null?p2.periodStow:p2.totalStow));setEl('ib-cti-p3',fmt(p3.periodStow!=null?p3.periodStow:p3.totalStow));setEl('ib-cti-total',fmt(f.totalStow));
     setEl('ib-rate-p1',fmt(p1.rate,1));setEl('ib-rate-p2',fmt(p2.rate,1));setEl('ib-rate-p3',fmt(p3.rate,1));setEl('ib-rate-total',fmt(f.rate,1));
+    // RSR (Receive Rate) = IDRT JPH Total; per period + shift-overall (full). Blank when 0.
+    setEl('ib-rsr-p1',p1.rsrRate>0?fmt(p1.rsrRate,1):'\u2014');setEl('ib-rsr-p2',p2.rsrRate>0?fmt(p2.rsrRate,1):'\u2014');setEl('ib-rsr-p3',p3.rsrRate>0?fmt(p3.rsrRate,1):'\u2014');setEl('ib-rsr-total',f.rsrRate>0?fmt(f.rsrRate,1):'\u2014');
     // IB Density
     setEl('ib-density-p1',p1.density>0?fmt(p1.density,2):'\u2014');setEl('ib-density-p2',p2.density>0?fmt(p2.density,2):'\u2014');setEl('ib-density-p3',p3.density>0?fmt(p3.density,2):'\u2014');setEl('ib-density-total',f.density>0?fmt(f.density,2):'\u2014');
     // Conditional format IB density vs planned
@@ -1192,15 +1201,24 @@ function renderIB(m){
 }
 function renderOB(m){
     const p1=m.ob.p1||{},p2=m.ob.p2||{},p3=m.ob.p3||{},f=m.ob.full||{};
-    setEl('ob-sync-p1',fmt(p1.loadedUnits));setEl('ob-sync-p2',fmt(p2.loadedUnits));setEl('ob-sync-p3',fmt(p3.loadedUnits));setEl('ob-sync-total',fmt(f.loadedUnits));
+    // Sync Metrics row = cumulative running total (syncLoaded). Total column = whole-shift loaded.
+    const sync1=p1.syncLoaded!=null?p1.syncLoaded:p1.loadedUnits;
+    const sync2=p2.syncLoaded!=null?p2.syncLoaded:p2.loadedUnits;
+    const sync3=p3.syncLoaded!=null?p3.syncLoaded:p3.loadedUnits;
+    const syncT=f.loadedUnits;
+    setEl('ob-sync-p1',fmt(sync1));setEl('ob-sync-p2',fmt(sync2));setEl('ob-sync-p3',fmt(sync3));setEl('ob-sync-total',fmt(syncT));
     // Conditional format OB sync metrics cells vs targets (based on loaded)
     const obG=parseFloat(document.getElementById('ob-goal-input')?.value)||0;
     if(obG>0){const periods=loadConfig().schedType==='4Q'?4:3;const dc=cfDensityColors();
-        [['ob-sync-p1',p1.loadedUnits,obG/periods],['ob-sync-p2',p2.loadedUnits,obG/periods*2],['ob-sync-p3',p3.loadedUnits,obG],['ob-sync-total',f.loadedUnits,obG]].forEach(([id,act,tgt])=>{
+        [['ob-sync-p1',sync1,obG/periods],['ob-sync-p2',sync2,obG/periods*2],['ob-sync-p3',sync3,obG],['ob-sync-total',syncT,obG]].forEach(([id,act,tgt])=>{
             const el=document.getElementById(id);if(!el)return;if(!act||act<=0){el.style.background='';el.style.color='';return;}if(act>=tgt){el.style.background=dc.goodBg;el.style.color=dc.goodTxt;}else if(act>=tgt*0.95){el.style.background=dc.warnBg;el.style.color=dc.warnTxt;}else{el.style.background=dc.badBg;el.style.color=dc.badTxt;}});
     }
-    setEl('ob-pick-p1',fmt(p1.pickUnits));setEl('ob-pick-p2',fmt(p2.pickUnits));setEl('ob-pick-p3',fmt(p3.pickUnits));setEl('ob-pick-total',fmt(f.pickUnits));
-    setEl('ob-cases-p1',fmt(p1.pickUnits));setEl('ob-cases-p2',fmt(p2.pickUnits));setEl('ob-cases-p3',fmt(p3.pickUnits));setEl('ob-cases-total',fmt(f.pickUnits));
+    // Pick - Total / Cases Picked = per-period (that time window only); Total = whole-shift pick.
+    const pick1=p1.periodPick!=null?p1.periodPick:p1.pickUnits;
+    const pick2=p2.periodPick!=null?p2.periodPick:p2.pickUnits;
+    const pick3=p3.periodPick!=null?p3.periodPick:p3.pickUnits;
+    setEl('ob-pick-p1',fmt(pick1));setEl('ob-pick-p2',fmt(pick2));setEl('ob-pick-p3',fmt(pick3));setEl('ob-pick-total',fmt(f.pickUnits));
+    setEl('ob-cases-p1',fmt(pick1));setEl('ob-cases-p2',fmt(pick2));setEl('ob-cases-p3',fmt(pick3));setEl('ob-cases-total',fmt(f.pickUnits));
     setEl('ob-rate-p1',fmt(p1.pickRate,1));setEl('ob-rate-p2',fmt(p2.pickRate,1));setEl('ob-rate-p3',fmt(p3.pickRate,1));setEl('ob-rate-total',fmt(f.pickRate,1));
     // OB Density
     setEl('ob-density-p1',p1.density>0?fmt(p1.density,2):'\u2014');setEl('ob-density-p2',p2.density>0?fmt(p2.density,2):'\u2014');setEl('ob-density-p3',p3.density>0?fmt(p3.density,2):'\u2014');setEl('ob-density-total',f.density>0?fmt(f.density,2):'\u2014');
@@ -1208,10 +1226,14 @@ function renderOB(m){
     const obDT=parseFloat(document.getElementById('ob-density-target')?.value)||0;
     if(obDT>0){const dc=cfDensityColors();['ob-density-p1','ob-density-p2','ob-density-p3','ob-density-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';el.style.color='';return;}if(v>=obDT){el.style.background=dc.goodBg;el.style.color=dc.goodTxt;}else if(v>=obDT*0.9){el.style.background=dc.warnBg;el.style.color=dc.warnTxt;}else{el.style.background=dc.badBg;el.style.color=dc.badTxt;}});}
     // Rate conditional formatting handled by renderLPPercents (LP rate)
-    setEl('ob-loadp-p1',fmt(p1.loadedUnits));setEl('ob-loadp-p2',fmt(p2.loadedUnits));setEl('ob-loadp-p3',fmt(p3.loadedUnits));setEl('ob-loadp-total',fmt(f.loadedUnits));
-    // Conditional format Loaded per Period cells vs targets
-    if(obG>0){const periods=loadConfig().schedType==='4Q'?4:3;const cc2=cfColors();
-        [['ob-loadp-p1',p1.loadedUnits,obG/periods],['ob-loadp-p2',p2.loadedUnits,obG/periods*2],['ob-loadp-p3',p3.loadedUnits,obG],['ob-loadp-total',f.loadedUnits,obG]].forEach(([id,act,tgt])=>{
+    // Loaded per Period = per-period loaded (that time window only); Total = whole-shift loaded.
+    const load1=p1.periodLoaded!=null?p1.periodLoaded:p1.loadedUnits;
+    const load2=p2.periodLoaded!=null?p2.periodLoaded:p2.loadedUnits;
+    const load3=p3.periodLoaded!=null?p3.periodLoaded:p3.loadedUnits;
+    setEl('ob-loadp-p1',fmt(load1));setEl('ob-loadp-p2',fmt(load2));setEl('ob-loadp-p3',fmt(load3));setEl('ob-loadp-total',fmt(f.loadedUnits));
+    // Conditional format Loaded per Period cells vs targets (per-period target = goal / #periods)
+    if(obG>0){const periods=loadConfig().schedType==='4Q'?4:3;const cc2=cfColors();const perTgt=obG/periods;
+        [['ob-loadp-p1',load1,perTgt],['ob-loadp-p2',load2,perTgt],['ob-loadp-p3',load3,perTgt],['ob-loadp-total',f.loadedUnits,obG]].forEach(([id,act,tgt])=>{
             const el=document.getElementById(id);if(!el)return;if(!act||act<=0){el.style.background='';return;}el.style.background=act>=tgt?cc2.good:act>=tgt*0.95?cc2.warn:cc2.bad;});
     }
     setEl('ob-dhrs-p1',fmt(p1.directHours,2));setEl('ob-dhrs-p2',fmt(p2.directHours,2));setEl('ob-dhrs-p3',fmt(p3.directHours,2));setEl('ob-dhrs-total',fmt(f.directHours,2));
@@ -1475,6 +1497,7 @@ function buildHTML(){return `
 <tr><td>&nbsp;&nbsp;Pallets Stowed</td><td id="ib-pallets-p1">0</td><td id="ib-pallets-p2">0</td><td id="ib-pallets-p3">0</td><td id="ib-pallets-total">0</td></tr>
 <tr><td>&nbsp;&nbsp;CTI/PTI per period</td><td id="ib-cti-p1">0</td><td id="ib-cti-p2">0</td><td id="ib-cti-p3">0</td><td id="ib-cti-total">0</td></tr>
 <tr class="row-rate"><td>Stow Rate <span style="margin-left:20px;font-size:11px;background:#e3f2fd;color:#1565c0;padding:2px 8px;border-radius:4px;font-weight:700;">LP Target = <span id="lp-cti-rate-display">\u2014</span></span></td><td id="ib-rate-p1">\u2014</td><td id="ib-rate-p2">\u2014</td><td id="ib-rate-p3">\u2014</td><td id="ib-rate-total">\u2014</td></tr>
+<tr><td>RSR (Receive Rate)</td><td id="ib-rsr-p1">\u2014</td><td id="ib-rsr-p2">\u2014</td><td id="ib-rsr-p3">\u2014</td><td id="ib-rsr-total">\u2014</td></tr>
 <tr><td>Density <span style="margin-left:20px;font-size:11px;background:#e3f2fd;color:#1565c0;padding:2px 8px;border-radius:4px;font-weight:700;">LP Target = <span id="lp-ib-density-display">\u2014</span></span></td><td id="ib-density-p1">\u2014</td><td id="ib-density-p2">\u2014</td><td id="ib-density-p3">\u2014</td><td id="ib-density-total">\u2014</td></tr>
 <tr><td>Direct Hours</td><td id="ib-dhrs-p1">0</td><td id="ib-dhrs-p2">0</td><td id="ib-dhrs-p3">0</td><td id="ib-dhrs-total">0</td></tr>
 <tr><td>&nbsp;&nbsp;Direct %</td><td id="ib-dpct-p1">\u2014</td><td id="ib-dpct-p2">\u2014</td><td id="ib-dpct-p3">\u2014</td><td id="ib-dpct-total">\u2014</td></tr>
@@ -1843,10 +1866,13 @@ function buildCSS2(){return `
 #sb-root.dark-mode .vrets-kpi,#sb-root.dark-mode .vrets-section{background:#0f3460!important;border-color:#444!important;color:#e0e0e0!important;}
 #sb-root.dark-mode .vrets-kpi .k-label,#sb-root.dark-mode .vrets-kpi .k-sub,#sb-root.dark-mode .vrets-section h3{color:#e0e0e0!important;}
 #sb-root.dark-mode .vrets-section .metrics-table th,#sb-root.dark-mode .vrets-section .metrics-table td{color:#e0e0e0!important;border-color:#444!important;}
+/* Compact VRETs panel (Sync tab) dark-mode: readable badge + darker progress track */
+#sb-root.dark-mode #vret-panel h3 span{background:#5a3a00!important;color:#ffcc80!important;}
+#sb-root.dark-mode .vrets-bar{background:#2a2a45!important;}
 /* Dark Mode */
 #sb-root.dark-mode{background:#1a1a2e!important;color:#e0e0e0!important;}
 #sb-root.dark-mode .topnav{background:#16213e!important;border-color:#333!important;}
-#sb-root.dark-mode .metrics-section,#sb-root.dark-mode .goal-card,#sb-root.dark-mode .site-cplh-panel,#sb-root.dark-mode .icqa-panel,#sb-root.dark-mode .targets-panel,#sb-root.dark-mode .chart-card,#sb-root.dark-mode .hourly-section,#sb-root.dark-mode #bb-24hr-panel{background:#0f3460!important;border-color:#444!important;color:#e0e0e0!important;}
+#sb-root.dark-mode .metrics-section,#sb-root.dark-mode .goal-card,#sb-root.dark-mode .site-cplh-panel,#sb-root.dark-mode .icqa-panel,#sb-root.dark-mode .targets-panel,#sb-root.dark-mode .chart-card,#sb-root.dark-mode .hourly-section,#sb-root.dark-mode #bb-24hr-panel,#sb-root.dark-mode #vret-panel{background:#0f3460!important;border-color:#444!important;color:#e0e0e0!important;}
 #sb-root.dark-mode .metrics-table th,#sb-root.dark-mode .metrics-table td,#sb-root.dark-mode .target-table td,#sb-root.dark-mode .actions-table th,#sb-root.dark-mode .actions-table td{color:#e0e0e0!important;border-color:#444!important;}
 #sb-root.dark-mode .metrics-table td{border-bottom-color:#333!important;}
 #sb-root.dark-mode .section-header h2,#sb-root.dark-mode .bold,#sb-root.dark-mode h3,#sb-root.dark-mode h4,#sb-root.dark-mode .panel-title,#sb-root.dark-mode .site-title{color:#e0e0e0!important;}
@@ -1878,7 +1904,7 @@ function buildCSS2(){return `
 #sb-root.dark-mode .pct-bad{color:#ff5252!important;}
 #sb-root.dark-mode span[style*="color"]{color:inherit!important;}
 #sb-root.dark-mode .table-input{background:#1a1a2e!important;color:#ffd740!important;border-color:#666!important;}
-#sb-root.dark-mode .goal-card *,#sb-root.dark-mode .site-cplh-panel *,#sb-root.dark-mode .icqa-panel *,#sb-root.dark-mode .targets-panel *,#sb-root.dark-mode #bb-24hr-panel *{color:#e0e0e0!important;}
+#sb-root.dark-mode .goal-card *,#sb-root.dark-mode .site-cplh-panel *,#sb-root.dark-mode .icqa-panel *,#sb-root.dark-mode .targets-panel *,#sb-root.dark-mode #bb-24hr-panel *,#sb-root.dark-mode #vret-panel *{color:#e0e0e0!important;}
 #sb-root.dark-mode .goal-card .pct-good,#sb-root.dark-mode .targets-panel .pct-good,#sb-root.dark-mode .icqa-panel .pct-good{color:#69f0ae!important;}
 #sb-root.dark-mode .goal-card .pct-warn,#sb-root.dark-mode .targets-panel .pct-warn,#sb-root.dark-mode .icqa-panel .pct-warn{color:#ffd740!important;}
 #sb-root.dark-mode .goal-card .pct-bad,#sb-root.dark-mode .targets-panel .pct-bad,#sb-root.dark-mode .icqa-panel .pct-bad{color:#ff5252!important;}
@@ -1972,7 +1998,7 @@ async function fetchHourlyData(){
     try{
         const results=await Promise.all(hours.map(hr=>fetchPeriod(site,startDate,hr)));
         const hourlyData=results.map((raw,i)=>{
-            const stow=raw.stow||{},pStow=raw.palletStow||{},pick=raw.pick||{},obDock=raw.obDock||{},sort=raw.sort||{},ppr=raw.ppr||{};
+            const stow=raw.stow||{},pStow=raw.palletStow||{},pick=raw.pick||{},obDock=raw.obDock||{},sort=raw.sort||{},ppr=raw.ppr||{},rsr=raw.rsr||{};
             const palletCases=pStow.palletCases||0;
             const ibU=(stow.totalUnits||0)+palletCases;
             const caseStowReserve=ppr.caseStowReserveHrs||0;
@@ -1987,7 +2013,7 @@ async function fetchHourlyData(){
             const obIndirect=daHrs>obPickDH?daHrs-obPickDH:0;
             return{
                 label:hours[i].label,
-                ib:{totalStow:ibU,stowUnits:stow.totalUnits||0,palletUnits:pStow.totalUnits||0,rate:stow.rate||0,directHours:ibDH,indirectHours:ibIndirect,totalHours:ibTotalHrs,directPct:ibTotalHrs>0?(ibDH/ibTotalHrs)*100:0,indirectPct:ibTotalHrs>0?(ibIndirect/ibTotalHrs)*100:0,cplh:cplhHrs>0?ibU/cplhHrs:0,pctToOP:(ppr.ibPlannedHrs||0)>0?(ibTotalHrs/ppr.ibPlannedHrs)*100:0},
+                ib:{totalStow:ibU,stowUnits:stow.totalUnits||0,palletUnits:pStow.totalUnits||0,rate:stow.rate||0,rsrRate:rsr.rate||0,directHours:ibDH,indirectHours:ibIndirect,totalHours:ibTotalHrs,directPct:ibTotalHrs>0?(ibDH/ibTotalHrs)*100:0,indirectPct:ibTotalHrs>0?(ibIndirect/ibTotalHrs)*100:0,cplh:cplhHrs>0?ibU/cplhHrs:0,pctToOP:(ppr.ibPlannedHrs||0)>0?(ibTotalHrs/ppr.ibPlannedHrs)*100:0},
                 ob:{pickUnits:pick.totalUnits||0,loadedUnits:obDock.fluidLoadJobs||0,pickRate:pick.rate||0,directHours:obPickDH,indirectHours:obIndirect,totalHours:daHrs,directPct:daHrs>0?(obPickDH/daHrs)*100:0,indirectPct:daHrs>0?(obIndirect/daHrs)*100:0,cplh:daHrs>0?(obDock.fluidLoadJobs||0)/daHrs:0,pctToOP:(ppr.daTransferPlan||0)>0?(daHrs/ppr.daTransferPlan)*100:0},
                 sort:{totalUnits:sort.totalUnits||0,rate:sort.rate||0,directHours:sort.directHours||0,cplh:(sort.directHours||0)>0?sort.totalUnits/sort.directHours:0}
             };
@@ -2058,6 +2084,7 @@ function renderHourlyTables(hourlyData,totalHours){
         ibRow('Cases Stowed',h=>h.ib.stowUnits)+
         ibRow('Pallets Stowed',h=>h.ib.palletUnits)+
         ibRateRow('Stow Rate',h=>h.ib.rate,ibRateT)+
+        ibRateRow('RSR (Receive Rate)',h=>h.ib.rsrRate,0)+
         ibRow('Direct Hours',h=>h.ib.directHours,0,2)+
         ibRow('Indirect Hours',h=>h.ib.indirectHours,0,2)+
         ibRow('Total Hours',h=>h.ib.totalHours,0,2)+
@@ -2355,7 +2382,9 @@ function updateVRETsPanel(v){
     setEl('sync-vret-goal',fmt(goal));
     setEl('sync-vret-pct',pct>0?fmtPct(pct):'\u2014');
     const de=setEl('sync-vret-delta',fmt(delta));
-    if(de)de.style.color=delta>=0?'#2e7d32':'#c62828';
+    if(de){const dk=document.getElementById('sb-root')?.classList.contains('dark-mode');
+        // setProperty(...,'important') so the dark-mode "#vret-panel *" color rule doesn't override it.
+        de.style.setProperty('color',delta>=0?(dk?'#69f0ae':'#2e7d32'):(dk?'#ff5252':'#c62828'),'important');}
     setEl('sync-vret-today-pick',fmt(last.totalPick||0));
     setEl('sync-vret-today-pack',fmt(last.totalPack||0));
     const bar=document.getElementById('sync-vret-bar');if(bar)bar.style.width=Math.min(pct,100)+'%';
@@ -2856,8 +2885,8 @@ function initBoard(){
         if(currentHourly&&currentHourly.data){renderHourlyTables(currentHourly.data,currentHourly.totalHours);}
         // Re-render the EOS Wash tab colors on theme change.
         if(currentEOSWash){renderEOSWash(currentEOSWash);}
-        // Re-render the VRETs tab colors on theme change.
-        if(currentVRETs){renderVRETsTab(currentVRETs);}};
+        // Re-render the VRETs tab AND the compact Sync-tab panel (delta color is theme-aware).
+        if(currentVRETs){renderVRETsTab(currentVRETs);updateVRETsPanel(currentVRETs);}};
     // Restore dark mode preference
     if(localStorage.getItem('syncboard_dark')==='1'){document.getElementById('sb-root').classList.add('dark-mode');document.getElementById('btn-dark').textContent='\u2600';}
     document.getElementById('btn-fetch-hourly')?.addEventListener('click',fetchHourlyData);
@@ -3003,22 +3032,30 @@ function downloadBlob(blob){
     document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);
 }
 
-async function doFetch(){
+async function doFetch(isRetry){
     config=loadConfig();config.site=document.getElementById('site-select').value;config.shiftType=document.getElementById('shift-select').value;saveConfig(config);
-    const btn=document.getElementById('btn-fetch');btn.disabled=true;btn.textContent='\u23F3 Fetching...';
+    const btn=document.getElementById('btn-fetch');btn.disabled=true;btn.textContent=isRetry?'\u23F3 Retrying...':'\u23F3 Fetching...';
     try{
         const raw=await fetchAllData(config);
         // Detect session expiry: if all data comes back as zeros AND we're within the shift window, auth likely expired
         const stowU=raw.full?.stow?.totalUnits||0;const pickU=raw.full?.pick?.totalUnits||0;const stowH=raw.full?.stow?.directHours||0;
         const ibPPRHrs=raw.full?.ppr?.ibActualHrs||0;
-        // Only show session expired if we're currently within the shift time window (data should exist)
+        // Only treat empty as a stale session if we're currently within the shift time window (data should exist)
         const now=new Date(),cm=now.getHours()*60+now.getMinutes();
         const sched=config.shiftType==='Nights'?config.nights:config.days;
         const p1Start=sched.p1.sh*60+sched.p1.sm;
         const shiftActive=config.shiftType==='Nights'?(cm>=p1Start||cm<sched.full.eh*60+sched.full.em):(cm>=p1Start&&cm<=sched.full.eh*60+sched.full.em);
         if(stowU===0&&pickU===0&&stowH===0&&ibPPRHrs===0&&shiftActive){
+            // First empty result during an active shift is almost always a stale FCLM session that
+            // re-authenticates on a second fetch. Auto-retry once silently (no popup) instead of
+            // making the user click OK + Get Data again. Only surface the message if the retry is
+            // also empty (genuine auth failure needing an F5).
+            if(!isRetry){
+                setStatus('\u21BB Refreshing data...');
+                return doFetch(true);
+            }
             setStatus('\u26A0\uFE0F Session expired');
-            alert('\u26A0\uFE0F FCLM session expired — no data returned.\n\nPlease refresh this page (F5) to re-authenticate, then try Get Data again.');
+            alert('\u26A0\uFE0F FCLM session expired \u2014 no data returned after retry.\n\nPlease refresh this page (F5) to re-authenticate, then try Get Data again.');
             btn.disabled=false;btn.textContent='\u25B6 Get Data';return;
         }
         currentMetrics=processData(raw);
