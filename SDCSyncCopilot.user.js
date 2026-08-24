@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      13.6.2
+// @version      13.7.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -38,9 +38,12 @@ const SITE_SCHEDULES = {
     QXX6: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:18,sm:30,eh:6,em:15},p1:{sh:19,sm:0,eh:22,em:30},p2:{sh:22,sm:31,eh:2,em:0},p3:{sh:2,sm:0,eh:5,em:30}} },
     SAV7: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:18,sm:30,eh:6,em:15},p1:{sh:19,sm:0,eh:22,em:30},p2:{sh:22,sm:31,eh:2,em:0},p3:{sh:2,sm:0,eh:5,em:30}} },
 };
-const PROCESS_IDS = { stow:'1003035', palletStow:'1003041', pick:'1003065', sort:'1003009', obDock:'1003021', icqa:'1003030' };
-// Line items (Function names) that count as "Direct Count" for ICQA DC% —
-// SBC - Library Deep + SBC - Pallet Single + Other Library Deep + Other Pallet Single
+const PROCESS_IDS = { stow:'1003035', palletStow:'1003041', pick:'1003065', sort:'1003009', obDock:'1003021', icqa:'1003030', vretPack:'1003056', vretPick:'1003034' };
+// ICQA DC% (Direct Count %):
+//   numerator   = "Library Deep" (Direct Count) functions: SBC - Library Deep + Other Library Deep
+//   denominator = report GRAND TOTAL paid hours (all functions), read from summary tfoot total row
+// e.g. (Other Library Deep 14.41 + SBC - Library Deep 2.50) / grand total 22.52 = ~75%
+const DC_NUMERATOR_FUNCTIONS=['SBC - Library Deep','Other Library Deep'];
 const DC_PERCENT_FUNCTIONS=['SBC - Library Deep','SBC - Pallet Single','Other Library Deep','Other Pallet Single'];
 const DEFAULT_CONFIG = {
     site:'KRB3', shiftType:'Days', schedType:'3P',
@@ -267,26 +270,67 @@ function parseFunctionHoursByName(doc,names){
     }
     return result;
 }
-// DC% (Direct Count %) = (SBC - Library Deep + SBC - Pallet Single + Other Library Deep
-// + Other Pallet Single hours) / Total Paid Hours, off the ICQA process Function Rollup.
-// The ICQA report does NOT use <tfoot> — the grand total is the last <tr class=" empl-all">
-// row whose first cell contains "Total" with class "size-total highlighted".
+// DC% (Direct Count %) = (SBC - Library Deep + Other Library Deep hours)
+//   / (report GRAND TOTAL paid hours), off the ICQA process Function Rollup.
+// See parseSummaryFunctionHours() + calcDCPercent() below.
+
+// Reads per-function paid hours straight from the ICQA Function Rollup SUMMARY table
+// (table#summary). Each function is one row in that table's <tbody>: the function name is
+// link/th text and its Total Paid Hours is the FIRST <td class="numeric"> in that same row.
+// This is the same, proven structure parseFnRollup() uses for the tfoot grand-total row,
+// so it avoids the fragile per-function-detail-block walk that misread the wrong column.
+function parseSummaryFunctionHours(doc,names){
+    const result={};names.forEach(n=>{result[n]=0;});
+    const summary=doc.querySelector('table#summary')||doc;
+    const rows=summary.querySelectorAll('tbody tr, tr');
+    for(const row of rows){
+        // The label lives in the row's th/td link text (e.g. "Other Library Deep").
+        let label='';
+        const a=row.querySelector('a');
+        if(a)label=a.textContent.trim();
+        if(!label){const th=row.querySelector('th');if(th)label=th.textContent.trim();}
+        if(!label)continue;
+        // Match against the requested function names (exact, then normalized).
+        let matched=null;
+        for(const n of names){if(label===n){matched=n;break;}}
+        if(!matched){const norm=s=>s.replace(/\s+/g,' ').trim().toLowerCase();for(const n of names){if(norm(label)===norm(n)){matched=n;break;}}}
+        if(!matched)continue;
+        // The summary lists each function in more than one row-block (e.g. a Paid-Hours
+        // block and a Units block). The FIRST occurrence is the Paid Hours value, so keep
+        // it and do NOT let a later duplicate row (e.g. Other Library Deep=3.14) overwrite
+        // the correct value (e.g. Other Library Deep=15.33).
+        if(result[matched]>0)continue;
+        const cell=row.querySelector('td.numeric');
+        if(cell){const v=parseFloat(cell.textContent.trim().replace(/,/g,''))||0;if(v>0)result[matched]=v;}
+    }
+    return result;
+}
+// DC% (Direct Count %):
+//   numerator   = SBC - Library Deep + Other Library Deep paid hours
+//   denominator = the report GRAND TOTAL paid hours (summary tfoot total row, first numeric)
+// e.g. (2.50 + 14.41) / 22.52 = ~75%.
 function calcDCPercent(html){
     const doc=new DOMParser().parseFromString(html,'text/html');
-    const byName=parseFunctionHoursByName(doc,DC_PERCENT_FUNCTIONS);
-    const dcHours=DC_PERCENT_FUNCTIONS.reduce((s,n)=>s+(byName[n]||0),0);
-    // Grand total = sum of ALL function hours. Reuse parseFunctionHoursByName (which
-    // already works correctly for DC functions) with every function name on the page.
-    const allFnNames=[];
-    const links=doc.querySelectorAll('a');
-    for(const a of links){
-        const name=a.textContent.trim();
-        if(name&&name.length>1&&!name.startsWith('http')&&!allFnNames.includes(name))allFnNames.push(name);
-    }
-    const allByName=parseFunctionHoursByName(doc,allFnNames);
+    // Numerator functions, read from the summary table.
+    const byName=parseSummaryFunctionHours(doc,DC_NUMERATOR_FUNCTIONS);
+    const dcHours=DC_NUMERATOR_FUNCTIONS.reduce((s,n)=>s+(byName[n]||0),0);
+    // Denominator = report grand total paid hours (same row parseFnRollup uses).
+    const totalRow=doc.querySelector('tfoot tr.total.empl-all')||doc.querySelector('tr.total.empl-all')||doc.querySelector('tfoot tr.total')||doc.querySelector('tfoot tr');
     let totalHours=0;
-    for(const name of allFnNames){totalHours+=(allByName[name]||0);}
-    console.log('[SB-DC] byName:',JSON.stringify(byName),'dcHours:',dcHours,'totalHours:',totalHours);
+    if(totalRow){const c=totalRow.querySelectorAll('td.numeric');if(c.length>=1)totalHours=parseFloat(c[0].textContent.trim().replace(/,/g,''))||0;}
+    // DEBUG: dump every summary-table function row (label + first numeric) so we can verify
+    // exact function names/values on the live page if the numbers still look off.
+    try{
+        const dump=[];const summary=doc.querySelector('table#summary')||doc;
+        summary.querySelectorAll('tbody tr, tr').forEach(r=>{
+            const a=r.querySelector('a');const th=r.querySelector('th');
+            const lbl=(a?a.textContent.trim():(th?th.textContent.trim():''));
+            const num=r.querySelector('td.numeric');
+            if(lbl&&num){const v=parseFloat(num.textContent.trim().replace(/,/g,''));if(!isNaN(v))dump.push(lbl+'='+v);}
+        });
+        console.log('[SB-DC] summary rows:',dump.join(' | '));
+    }catch(e){}
+    console.log('[SB-DC] numerator byName:',JSON.stringify(byName),'dcHours:',dcHours,'grandTotalHours:',totalHours);
     const pct=totalHours>0?(dcHours/totalHours)*100:0;
     return{dcHours,totalHours,pct};
 }
@@ -422,6 +466,8 @@ async function fetchIcqaDC(config){
         console.log('[SB-DC] Shift HTML length:',shiftHtml.length,'first 300:',shiftHtml.substring(0,300));
         const shiftDC=calcDCPercent(shiftHtml);
         console.log('[SB-DC] Shift result:',JSON.stringify(shiftDC));
+        // Store ICQA total hours (the DC% denominator) so the EOS Wash can show it as ICQA Actual Hours.
+        window._icqaTotalHours=shiftDC.totalHours;
         setEl('icqa-dc-shift-actual',shiftDC.totalHours>0?fmtPct(shiftDC.pct):'\u2014');
         // Color shift DC% green if >= 70, red if below
         const shiftEl=document.getElementById('icqa-dc-shift-actual');
@@ -623,6 +669,9 @@ function attemptLPFetch(site,resolve,isRetry){
                     });
                     // Pick rate from UnderatedRatesAndHours (Cartons value is the diluted rate)
                     fetchLPPageAutoRate(planId,'UnderatedRatesAndHours',sundayStr,'Transfer Out Pick - Small',(v)=>{results.topRate=v;done++;checkDone();});
+                    // Capture per-process-path planned rates (DeratedRates, Forecast/Units) for the EOS Wash
+                    // % to LP column. No extra network cost beyond this one page fetch.
+                    fetchEOSPlannedRates(planId,sundayStr);
                     fetchLPPageAutoRate(planId,'Density',sundayStr,'Case Transfer In',(v)=>{results.ibDensityLP=v;done++;checkDone();});
                     fetchLPPageAutoRate(planId,'Density',sundayStr,'DA Bldg to Bldg Transfer TOTAL',(v)=>{results.obDensityLP=v;done++;checkDone();});
                     // BB Goals: Week Capacity (Cartons) for today's day from IB and DA
@@ -695,6 +744,38 @@ function fetchLPPageAuto(planId,pageName,sundayStr,fieldName,targetKey,callback)
     });
 }
 
+// EOS Wash: capture per-process-path PLANNED RATES from the GalaxyBI DeratedRates page
+// (type=Forecast, packType=Units) keyed by line-item name, and cache them in localStorage.
+// Used as the denominator for the EOS Wash "% to LP" column (actual rate / planned rate).
+function fetchEOSPlannedRates(planId,sundayStr){
+    const site=loadConfig().site;
+    const url=`https://galaxybi.aka.corp.amazon.com/api/metadata/pageUrl?pageName=DeratedRates&planId=${planId}&site=${site}`;
+    GM_xmlhttpRequest({method:'GET',url,headers:{'Accept':'*/*','Content-Type':'application/json'},
+        onload:function(resp){
+            try{
+                const t=resp.responseText.trim();if(!t.startsWith('{'))return;
+                const s3=JSON.parse(t).url;if(!s3)return;
+                GM_xmlhttpRequest({method:'GET',url:s3,headers:{'Accept':'*/*'},
+                    onload:function(s3r){
+                        try{
+                            const rows=JSON.parse(s3r.responseText);
+                            const rates={};
+                            rows.forEach(r=>{
+                                if(r.date!==sundayStr)return;
+                                if(r.type!=='Forecast'||r.packType!=='Units')return;
+                                const li=(r.lineItem||'').trim();if(!li)return;
+                                const v=parseFloat(r.value);if(!isNaN(v)&&v>0)rates[li]=v;
+                            });
+                            try{localStorage.setItem('syncboard_eos_rates',JSON.stringify(rates));}catch(e){}
+                            console.log('[SB-EOS] planned rates cached:',Object.keys(rates).length,'line items');
+                        }catch(e){console.warn('[SB-EOS] rates parse err',e);}
+                    }
+                });
+            }catch(e){console.warn('[SB-EOS] rates err',e);}
+        }
+    });
+}
+function loadEOSPlannedRates(){try{const s=localStorage.getItem('syncboard_eos_rates');return s?JSON.parse(s):{};}catch(e){return{};}}
 function fetchLPPageAutoRate(planId,pageName,sundayStr,targetLineItem,callback){
     const site=loadConfig().site;
     const url=`https://galaxybi.aka.corp.amazon.com/api/metadata/pageUrl?pageName=${pageName}&planId=${planId}&site=${site}`;
@@ -992,7 +1073,7 @@ function processData(raw){
         // CPLH = total volume / total hours (IB PPR total)
         const cplhHrs=ibTotalHrs;
         const dur=pDurations[p]||1;
-        m.ib[p]={totalStow:ibU,stowUnits:stow.totalUnits||0,palletUnits:pStow.totalUnits||0,palletCases,
+        m.ib[p]={totalStow:ibU,periodStow:ibU,stowUnits:stow.totalUnits||0,palletUnits:pStow.totalUnits||0,palletCases,
             directHours:ibDH,indirectHours:ibIndirect,totalHours:ibTotalHrs,
             directPct:ibTotalHrs>0?(ibDH/ibTotalHrs)*100:0,indirectPct:ibTotalHrs>0?(ibIndirect/ibTotalHrs)*100:0,
             rate:stow.rate||0,headcount:(stow.headcount||0)+(pStow.headcount||0),
@@ -1089,7 +1170,8 @@ function renderIB(m){
     }
     setEl('ib-cases-p1',fmt(p1.stowUnits));setEl('ib-cases-p2',fmt(p2.stowUnits));setEl('ib-cases-p3',fmt(p3.stowUnits));setEl('ib-cases-total',fmt(f.stowUnits));
     setEl('ib-pallets-p1',fmt(p1.palletUnits||0));setEl('ib-pallets-p2',fmt(p2.palletUnits||0));setEl('ib-pallets-p3',fmt(p3.palletUnits||0));setEl('ib-pallets-total',fmt(f.palletUnits||0));
-    setEl('ib-cti-p1',fmt(p1.totalStow));setEl('ib-cti-p2',fmt(p2.totalStow));setEl('ib-cti-p3',fmt(p3.totalStow));setEl('ib-cti-total',fmt(f.totalStow));
+    // CTI/PTI per period = ONLY that period's production (not the cumulative Sync Metrics running total)
+    setEl('ib-cti-p1',fmt(p1.periodStow!=null?p1.periodStow:p1.totalStow));setEl('ib-cti-p2',fmt(p2.periodStow!=null?p2.periodStow:p2.totalStow));setEl('ib-cti-p3',fmt(p3.periodStow!=null?p3.periodStow:p3.totalStow));setEl('ib-cti-total',fmt(f.totalStow));
     setEl('ib-rate-p1',fmt(p1.rate,1));setEl('ib-rate-p2',fmt(p2.rate,1));setEl('ib-rate-p3',fmt(p3.rate,1));setEl('ib-rate-total',fmt(f.rate,1));
     // IB Density
     setEl('ib-density-p1',p1.density>0?fmt(p1.density,2):'\u2014');setEl('ib-density-p2',p2.density>0?fmt(p2.density,2):'\u2014');setEl('ib-density-p3',p3.density>0?fmt(p3.density,2):'\u2014');setEl('ib-density-total',f.density>0?fmt(f.density,2):'\u2014');
@@ -1373,7 +1455,7 @@ function updatePeriodDots(){
 // === HTML ===
 function buildHTML(){return `
 <nav class="topnav"><div class="topnav-left"><span class="logo"><svg width="28" height="28" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="46" fill="#333A44" stroke="#4a9eff" stroke-width="4"/><path d="M25 65 L25 40 L50 28 L75 40 L75 65 Z" fill="none" stroke="#E8EAED" stroke-width="3" stroke-linejoin="round"/><line x1="25" y1="65" x2="75" y2="65" stroke="#E8EAED" stroke-width="3"/><rect x="30" y="45" width="16" height="20" fill="none" stroke="#E8EAED" stroke-width="2"/><line x1="30" y1="50" x2="46" y2="50" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="55" x2="46" y2="55" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="60" x2="46" y2="60" stroke="#E8EAED" stroke-width="1.5"/><rect x="54" y="48" width="14" height="17" fill="none" stroke="#E8EAED" stroke-width="2"/><rect x="57" y="52" width="4" height="5" fill="#E8EAED"/><rect x="62" y="55" width="3" height="4" fill="#E8EAED"/></svg></span><h1 class="site-title">FC Sync Board<span style="display:block;font-size:10px;font-weight:400;color:#aaa;margin-top:-2px;">by snodgtyl</span></h1>
-<div class="nav-tabs"><button class="nav-tab active" data-tab="sync">Sync IB-OB</button><button class="nav-tab" data-tab="hourly">Hourly</button><button class="nav-tab" data-tab="settings">Settings</button></div></div>
+<div class="nav-tabs"><button class="nav-tab active" data-tab="sync">Sync IB-OB</button><button class="nav-tab" data-tab="hourly">Hourly</button><button class="nav-tab" data-tab="eoswash">EOS Wash</button><button class="nav-tab" data-tab="vrets">VRETs</button><button class="nav-tab" data-tab="settings">Settings</button></div></div>
 <div class="topnav-right"><select id="site-select" class="select-input"></select><select id="shift-select" class="select-input"><option value="Days">Days</option><option value="Nights">Nights</option></select>
 <div class="period-indicator"><span class="period-dot" id="dot-p1">P1</span><span class="period-dot" id="dot-p2">P2</span><span class="period-dot" id="dot-p3">P3</span></div>
 <button id="btn-fetch" class="btn btn-primary">\u25B6 Get Data</button><button id="btn-snip" class="btn btn-snip">\uD83D\uDCF7 Snip</button><button id="btn-dark" class="btn" style="background:#333;color:#fff;border-color:#333;">\u263D</button><button id="btn-exit" class="btn btn-danger">\u2715 Exit</button><span id="last-update" class="meta-text">Ready</span></div></nav>
@@ -1491,6 +1573,20 @@ function buildHTML(){return `
 <strong id="tot-value" style="font-size:18px;color:#fff;">\u2014</strong>
 </div>
 </div>
+<div id="vret-panel" style="background:#fff;border:2px solid #000;border-radius:4px;border-left:4px solid #e65100;padding:10px 14px;margin-top:6px;">
+<h3 style="font-size:11px;font-weight:700;margin-bottom:6px;">VRETs (Weekly Pack) <span style="margin-left:8px;font-size:10px;background:#fff3e0;color:#e65100;padding:2px 8px;border-radius:4px;font-weight:700;">see VRETs tab</span></h3>
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;font-size:12px;">
+<div><span style="color:#333;font-size:10px;">PACK WTD</span><br><strong id="sync-vret-wtd" style="font-size:16px;">\u2014</strong></div>
+<div><span style="color:#333;font-size:10px;">WEEK GOAL</span><br><strong id="sync-vret-goal" style="font-size:16px;">\u2014</strong></div>
+<div><span style="color:#333;font-size:10px;">% TO GOAL</span><br><strong id="sync-vret-pct" style="font-size:16px;">\u2014</strong></div>
+<div><span style="color:#333;font-size:10px;">DELTA</span><br><strong id="sync-vret-delta" style="font-size:16px;">\u2014</strong></div>
+</div>
+<div class="vrets-bar" style="margin-top:6px;"><div id="sync-vret-bar" style="width:0%;"></div></div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;margin-top:8px;">
+<div><span style="color:#333;font-size:10px;">TODAY PICK</span><br><strong id="sync-vret-today-pick" style="font-size:14px;">\u2014</strong></div>
+<div><span style="color:#333;font-size:10px;">TODAY PACK</span><br><strong id="sync-vret-today-pack" style="font-size:14px;">\u2014</strong></div>
+</div>
+</div>
 <div id="bb-24hr-panel" style="background:#fff;border:2px solid #000;border-radius:4px;padding:10px 14px;margin-top:6px;">
 <h3 style="font-size:11px;font-weight:700;margin-bottom:8px;">24 Hour Goal Tracker</h3>
 <div style="margin-bottom:8px;">
@@ -1545,13 +1641,26 @@ function buildHTML(){return `
 <tr><td>SITE CPLH TARGET</td><td><input type="number" id="site-cplh-target" class="target-input" step="0.01"></td><td><span id="site-cplh-pct">\u2014</span></td></tr>
 </tbody></table></div>
 </div>
-</div>
 </div><!-- sync-right -->
 </div></main>
 
 <main id="tab-hourly" class="tab-content"><div class="hourly-container">
 <div class="section-header"><h2>Hourly Breakdown</h2><button id="btn-fetch-hourly" class="btn btn-primary">\u25B6 Fetch Hourly</button><span id="hourly-status" class="meta-text"></span></div>
 <div id="hourly-tables"></div>
+</div></main>
+
+<main id="tab-eoswash" class="tab-content"><div class="eoswash-container">
+<div class="section-header"><h2>EOS Wash</h2><button id="btn-fetch-eoswash" class="btn btn-primary">\u25B6 Fetch EOS Wash</button><button id="btn-email-eoswash" class="btn" style="background:#1565c0;color:#fff;border-color:#1565c0;">\u2709 Email</button><span id="eoswash-status" class="meta-text"></span></div>
+<div id="eoswash-content"></div>
+</div></main>
+
+<main id="tab-vrets" class="tab-content"><div class="vrets-container">
+<div class="section-header"><h2>Weekly VRETs Tracker</h2>
+<label style="font-size:12px;">Week <select id="vrets-week-sel" class="select-input"></select></label>
+<label style="font-size:12px;">Pack Goal <input type="number" id="vrets-goal-input" class="target-input" style="width:90px;"></label>
+<button id="btn-fetch-vrets" class="btn btn-primary">\u25B6 Fetch VRETs</button>
+<span id="vrets-status" class="meta-text"></span></div>
+<div id="vrets-content"></div>
 </div></main>
 
 <main id="tab-support" class="tab-content"><div class="support-grid">
@@ -1610,7 +1719,10 @@ function buildCSS(){return `
 .period-dot.active{background:#2e7d32;color:#fff;border-color:#2e7d32;}.period-dot.completed{background:#1565c0;color:#fff;border-color:#1565c0;}
 .btn{padding:5px 10px;border:1px solid #000;border-radius:4px;font-size:12px;font-weight:600;cursor:pointer;}.btn-primary{background:#2e7d32;color:#fff;border-color:#2e7d32;}.btn-primary:hover{background:#1b5e20;}.btn-primary:disabled{opacity:.5;cursor:wait;}
 .btn-danger{background:#c62828;color:#fff;border-color:#c62828;}.btn-small{padding:3px 7px;font-size:11px;}.btn-snip{background:#6a1b9a;color:#fff;border-color:#6a1b9a;}.btn-snip:hover{background:#4a148c;}
-.tab-content{display:none;padding:10px 16px;}.tab-content.active{display:block;}
+/* Hidden tabs must take ZERO space. Use height:0/overflow:hidden in addition to display:none
+   so a hidden tab can never leave a tall empty gap above the visible tab. */
+.tab-content{display:none;height:0;overflow:hidden;padding:0;}
+.tab-content.active{display:block;height:auto;overflow:visible;padding:10px 16px;}
 .sync-layout{display:grid;grid-template-columns:1fr 520px;gap:10px;align-items:start;}
 .sync-left{min-width:0;}
 .sync-right{position:sticky;top:52px;display:flex;flex-direction:column;gap:8px;max-height:calc(100vh - 60px);overflow-y:auto;overflow-x:hidden;padding-right:4px;}
@@ -1691,6 +1803,46 @@ function buildCSS2(){return `
 .hourly-section.ib-hourly{border-left:4px solid #1565c0;}
 .hourly-section.ob-hourly{border-left:4px solid #e65100;}
 .hourly-section.sort-hourly{border-left:4px solid #6a1b9a;}
+/* EOS Wash */
+.eoswash-container{padding:4px 0;}
+.eoswash-section{background:#fff;border:2px solid #000;border-radius:4px;padding:12px 16px;margin-bottom:10px;}
+.eoswash-section h3{font-size:13px;font-weight:700;margin-bottom:8px;}
+.eoswash-section.ib-eos{border-left:4px solid #1565c0;}
+.eoswash-section.da-eos{border-left:4px solid #e65100;}
+/* Color-coded EOS Wash process sections: Inbound=blue, Outbound=orange, Support/Throughput=purple */
+.eoswash-section.eos-ib-section{border:3px solid #1565c0;}
+.eoswash-section.eos-ib-section h3{color:#1565c0;}
+.eoswash-section.eos-da-section{border:3px solid #e65100;}
+.eoswash-section.eos-da-section h3{color:#e65100;}
+.eoswash-section.eos-support-section{border:3px solid #7b1fa2;}
+.eoswash-section.eos-support-section h3{color:#7b1fa2;}
+.eoswash-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+@media(max-width:1100px){.eoswash-grid{grid-template-columns:1fr;}}
+.eos-accuracy-table td,.eos-accuracy-table th{padding:4px 10px;text-align:right;border-bottom:1px solid #ccc;}
+.eos-accuracy-table td:first-child,.eos-accuracy-table th:first-child{text-align:left;font-weight:700;}
+.eos-input{width:80px;padding:3px 5px;background:#ffffcc;border:1px solid #000;color:#000;border-radius:3px;font-size:12px;text-align:right;font-weight:700;-moz-appearance:textfield;}
+.eos-input::-webkit-outer-spin-button,.eos-input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
+/* Thicker rows in the EOS Wash tables for readability */
+.eoswash-section .metrics-table td,.eoswash-section .metrics-table th{padding:11px 10px;font-size:12.5px;}
+.eoswash-section .metrics-table .eos-manual{padding:6px 6px;font-size:12px;}
+.eoswash-section .metrics-table td:last-child{min-width:240px;width:260px;}
+.eos-bridge-ta{min-height:38px;line-height:1.3;overflow:auto;background:#ffffcc!important;color:#000!important;}
+#sb-root.dark-mode .eos-bridge-ta{background:#fff3b0!important;color:#000!important;border-color:#777!important;}
+/* VRETs tab */
+.vrets-container{padding:4px 0;}
+.vrets-kpis{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:12px;}
+.vrets-kpi{background:#fff;border:2px solid #000;border-radius:6px;padding:12px 14px;text-align:center;}
+.vrets-kpi .k-label{font-size:11px;color:#555;font-weight:700;}
+.vrets-kpi .k-val{font-size:26px;font-weight:800;margin-top:4px;}
+.vrets-kpi .k-sub{font-size:11px;color:#555;margin-top:4px;}
+.vrets-section{background:#fff;border:2px solid #000;border-radius:4px;padding:12px 16px;margin-bottom:10px;border-left:4px solid #e65100;}
+.vrets-section h3{font-size:13px;font-weight:700;margin-bottom:8px;}
+.vrets-section .metrics-table td,.vrets-section .metrics-table th{padding:8px 10px;font-size:12.5px;}
+.vrets-bar{position:relative;background:#e0e0e0;border-radius:3px;height:8px;overflow:hidden;margin-top:6px;}
+.vrets-bar>div{height:100%;background:#22c55e;border-radius:3px;}
+#sb-root.dark-mode .vrets-kpi,#sb-root.dark-mode .vrets-section{background:#0f3460!important;border-color:#444!important;color:#e0e0e0!important;}
+#sb-root.dark-mode .vrets-kpi .k-label,#sb-root.dark-mode .vrets-kpi .k-sub,#sb-root.dark-mode .vrets-section h3{color:#e0e0e0!important;}
+#sb-root.dark-mode .vrets-section .metrics-table th,#sb-root.dark-mode .vrets-section .metrics-table td{color:#e0e0e0!important;border-color:#444!important;}
 /* Dark Mode */
 #sb-root.dark-mode{background:#1a1a2e!important;color:#e0e0e0!important;}
 #sb-root.dark-mode .topnav{background:#16213e!important;border-color:#333!important;}
@@ -1712,12 +1864,14 @@ function buildCSS2(){return `
 #sb-root.dark-mode .pace-insight{color:#ccc!important;border-color:#444!important;}
 #sb-root.dark-mode .tg-compact h4{color:#64b5f6!important;}
 #sb-root.dark-mode .metrics-table td[style*="background"]{color:#fff!important;}
-#sb-root.dark-mode .metrics-table td[style*="rgba(52,211,153"]{background:rgba(46,204,113,0.45)!important;color:#fff!important;}
-#sb-root.dark-mode .metrics-table td[style*="rgba(251,191,36"]{background:rgba(255,193,7,0.35)!important;color:#fff!important;}
-#sb-root.dark-mode .metrics-table td[style*="rgba(220,38,38"]{background:#b71c1c!important;color:#fff!important;}
-#sb-root.dark-mode .metrics-table td[style*="rgba(46,125,50"]{background:rgba(46,204,113,0.45)!important;color:#69f0ae!important;}
-#sb-root.dark-mode .metrics-table td[style*="rgba(230,81,0"]{background:rgba(255,152,0,0.35)!important;color:#ffab40!important;}
-#sb-root.dark-mode .metrics-table td[style*="rgba(198,40,40"]{background:#b71c1c!important;color:#fff!important;}
+/* Dark mode: make conditional-format cell colors SOLID (not transparent) so they read
+   clearly on the dark board. Light mode is unaffected. */
+#sb-root.dark-mode .metrics-table td[style*="rgba(52,211,153"]{background:#1b8a4a!important;color:#fff!important;}
+#sb-root.dark-mode .metrics-table td[style*="rgba(251,191,36"]{background:#c77d00!important;color:#fff!important;}
+#sb-root.dark-mode .metrics-table td[style*="rgba(220,38,38"]{background:#c62828!important;color:#fff!important;}
+#sb-root.dark-mode .metrics-table td[style*="rgba(46,125,50"]{background:#1b8a4a!important;color:#fff!important;}
+#sb-root.dark-mode .metrics-table td[style*="rgba(230,81,0"]{background:#c77d00!important;color:#fff!important;}
+#sb-root.dark-mode .metrics-table td[style*="rgba(198,40,40"]{background:#c62828!important;color:#fff!important;}
 #sb-root.dark-mode .row-rate td,#sb-root.dark-mode .row-fast td{color:#ffab40!important;}
 #sb-root.dark-mode .pct-good{color:#69f0ae!important;}
 #sb-root.dark-mode .pct-warn{color:#ffd740!important;}
@@ -1738,6 +1892,22 @@ function buildCSS2(){return `
 #sb-root.dark-mode .btn-danger{color:#fff!important;}
 #sb-root.dark-mode .btn-snip{color:#fff!important;}
 #sb-root.dark-mode .btn[style*="background:#333"]{color:#fff!important;}
+/* Hourly tab dark-mode: force the section boxes and every cell dark, matching the Sync tab. */
+#sb-root.dark-mode .hourly-container,#sb-root.dark-mode .hourly-section{background:#0f3460!important;border-color:#444!important;color:#e0e0e0!important;}
+#sb-root.dark-mode .hourly-section h3{color:#e0e0e0!important;}
+#sb-root.dark-mode .hourly-section .metrics-table th,#sb-root.dark-mode .hourly-section .metrics-table td{color:#e0e0e0!important;border-color:#444!important;}
+/* EOS Wash dark-mode */
+#sb-root.dark-mode .eoswash-section{background:#0f3460!important;border-color:#444!important;color:#e0e0e0!important;}
+#sb-root.dark-mode .eoswash-section h3{color:#e0e0e0!important;}
+#sb-root.dark-mode .eoswash-section .metrics-table th,#sb-root.dark-mode .eoswash-section .metrics-table td{color:#e0e0e0!important;border-color:#444!important;}
+#sb-root.dark-mode .eos-input,#sb-root.dark-mode .eos-manual{background:#4a4a1f!important;color:#ffe082!important;border-color:#777!important;}
+/* Keep the colored section headings vivid in dark mode */
+#sb-root.dark-mode .eos-ib-section h3{color:#64b5f6!important;}
+#sb-root.dark-mode .eos-da-section h3{color:#ffab40!important;}
+#sb-root.dark-mode .eos-support-section h3{color:#ce93d8!important;}
+#sb-root.dark-mode .eos-ib-section{border-color:#1565c0!important;}
+#sb-root.dark-mode .eos-da-section{border-color:#e65100!important;}
+#sb-root.dark-mode .eos-support-section{border-color:#9c27b0!important;}
 `;}
 
 // === HOURLY TAB ===
@@ -1748,8 +1918,12 @@ async function fetchHourlyData(){
     const {startDate}=getShiftDates(config);
     const statusEl=document.getElementById('hourly-status');
     const btn=document.getElementById('btn-fetch-hourly');
-    btn.disabled=true;btn.textContent='\u23F3 Fetching...';
+    // Guard: never throw if the button/status aren't found (that would abort the whole fetch).
+    if(btn){btn.disabled=true;btn.textContent='\u23F3 Fetching...';}
     if(statusEl)statusEl.textContent='Fetching hourly data...';
+    // Show an immediate visible message inside the panel so the user always sees feedback.
+    const tablesEl=document.getElementById('hourly-tables');
+    if(tablesEl)tablesEl.innerHTML='<div style="padding:20px;font-size:14px;color:inherit;">\u23F3 Fetching hourly data\u2026</div>';
 
     // Start = P1 start (SOS), End = P3 end (EOS)
     const hourlyStartH=sched.p1.sh;
@@ -1823,11 +1997,16 @@ async function fetchHourlyData(){
     }catch(err){
         console.error('Hourly fetch failed:',err);
         if(statusEl)statusEl.textContent='\u26A0 '+err.message;
-    }finally{btn.disabled=false;btn.textContent='\u25B6 Fetch Hourly';}
+        // Surface the error inside the panel so it's visible without opening the console.
+        const te=document.getElementById('hourly-tables');
+        if(te)te.innerHTML='<div style="padding:20px;font-size:14px;color:#c62828;">\u26A0 Hourly fetch failed: '+(err&&err.message?err.message:err)+'<br><br>If this says a network/CORS error, your FCLM session likely expired \u2014 reload the page (F5) to re-authenticate, then try again.</div>';
+    }finally{if(btn){btn.disabled=false;btn.textContent='\u25B6 Fetch Hourly';}}
 }
 
 function renderHourlyTables(hourlyData,totalHours){
     const container=document.getElementById('hourly-tables');if(!container)return;
+    // Remember the data so the dark/day toggle can re-render colors without re-fetching.
+    currentHourly={data:hourlyData,totalHours:totalHours};
     const config=loadConfig();
     const ibGoal=parseFloat(document.getElementById('ib-goal-input')?.value)||0;
     const obGoal=parseFloat(document.getElementById('ob-goal-input')?.value)||0;
@@ -1973,10 +2152,634 @@ function renderHourlyTables(hourlyData,totalHours){
     colorCells('ib-hourly','CPLH',lpIbCplh);
     colorCells('ob-hourly','Pick Rate',lpTop);
     colorCells('ob-hourly','CPLH',lpObCplh);
+    // After the tables paint, make sure we're scrolled to the top so users don't have to scroll.
+    window.scrollTo(0,0);
+}
+
+// ============================ VRETs (V-Returns) ============================
+// Weekly V-Returns tracker: Pack (1003056) + Pick (1003034) EACH-Total from FCLM function
+// rollups, split by day/night shift, week-to-date vs a saved weekly Pack goal.
+function vretLoadGoal(){const v=parseFloat(localStorage.getItem('syncboard_vret_goal'));return(!isNaN(v)&&v>0)?v:10949;}
+function vretSaveGoal(v){try{localStorage.setItem('syncboard_vret_goal',String(v));}catch(e){}}
+// Amazon week: weeks start Sunday. Returns {weekNum, weekStart(Date)} for a target date.
+function vretAmazonWeek(target){
+    const year=target.getFullYear();
+    const jan1=new Date(year,0,1);
+    const week1Start=new Date(jan1);week1Start.setDate(jan1.getDate()-jan1.getDay());
+    const diffDays=Math.floor((target-week1Start)/86400000);
+    const weekNum=Math.floor(diffDays/7)+1;
+    const weekStart=new Date(target);weekStart.setDate(target.getDate()-target.getDay());weekStart.setHours(0,0,0,0);
+    return{weekNum,weekStart};
+}
+function vretShiftGroup(dow){if(dow>=0&&dow<=2)return'FHD / FHN';if(dow===3)return'Wed DS / Wed NS';return'BHD / BHN';}
+function vretNightWindow(dow){return dow===3?{sh:17,sm:30,eh:5,em:30}:{sh:18,sm:30,eh:5,em:30};}
+function vretFmtDate(d){return d.getFullYear()+'/'+String(d.getMonth()+1).padStart(2,'0')+'/'+String(d.getDate()).padStart(2,'0');}
+function vretDayName(d){return['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()];}
+function vretDateShort(d){return String(d.getMonth()+1).padStart(2,'0')+'/'+String(d.getDate()).padStart(2,'0');}
+
+// Pull one process's EACH-Total for a time window (reuses buildFnUrl/parseFnRollup).
+async function vretFetchOne(site,pid,sd,sh,sm,ed,eh,em){
+    try{const html=await fetchHTML(buildFnUrl(site,pid,sd,sh,sm,ed,eh,em));const r=parseFnRollup(html);return r.totalUnits||0;}catch(e){return 0;}
+}
+// Pull the full week (weekStart..today) day+night Pack/Pick per day.
+async function fetchVRETsWeek(site,weekStart,today){
+    const results=[];
+    const now=new Date();
+    let cur=new Date(weekStart);cur.setHours(0,0,0,0);
+    const end=new Date(today);end.setHours(0,0,0,0);
+    while(cur<=end){
+        const d=new Date(cur);
+        const next=new Date(d);next.setDate(next.getDate()+1);
+        const dow=d.getDay();
+        const isToday=d.toDateString()===end.toDateString();
+        // Day window: Sunday from 00:00, other days from 05:30, to 17:30.
+        const dSh=dow===0?0:5,dSm=dow===0?0:30;
+        const nw=vretNightWindow(dow);
+        const nightStarted=!isToday||(now.getHours()>nw.sh||(now.getHours()===nw.sh&&now.getMinutes()>=nw.sm));
+        const [dayPack,dayPick,nightPack,nightPick]=await Promise.all([
+            vretFetchOne(site,PROCESS_IDS.vretPack,d,dSh,dSm,d,17,30),
+            vretFetchOne(site,PROCESS_IDS.vretPick,d,dSh,dSm,d,17,30),
+            nightStarted?vretFetchOne(site,PROCESS_IDS.vretPack,d,nw.sh,nw.sm,next,nw.eh,nw.em):Promise.resolve(0),
+            nightStarted?vretFetchOne(site,PROCESS_IDS.vretPick,d,nw.sh,nw.sm,next,nw.eh,nw.em):Promise.resolve(0),
+        ]);
+        results.push({date:new Date(d),label:vretDayName(d)+' '+vretDateShort(d),shiftGroup:vretShiftGroup(dow),
+            dayPack,dayPick,nightPack,nightPick,nightStarted,totalPack:dayPack+nightPack,totalPick:dayPick+nightPick});
+        cur.setDate(cur.getDate()+1);
+    }
+    return results;
+}
+
+// Populate the week selector (current + previous 8 weeks) once.
+function vretPopulateWeeks(){
+    const sel=document.getElementById('vrets-week-sel');if(!sel||sel.options.length)return;
+    const today=new Date();today.setHours(0,0,0,0);
+    for(let w=0;w<9;w++){
+        const t=new Date(today);t.setDate(today.getDate()-w*7);
+        const {weekNum,weekStart}=vretAmazonWeek(t);
+        const wkEnd=new Date(weekStart);wkEnd.setDate(weekStart.getDate()+6);
+        const label='Wk'+weekNum+' ('+(weekStart.getMonth()+1)+'/'+weekStart.getDate()+'-'+(wkEnd.getMonth()+1)+'/'+wkEnd.getDate()+')';
+        const opt=document.createElement('option');
+        opt.value=JSON.stringify({weekNum,weekStart:weekStart.toISOString()});
+        opt.textContent=label;if(w===0)opt.selected=true;
+        sel.appendChild(opt);
+    }
+}
+
+async function fetchVRETsData(){
+    const statusEl=document.getElementById('vrets-status');
+    const btn=document.getElementById('btn-fetch-vrets');
+    const content=document.getElementById('vrets-content');
+    const goalInput=document.getElementById('vrets-goal-input');
+    if(goalInput){if(!goalInput.value)goalInput.value=vretLoadGoal();else vretSaveGoal(parseFloat(goalInput.value)||vretLoadGoal());}
+    const goal=parseFloat(goalInput&&goalInput.value)||vretLoadGoal();
+    if(btn){btn.disabled=true;btn.textContent='\u23F3 Fetching...';}
+    if(statusEl)statusEl.textContent='Fetching VRETs...';
+    if(content&&content.innerHTML.trim()==='')content.innerHTML='<div style="padding:20px;font-size:14px;">\u23F3 Fetching VRETs data\u2026</div>';
+    try{
+        const config=loadConfig();const site=config.site;
+        // Week from selector (default current).
+        let weekNum,weekStart;
+        const sel=document.getElementById('vrets-week-sel');
+        if(sel&&sel.value){const s=JSON.parse(sel.value);weekNum=s.weekNum;weekStart=new Date(s.weekStart);}
+        else{const w=vretAmazonWeek(new Date());weekNum=w.weekNum;weekStart=w.weekStart;}
+        const todayActual=new Date();todayActual.setHours(0,0,0,0);
+        const weekEnd=new Date(weekStart);weekEnd.setDate(weekStart.getDate()+6);
+        const today=todayActual<=weekEnd?todayActual:weekEnd;
+        const data=await fetchVRETsWeek(site,weekStart,today);
+        currentVRETs={data,goal,weekNum,site};
+        renderVRETsTab(currentVRETs);
+        updateVRETsPanel(currentVRETs); // also refresh the compact Sync-tab panel
+        if(statusEl)statusEl.textContent='\u2713 Updated '+new Date().toLocaleTimeString();
+    }catch(err){
+        console.error('[SB-VRET] fetch failed:',err);
+        if(statusEl)statusEl.textContent='\u26A0 '+err.message;
+        if(content)content.innerHTML='<div style="padding:20px;font-size:14px;color:#c62828;">\u26A0 VRETs fetch failed: '+(err&&err.message?err.message:err)+'<br><br>If this is a network/CORS error, your FCLM session likely expired \u2014 reload the page (F5) and try again.</div>';
+    }finally{if(btn){btn.disabled=false;btn.textContent='\u25B6 Fetch VRETs';}}
+}
+
+function renderVRETsTab(v){
+    const content=document.getElementById('vrets-content');if(!content)return;
+    const data=(v&&v.data)||[];const goal=(v&&v.goal)||0;const weekNum=(v&&v.weekNum)||'';
+    const dc=cfDensityColors();
+    const fmtN=n=>(n==null||isNaN(n))?'0':Number(n).toLocaleString();
+    const perShiftGoal=Math.round(goal/14);
+    const wtdPack=data.reduce((s,d)=>s+d.totalPack,0);
+    const wtdPick=data.reduce((s,d)=>s+d.totalPick,0);
+    const daysElapsed=data.length;
+    const wtdGoal=Math.round(goal*daysElapsed/7);
+    const delta=wtdPack-wtdGoal;
+    const onTarget=delta>=0;
+    const progressPct=goal>0?(wtdPack/goal*100):0;
+    const status=wtdPack>=goal?'Goal Achieved':(onTarget?'On Target':'At Risk');
+    const statusColor=onTarget?'#22c55e':'#ef4444';
+
+    const kpis=`<div class="vrets-kpis">
+        <div class="vrets-kpi"><div class="k-label">PACK WEEKLY GOAL</div><div class="k-val">${fmtN(goal)}</div><div class="k-sub">Goal per shift: ${fmtN(perShiftGoal)}</div></div>
+        <div class="vrets-kpi"><div class="k-label">PACK WTD</div><div class="k-val">${wtdPack>=goal?fmtN(wtdPack):fmtN(wtdPack)+' / '+fmtN(wtdGoal)}</div><div class="vrets-bar"><div style="width:${Math.min(progressPct,100)}%"></div></div><div class="k-sub">${progressPct.toFixed(1)}%</div></div>
+        <div class="vrets-kpi"><div class="k-label">DELTA (VS GOAL)</div><div class="k-val" style="color:${statusColor};">${fmtN(delta)}</div><div class="k-sub" style="color:${statusColor};">\u25CF ${status}</div></div>
+    </div>`;
+
+    // Daily Progress
+    let running=0;
+    const dailyRows=data.map((row,ri)=>{
+        running+=row.totalPack;
+        const dayWtdGoal=Math.round(goal*(ri+1)/7);
+        const gap=running-dayWtdGoal;
+        const gapStyle=gap>=0?`color:${dc.goodTxt};`:`color:${dc.badTxt};`;
+        return `<tr>
+            <td style="text-align:left;">${row.label}</td>
+            <td>${fmtN(row.totalPack)}</td>
+            <td>${fmtN(row.totalPick)}</td>
+            <td>${fmtN(running)}</td>
+            <td>${fmtN(dayWtdGoal)}</td>
+            <td style="${gap>=0?`background:${dc.goodBg};`:`background:${dc.badBg};`}${gapStyle}">${fmtN(gap)}</td>
+            <td style="color:${gap>=0?'#22c55e':'#ef4444'};font-weight:700;">${gap>=0?'\u25CF':'\u25CF'}</td>
+        </tr>`;
+    }).join('');
+    const dailyHTML=`<section class="vrets-section"><h3>Daily Progress</h3>
+        <table class="metrics-table"><thead><tr><th style="text-align:left;">Day</th><th>Pack</th><th>Pick</th><th>WTD Pack</th><th>WTD Goal</th><th>Gap</th><th>Status</th></tr></thead>
+        <tbody>${dailyRows}</tbody></table></section>`;
+
+    // Pack by Shift
+    const shiftRows=data.map(row=>{
+        const dayOk=row.dayPack>=perShiftGoal;
+        const nightOk=row.nightStarted&&row.nightPack>=perShiftGoal;
+        const nightLabel=row.nightStarted?fmtN(row.nightPack):'0*';
+        return `<tr>
+            <td style="text-align:left;">${row.label}</td>
+            <td style="text-align:left;">${row.shiftGroup}</td>
+            <td>${fmtN(row.dayPack)}</td>
+            <td style="color:${dayOk?'#22c55e':'#ef4444'};font-weight:700;">\u25CF</td>
+            <td>${nightLabel}</td>
+            <td style="color:${nightOk?'#22c55e':'#ef4444'};font-weight:700;">\u25CF</td>
+        </tr>`;
+    }).join('');
+    const shiftHTML=`<section class="vrets-section"><h3>Pack by Shift</h3>
+        <table class="metrics-table"><thead><tr><th style="text-align:left;">Day</th><th style="text-align:left;">Shift Group</th><th>Day Pack</th><th>Day</th><th>Night Pack</th><th>Night</th></tr></thead>
+        <tbody>${shiftRows}</tbody></table>
+        <div style="font-size:10px;color:#888;margin-top:4px;">* Night shift not started yet. Green dot = met per-shift goal (${fmtN(perShiftGoal)}).</div></section>`;
+
+    // Claw-back plan (only when at risk and a higher pace is required)
+    let clawHTML='';
+    if(!onTarget){
+        const remainingPack=goal-wtdPack;
+        const remainingDays=7-daysElapsed;
+        const remainingShifts=remainingDays*2+((data[data.length-1]&&!data[data.length-1].nightStarted)?1:0);
+        const newGoalPerShift=remainingShifts>0?Math.ceil(remainingPack/remainingShifts):0;
+        if(newGoalPerShift>perShiftGoal){
+            const inc=newGoalPerShift-perShiftGoal;
+            const incPct=perShiftGoal>0?Math.round(inc/perShiftGoal*100):0;
+            clawHTML=`<section class="vrets-section" style="border-left-color:#c62828;"><h3>Claw-Back Plan</h3>
+                <table class="metrics-table"><thead><tr><th>Remaining Pack</th><th>Remaining Shifts</th><th>New Goal/Shift</th><th>Increase</th></tr></thead>
+                <tbody><tr><td>${fmtN(remainingPack)}</td><td>${remainingShifts}</td><td>${fmtN(newGoalPerShift)}</td><td style="color:#c62828;font-weight:700;">+${fmtN(inc)} (+${incPct}%)</td></tr></tbody></table></section>`;
+        }
+    }
+
+    const creditHTML='<div style="text-align:center;font-size:10px;color:#999;margin-top:10px;font-style:italic;">Inspired by sorianou</div>';
+    content.innerHTML=kpis+dailyHTML+shiftHTML+clawHTML+creditHTML;
+    window.scrollTo(0,0);
+}
+
+// Compact VRETs panel on the Sync tab (populated from the same weekly fetch).
+function updateVRETsPanel(v){
+    if(!v||!v.data)return;
+    const goal=v.goal||0;
+    const data=v.data;
+    const wtdPack=data.reduce((s,d)=>s+d.totalPack,0);
+    const daysElapsed=data.length;
+    const wtdGoal=Math.round(goal*daysElapsed/7);
+    const delta=wtdPack-wtdGoal;
+    const pct=goal>0?(wtdPack/goal*100):0;
+    const last=data[data.length-1]||{};
+    setEl('sync-vret-wtd',fmt(wtdPack));
+    setEl('sync-vret-goal',fmt(goal));
+    setEl('sync-vret-pct',pct>0?fmtPct(pct):'\u2014');
+    const de=setEl('sync-vret-delta',fmt(delta));
+    if(de)de.style.color=delta>=0?'#2e7d32':'#c62828';
+    setEl('sync-vret-today-pick',fmt(last.totalPick||0));
+    setEl('sync-vret-today-pack',fmt(last.totalPack||0));
+    const bar=document.getElementById('sync-vret-bar');if(bar)bar.style.width=Math.min(pct,100)+'%';
+}
+
+// ============================ EOS WASH TAB ============================
+// Parses a full Process Path Rollup (PPR) HTML report into a map keyed by line-item name.
+// Reads cells by CSS class (robust against rows that have an extra leading header cell):
+//   actualVolume -> volume, actualTimeSeconds -> hours, actualProductivity -> rate,
+//   planProductivity -> plan rate, planVarianceSeconds -> hours variance (=PPR!M27),
+//   ratioToPlan -> % to plan.
+function parsePPRDetail(html){
+    const doc=new DOMParser().parseFromString(html,'text/html');
+    const map={};
+    const num=(cell)=>{if(!cell)return null;const div=cell.querySelector('div.original');const t=(div?div.textContent:cell.textContent).trim().replace(/,/g,'').replace('%','');const v=parseFloat(t);return isNaN(v)?null:v;};
+    doc.querySelectorAll('tr').forEach(tr=>{
+        const nameCell=tr.querySelector('td.lineItemName, td[class*="lineItemName"]');
+        if(!nameCell)return;
+        const name=nameCell.textContent.trim();if(!name)return;
+        const vol=num(tr.querySelector('td.actualVolume'));
+        const hrs=num(tr.querySelector('td.actualTimeSeconds'));
+        const rate=num(tr.querySelector('td.actualProductivity'));
+        const planRate=num(tr.querySelector('td.planProductivity'));
+        const planVar=num(tr.querySelector('td.planVarianceSeconds'));
+        const ratio=num(tr.querySelector('td.ratioToPlan'));
+        const unitCell=tr.querySelector('td.unitType');
+        const unit=unitCell?unitCell.textContent.trim():'';
+        // Keep the first occurrence of a given line-item name.
+        if(map[name]===undefined)map[name]={vol,hrs,rate,planRate,planVar,ratio,unit};
+    });
+    return map;
+}
+
+// Fetch the full-shift PPR once and render the EOS Wash. Uses the same shift window as the
+// Sync tab (getShiftDates + full schedule).
+async function fetchEOSWashData(){
+    const statusEl=document.getElementById('eoswash-status');
+    const btn=document.getElementById('btn-fetch-eoswash');
+    const content=document.getElementById('eoswash-content');
+    if(btn){btn.disabled=true;btn.textContent='\u23F3 Fetching...';}
+    if(statusEl)statusEl.textContent='Fetching EOS Wash data...';
+    if(content&&content.innerHTML.trim()==='')content.innerHTML='<div style="padding:20px;font-size:14px;">\u23F3 Fetching EOS Wash data\u2026</div>';
+    try{
+        const config=loadConfig();
+        const sched=config.shiftType==='Nights'?config.nights:config.days;
+        const {startDate}=getShiftDates(config);
+        let sDate=new Date(startDate);
+        if(sched.full.sh<12&&startDate.getHours()>=12){sDate.setDate(sDate.getDate()+1);}
+        let eDate=new Date(sDate);if(sched.full.eh<sched.full.sh)eDate.setDate(eDate.getDate()+1);
+        const pprUrl=buildPPRUrl(config.site,sDate,sched.full.sh,sched.full.sm,eDate,sched.full.eh,sched.full.em);
+        // Also fetch case-based volumes from the function rollups (same source the Sync tab uses),
+        // since the PPR reports pick/transfer-out in EACHES, not cases.
+        const S=PROCESS_IDS;
+        const [pprHtml,stowH,palletH,pickH,dockH]=await Promise.all([
+            fetchHTML(pprUrl),
+            fetchHTML(buildFnUrl(config.site,S.stow,sDate,sched.full.sh,sched.full.sm,eDate,sched.full.eh,sched.full.em)),
+            fetchHTML(buildFnUrl(config.site,S.palletStow,sDate,sched.full.sh,sched.full.sm,eDate,sched.full.eh,sched.full.em)),
+            fetchHTML(buildFnUrl(config.site,S.pick,sDate,sched.full.sh,sched.full.sm,eDate,sched.full.eh,sched.full.em)),
+            fetchHTML(buildFnUrl(config.site,S.obDock,sDate,sched.full.sh,sched.full.sm,eDate,sched.full.eh,sched.full.em))
+        ]);
+        const ppr=parsePPRDetail(pprHtml);
+        const stow=parseFnRollup(stowH),pallet=parseFnRollup(palletH),pick=parseFnRollup(pickH),dock=parseFnRollup(dockH);
+        // Case volumes keyed by PPR line-item name.
+        const caseVols={
+            'Case Transfer In':stow.totalUnits||0,
+            'Pallet Transfer In':pallet.palletCases||0,
+            'Transfer Out Pick - Total':pick.totalUnits||0,
+            'Transfer Out':dock.fluidLoadJobs||0,
+        };
+        currentEOSWash={ppr,caseVols};
+        renderEOSWash(currentEOSWash);
+        if(statusEl)statusEl.textContent='\u2713 Updated '+new Date().toLocaleTimeString();
+    }catch(err){
+        console.error('[SB-EOS] fetch failed:',err);
+        if(statusEl)statusEl.textContent='\u26A0 '+err.message;
+        if(content)content.innerHTML='<div style="padding:20px;font-size:14px;color:#c62828;">\u26A0 EOS Wash fetch failed: '+(err&&err.message?err.message:err)+'<br><br>If this is a network/CORS error, your FCLM session likely expired \u2014 reload the page (F5) and try again.</div>';
+    }finally{if(btn){btn.disabled=false;btn.textContent='\u25B6 Fetch EOS Wash';}}
+}
+
+function renderEOSWash(data){
+    const content=document.getElementById('eoswash-content');if(!content)return;
+    const ppr=(data&&data.ppr)||{};
+    const caseVols=(data&&data.caseVols)||{};
+    const rates=loadEOSPlannedRates();
+    const dc=cfDensityColors();
+    // Read existing Sync-tab plan inputs (no re-entry).
+    const gv=id=>{const el=document.getElementById(id);if(!el)return 0;const raw=(el.value!=null&&el.value!=='')?el.value:el.textContent;return parseFloat(String(raw).replace(/,/g,''))||0;};
+    const ibBB=gv('ib-bb-goal'),ibPlan=gv('ib-goal-input'),ibCplh=gv('ib-cplh-target');
+    const daBB=gv('ob-bb-goal'),daPlan=gv('ob-goal-input'),daCplh=gv('ob-cplh-target');
+
+    // Process-path rows: label + the PPR line-item name to look up + the planned-rate key.
+    const IB_ROWS=[
+        ['Case Transfer In','Case Transfer In'],
+        ['Pallet Transfer In','Pallet Transfer In'],
+        ['Case Stow to Reserve','Case Stow to Reserve'],
+        ['Transfer In Support','Transfer In Support'],
+        ['RSR Support','RSR Support'],
+        ['IB Lead/PA','IB Lead/PA'],
+        ['IB Problem Solve','IB Problem Solve'],
+    ];
+    // [display label, PPR line-item name]. PPR names are corrected once we confirm them from
+    // the [SB-EOS] PPR line items log.
+    const DA_ROWS=[
+        ['RC Sort (Units)','RC Sort - Total'],
+        ['Transfer Out Pick Total (Cases)','Transfer Out Pick - Total'],
+        ['Transfer Out','Transfer Out'],
+        ['Transfer Out Dock','Transfer Out Dock'],
+        ['TO Lead/PA','TO Lead/PA'],
+        ['TO Problem Solve','TO Problem Solve'],
+    ];
+    const OTHER_ROWS=[
+        ['Non FC Controllable','Non_FC_Controllable'],
+        ['Admin/HR/IT','Admin/HR/IT'],
+    ];
+
+    const fv=(v,d=0)=>(v==null||isNaN(v))?'':Number(v).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d});
+    // Cell background by good/warn/bad. dir='high' => higher is better (rate, %); 'low' => lower is better.
+    const bg=(pct)=>{if(pct==null||isNaN(pct)||pct===0)return '';if(pct>=100)return `background:${dc.goodBg};color:${dc.goodTxt};`;if(pct>=95)return `background:${dc.warnBg};color:${dc.warnTxt};`;return `background:${dc.badBg};color:${dc.badTxt};`;};
+    const varBg=(v)=>{if(v==null||isNaN(v)||v===0)return '';return v>=0?`background:${dc.goodBg};color:${dc.goodTxt};`:`background:${dc.badBg};color:${dc.badTxt};`;};
+
+    // Map a PPR line-item name to the GalaxyBI DeratedRates planned-rate key (names differ slightly).
+    const RATE_KEY={'Transfer Out Pick - Total':'Transfer Out Pick - Small','RC Sort - Total':'RC Sort','Non_FC_Controllable':'Non FC Controllable'};
+    // Only these rows produce real throughput VOLUME (in cases). Support / Lead-PA / Problem
+    // Solve / Non-FC / Admin rows do NOT produce volume, so their Volume/Rate/% to LP are blank
+    // and only Hours + Hours Variance show.
+    const HAS_VOLUME=new Set(['Case Transfer In','Pallet Transfer In','Case Stow to Reserve','Transfer Out Pick - Total','Transfer Out','RC Sort - Total']);
+    // Returns the CASE volume for a row. The PPR reports volume in the row's own unit; we only
+    // treat it as cases when the unit is Case/Pallet/Carton. Eaches-based rows (e.g. some pick/
+    // transfer-out rows) would otherwise show inflated unit counts, so those are left blank until
+    // wired to a case source.
+    const caseVol=(pprName,d)=>{
+        // Prefer the case-based volume from the function rollups (in cases), when available.
+        if(caseVols[pprName]!=null)return caseVols[pprName];
+        if(!d||d.vol==null)return null;
+        const u=(d.unit||'').toLowerCase();
+        if(u===''||u.includes('case')||u.includes('carton')||u.includes('pallet'))return d.vol;
+        return null; // eaches / other units are not cases
+    };
+    function procRow(label,pprName){
+        const d=ppr[pprName]||{};
+        const showsVol=HAS_VOLUME.has(pprName);
+        const vol=showsVol?caseVol(pprName,d):null;
+        const hrs=d.hrs;
+        const rate=(showsVol&&vol!=null&&hrs>0)?vol/hrs:(showsVol?d.rate:null);
+        const rateKey=RATE_KEY[pprName]||pprName;
+        const planRate=rates[rateKey]||rates[pprName]||d.planRate||0;
+        // % to LP: volume rows use actual rate / planned rate. Support/indirect rows (no volume)
+        // fall back to the PPR's own % to Plan (ratioToPlan), matching the Excel.
+        let pctLP=(showsVol&&rate>0&&planRate>0)?(rate/planRate)*100:0;
+        if(!showsVol&&d.ratio!=null&&d.ratio!==0)pctLP=d.ratio;
+        const hoursVar=d.planVar; // straight from PPR (planVarianceSeconds), + = under plan
+        return `<tr>
+            <td style="text-align:left;">${label}</td>
+            <td>${vol!=null?fv(vol):''}</td>
+            <td>${fv(hrs,2)}</td>
+            <td>${rate!=null&&rate>0?fv(rate,2):''}</td>
+            <td style="${bg(pctLP)}">${pctLP>0?pctLP.toFixed(1)+'%':''}</td>
+            <td style="${varBg(hoursVar)}">${hoursVar!=null?fv(hoursVar,2):''}</td>
+            ${bridge(slug(label))}
+        </tr>`;
+    }
+    // Which line items count as real THROUGHPUT VOLUME (support/lead/PS rows are indirect and
+    // their "volume" is not real production, so they only contribute HOURS, not volume/CPLH).
+    const IB_VOL_ROWS=['Case Transfer In','Pallet Transfer In'];
+    // DA TOTAL volume = Transfer Out Pick cases (matches the Excel "Transfer Out Pick Total (Cases)");
+    // hours = all DA rows. CPLH = cases / total DA hours.
+    const DA_VOL_ROWS=['Transfer Out Pick - Total'];
+    const sumVol=(names)=>{let v=0,have=false;names.forEach(n=>{const d=ppr[n];const cv=caseVol(n,d);if(cv!=null){v+=cv;have=true;}});return have?v:null;};
+    const sumHrs=(names)=>{let h=0,have=false;names.forEach(n=>{const d=ppr[n];if(d&&d.hrs!=null){h+=d.hrs;have=true;}});return have?h:null;};
+
+    // Subtotal row: VOLUME from the volume rows only, HOURS from all rows, CPLH = vol/hrs.
+    // Hours variance = (planned volume / CPLH goal) - actual hours (positive = under plan).
+    function totalRow(label,allNames,volNames,planVol,cplhGoal,cls){
+        const vol=sumVol(volNames);
+        const hrs=sumHrs(allNames);
+        const rate=(hrs&&hrs>0&&vol!=null)?vol/hrs:0;
+        const needed=(planVol>0&&cplhGoal>0)?planVol/cplhGoal:0;
+        const hoursVar=(needed>0&&hrs!=null)?needed-hrs:null;
+        const cplhPct=(cplhGoal>0&&rate>0)?(rate/cplhGoal)*100:0;
+        return `<tr class="${cls}" style="font-weight:700;border-top:2px solid #000;">
+            <td style="text-align:left;">${label}</td>
+            <td>${vol!=null?fv(vol):''}</td>
+            <td>${hrs!=null?fv(hrs,2):''}</td>
+            <td>${rate>0?fv(rate,2):''}</td>
+            <td style="${bg(cplhPct)}">${cplhPct>0?cplhPct.toFixed(1)+'%':''}</td>
+            <td style="${varBg(hoursVar)}">${hoursVar!=null?fv(hoursVar,2):''}</td>
+            ${bridge(slug(label))}
+        </tr>`;
+    }
+    // THROUGHPUT = all hours; volume = IB volume + DA volume (real throughput).
+    function throughputRow(){
+        const allNames=IB_ROWS.concat(DA_ROWS,OTHER_ROWS).map(r=>r[1]);
+        const vol=(sumVol(IB_VOL_ROWS)||0)+(sumVol(DA_VOL_ROWS)||0);
+        const hrs=sumHrs(allNames)||0;
+        const rate=hrs>0?vol/hrs:0;
+        // Pull the PPR THROUGHPUT row's own % to Plan + Hours Variance (matches the Excel).
+        const tp=ppr['THROUGHPUT']||{};
+        const pct=(tp.ratio!=null&&tp.ratio!==0)?tp.ratio:0;
+        const hv=tp.planVar;
+        return `<tr style="font-weight:700;border-top:3px solid #000;background:rgba(123,31,162,0.10);">
+            <td style="text-align:left;">THROUGHPUT</td><td>${fv(vol)}</td><td>${fv(hrs,2)}</td><td>${rate>0?fv(rate,2):''}</td>
+            <td style="${bg(pct)}">${pct>0?pct.toFixed(1)+'%':''}</td>
+            <td style="${varBg(hv)}">${hv!=null?fv(hv,2):''}</td>${bridge('throughput')}
+        </tr>`;
+    }
+
+    const th='<thead><tr><th style="text-align:left;">Process Path</th><th>Volume</th><th>Hours</th><th>Rate</th><th>% to LP</th><th>Hours Variance</th><th style="min-width:220px;">Bridge</th></tr></thead>';
+    // Manual Bridge note (wraps text), keyed per row so it saves/restores like the other manual fields.
+    const bridge=(key)=>`<td><textarea class="support-input eos-manual eos-bridge-ta" id="eos-bridge-${key}" placeholder="notes\u2026" rows="2" style="width:100%;box-sizing:border-box;background:#ffffcc;color:#000;border:1px solid #999;border-radius:3px;resize:vertical;white-space:pre-wrap;word-wrap:break-word;font-family:inherit;"></textarea></td>`;
+    const slug=(s)=>s.replace(/[^a-z0-9]+/gi,'-').toLowerCase();
+
+    // Shift Accuracy: Actual VOLUME = real throughput volume rows only; CPLH = vol / total hours.
+    const ibActVol=sumVol(IB_VOL_ROWS)||0;
+    const ibActHrs=sumHrs(IB_ROWS.map(r=>r[1]))||0;
+    const ibActCplh=ibActHrs>0?ibActVol/ibActHrs:0;
+    const daActVol=sumVol(DA_VOL_ROWS)||0;
+    const daActHrs=sumHrs(DA_ROWS.map(r=>r[1]))||0;
+    const daActCplh=daActHrs>0?daActVol/daActHrs:0;
+    const accRow=(label,plan,act,dec=0,pctHigh=true)=>{
+        const varc=(plan&&act)?((pctHigh?act/plan:plan/act)*100):0;
+        return `<tr><td>${label}</td><td>${plan?fv(plan,dec):'\u2014'}</td><td>${act?fv(act,dec):'\u2014'}</td><td style="${bg(varc)}">${varc>0?varc.toFixed(1)+'%':'\u2014'}</td></tr>`;
+    };
+    const accuracyHTML=`<section class="eoswash-section">
+        <h3>Shift Accuracy</h3>
+        <table class="metrics-table eos-accuracy-table"><thead><tr><th>Metric</th><th>Plan</th><th>Actual</th><th>% to Plan</th></tr></thead><tbody>
+        ${accRow('IB BB',ibBB,ibActVol)}
+        ${accRow('IB Shift Plan',ibPlan,ibActVol)}
+        ${accRow('IB CPLH',ibCplh,ibActCplh,2)}
+        <tr><td colspan="4" style="height:6px;background:#888;"></td></tr>
+        ${accRow('DA BB',daBB,daActVol)}
+        ${accRow('DA Shift Plan',daPlan,daActVol)}
+        ${accRow('DA CPLH',daCplh,daActCplh,2)}
+        </tbody></table>
+        <div style="font-size:10px;color:#888;margin-top:6px;">Plan values are read from the Sync tab targets.</div>
+    </section>`;
+
+    const headRow=th.replace('<thead>','').replace('</thead>','');
+    // Split into color-coded sections: INBOUND (blue), OUTBOUND (orange), SUPPORT/THROUGHPUT (purple).
+    const processHTML=
+    `<section class="eoswash-section eos-ib-section">
+        <h3>INBOUND</h3>
+        <table class="metrics-table"><tbody>
+        ${headRow}
+        ${IB_ROWS.map(r=>procRow(r[0],r[1])).join('')}
+        ${totalRow('IB TOTAL',IB_ROWS.map(r=>r[1]),IB_VOL_ROWS,ibPlan,ibCplh,'')}
+        </tbody></table>
+    </section>
+    <section class="eoswash-section eos-da-section">
+        <h3>OUTBOUND</h3>
+        <table class="metrics-table"><tbody>
+        ${headRow}
+        ${DA_ROWS.map(r=>procRow(r[0],r[1])).join('')}
+        ${totalRow('DA TOTAL',DA_ROWS.map(r=>r[1]),DA_VOL_ROWS,daPlan,daCplh,'')}
+        </tbody></table>
+    </section>
+    <section class="eoswash-section eos-support-section">
+        <h3>SUPPORT / THROUGHPUT</h3>
+        <table class="metrics-table"><tbody>
+        ${headRow}
+        ${OTHER_ROWS.map(r=>procRow(r[0],r[1])).join('')}
+        ${throughputRow()}
+        </tbody></table>
+    </section>`;
+
+    // ---- Manual-entry sections (saved via the existing support-input mechanism) ----
+    // These will be automated later; for now they're editable inputs that persist.
+    const inp=(id,ph='')=>`<input type="text" class="support-input eos-manual" id="${id}" placeholder="${ph}" style="width:100%;box-sizing:border-box;background:#ffffcc;color:#000;border:1px solid #999;border-radius:3px;">`;
+    const backlogHTML=`<section class="eoswash-section">
+        <h3>Backlog</h3>
+        <table class="metrics-table"><thead><tr><th style="text-align:left;">Dept</th><th>Units</th><th>Cases</th><th>Days in Units</th><th>Days in Cases</th><th>IPT Backlog</th></tr></thead><tbody>
+        <tr><td style="text-align:left;">Inbound Backlog</td><td>${inp('eos-bl-ib-units')}</td><td>${inp('eos-bl-ib-cases')}</td><td>${inp('eos-bl-ib-dunits')}</td><td>${inp('eos-bl-ib-dcases')}</td><td rowspan="2" style="vertical-align:middle;">${inp('eos-bl-ipt')}</td></tr>
+        <tr><td style="text-align:left;">DA Backlog</td><td>${inp('eos-bl-da-units')}</td><td>${inp('eos-bl-da-cases')}</td><td>${inp('eos-bl-da-dunits')}</td><td>${inp('eos-bl-da-dcases')}</td></tr>
+        </tbody></table>
+    </section>`;
+
+    const qualityHTML=`<section class="eoswash-section">
+        <h3>Quality</h3>
+        <div class="eoswash-grid">
+          <div>
+            <h4 style="font-size:12px;margin:0 0 4px;">Atlas Breakdown</h4>
+            <table class="metrics-table"><thead><tr><th style="text-align:left;">Metric</th><th>Threshold</th><th>DPMO</th></tr></thead><tbody>
+            <tr><td style="text-align:left;">Bin Collisions</td><td>${inp('eos-q-bincol-thr')}</td><td>${inp('eos-q-bincol-dpmo')}</td></tr>
+            <tr><td style="text-align:left;">Ship Failed Moves</td><td>${inp('eos-q-shipfail-thr')}</td><td>${inp('eos-q-shipfail-dpmo')}</td></tr>
+            </tbody></table>
+          </div>
+          <div>
+            <h4 style="font-size:12px;margin:0 0 4px;">ICQA Execution</h4>
+            <table class="metrics-table"><tbody>
+            <tr><td style="text-align:left;">ICQA Plan Rate</td><td>${inp('eos-q-icqa-plan')}</td></tr>
+            <tr><td style="text-align:left;">ICQA Actual Hours</td><td>${inp('eos-q-icqa-hrs')}</td></tr>
+            <tr><td style="text-align:left;">ICQA Actual Rate</td><td>${inp('eos-q-icqa-rate')}</td></tr>
+            <tr><td style="text-align:left;">ICQA % to RO</td><td>${inp('eos-q-icqa-ro')}</td></tr>
+            </tbody></table>
+          </div>
+          <div>
+            <h4 style="font-size:12px;margin:0 0 4px;">Piles</h4>
+            <table class="metrics-table"><tbody>
+            <tr><td style="text-align:left;">IB Problem Solve</td><td>${inp('eos-q-piles-ibps')}</td></tr>
+            <tr><td style="text-align:left;">Damages</td><td>${inp('eos-q-piles-dmg')}</td></tr>
+            <tr><td style="text-align:left;">DA Problem Solve</td><td>${inp('eos-q-piles-daps')}</td></tr>
+            <tr><td style="text-align:left;">Sort Problem Solve</td><td>${inp('eos-q-piles-sortps')}</td></tr>
+            </tbody></table>
+          </div>
+        </div>
+    </section>`;
+
+    // Safety: 5 editable leader rows.
+    const safetyRows=[0,1,2,3,4].map(i=>`<tr>
+        <td>${inp('eos-sf-name-'+i)}</td><td>${inp('eos-sf-rbi-'+i)}</td><td>${inp('eos-sf-audit-'+i)}</td><td>${inp('eos-sf-icare-'+i)}</td><td>${inp('eos-sf-pa-'+i)}</td><td>${inp('eos-sf-arc-'+i)}</td><td>${inp('eos-sf-bridge-'+i)}</td>
+    </tr>`).join('');
+    const safetyHTML=`<section class="eoswash-section">
+        <h3>Safety Summary</h3>
+        <table class="metrics-table"><thead><tr><th style="text-align:left;">Leader Name</th><th>Weekly RBI</th><th>Trailer Audits</th><th>I-Care</th><th>PA Name</th><th>Daily ARC</th><th>Bridge</th></tr></thead><tbody>
+        ${safetyRows}
+        </tbody></table>
+    </section>`;
+
+    content.innerHTML=accuracyHTML+processHTML+backlogHTML+qualityHTML+safetyHTML;
+
+    // Restore saved manual values and wire change-to-save (inputs are created dynamically,
+    // so the initBoard-time listener doesn't cover them).
+    const sup=loadSupport();
+    content.querySelectorAll('.eos-manual').forEach(el=>{
+        if(sup[el.id]!=null)el.value=sup[el.id];
+        el.addEventListener('change',()=>{
+            const d=loadSupport();
+            document.querySelectorAll('.support-input,.callout-textarea,.eos-manual').forEach(e=>{if(e.id)d[e.id]=e.value;});
+            saveSupport(d);
+        });
+    });
+    // Auto-fill ICQA Quality fields from the Sync tab's live ICQA panel. Auto-filled values are
+    // LOCKED (read-only) so they can't be manually changed.
+    const txt=id=>{const e=document.getElementById(id);return e?(e.textContent||'').trim():'';};
+    const autofill=(targetId,val)=>{const el=document.getElementById(targetId);if(el&&val!=null&&val!==''&&val!=='\u2014'){el.value=val;el.readOnly=true;el.style.background='#e8f5e9';el.style.cursor='not-allowed';el.title='Auto-filled from live data';}};
+    autofill('eos-q-icqa-plan',txt('icqa-ro-target-display'));   // RO / plan target (e.g. 2,400)
+    autofill('eos-q-icqa-rate',txt('icqa-ro-shift-actual'));     // shift RO rate (actual, e.g. 2,576.61)
+    autofill('eos-q-icqa-ro',txt('icqa-ro-shift-pct'));          // shift % to RO (e.g. 107.4%)
+    // ICQA Actual Hours = FCLM ICQA total hours (the DC% denominator computed in fetchIcqaDC).
+    if(typeof window._icqaTotalHours==='number'&&window._icqaTotalHours>0){
+        autofill('eos-q-icqa-hrs',window._icqaTotalHours.toFixed(2));
+    }
+    window.scrollTo(0,0);
+}
+
+// Capture the EOS Wash as an image, copy it to the clipboard, and open an email addressed to
+// the site's boss ({SITE}-boss@amazon.com). The user pastes the image into the email body.
+function emailEOSWash(){
+    const content=document.getElementById('eoswash-content');
+    const btn=document.getElementById('btn-email-eoswash');
+    if(!content||content.innerHTML.trim()===''){alert('Fetch the EOS Wash first, then email.');return;}
+    if(typeof html2canvas==='undefined'){alert('Screenshot library still loading. Try again in a moment.');return;}
+    const config=loadConfig();
+    const site=(config.site||'').toUpperCase();
+    const to=site?`${site}-boss@amazon.com`:'';
+    const shift=config.shiftType||'';
+    const dateStr=new Date().toLocaleDateString();
+    const subject=`${site} EOS Wash \u2013 ${shift} \u2013 ${dateStr}`;
+    const isDark=document.getElementById('sb-root')?.classList.contains('dark-mode');
+    if(btn){btn.disabled=true;btn.textContent='\u23F3 Capturing...';}
+    // Give the browser a tick, then capture.
+    setTimeout(()=>{
+        html2canvas(content,{backgroundColor:isDark?'#1a1a2e':'#ffffff',scale:1,useCORS:true,logging:false,windowWidth:content.scrollWidth,windowHeight:content.scrollHeight}).then(canvas=>{
+            // Build an .eml file (standard email format) with the EOS Wash image embedded inline
+            // in the HTML body. Opening the .eml launches the DESKTOP Outlook app with a new
+            // message already addressed, subjected, and containing the image — ready to send.
+            const dataUrl=canvas.toDataURL('image/png');
+            const b64=dataUrl.split(',')[1];
+            const cid='eoswash_'+Date.now();
+            const boundary='----=_SB_'+Date.now();
+            const htmlBody=''+
+                '<html><body style="font-family:Calibri,Arial,sans-serif;font-size:11pt;">'+
+                'KRB team,<br><br>Please see the '+site+' EOS Wash below.<br><br>'+
+                '<img src="cid:'+cid+'" style="max-width:100%;"><br><br>'+
+                'Thank you,<br></body></html>';
+            // CRLF line endings are required by the .eml (RFC 822) format.
+            const CRLF='\r\n';
+            const eml=[
+                'To: '+to,
+                'Subject: '+subject,
+                'X-Unsent: 1',                 // tells Outlook this is an unsent draft to open in compose
+                'Content-Type: multipart/related; boundary="'+boundary+'"',
+                '',
+                '--'+boundary,
+                'Content-Type: text/html; charset="utf-8"',
+                'Content-Transfer-Encoding: 7bit',
+                '',
+                htmlBody,
+                '',
+                '--'+boundary,
+                'Content-Type: image/png; name="EOSWash.png"',
+                'Content-Transfer-Encoding: base64',
+                'Content-ID: <'+cid+'>',
+                'Content-Disposition: inline; filename="EOSWash.png"',
+                '',
+                b64.replace(/(.{76})/g,'$1'+CRLF),
+                '',
+                '--'+boundary+'--',
+                ''
+            ].join(CRLF);
+            const blob=new Blob([eml],{type:'message/rfc822'});
+            const url=URL.createObjectURL(blob);
+            const a=document.createElement('a');
+            a.href=url;
+            a.download=(site||'EOS')+'_EOS_Wash_'+new Date().toISOString().slice(0,16).replace(/[T:]/g,'-')+'.eml';
+            document.body.appendChild(a);a.click();document.body.removeChild(a);
+            setTimeout(()=>URL.revokeObjectURL(url),4000);
+            if(btn){btn.textContent='\u2713 Opening Outlook\u2026';setTimeout(()=>{btn.textContent='\u2709 Email';btn.disabled=false;},4000);}
+        }).catch(e=>{
+            console.error('[SB-EOS] email capture failed:',e);
+            if(btn){btn.textContent='\u2709 Email';btn.disabled=false;}
+            alert('Screenshot failed: '+e.message);
+        });
+    },150);
 }
 
 // === BOOT ===
 let boardActive=false, currentMetrics=null, config=loadConfig(), originalBody='';
+// Holds the last-fetched hourly data + slot count so the dark/day toggle can re-render the
+// Hourly tab colors without re-fetching (mirrors how currentMetrics re-renders the Sync tab).
+let currentHourly=null;
+// Holds the last-fetched EOS Wash PPR data so the dark/day toggle can re-render without re-fetching.
+let currentEOSWash=null;
+// Holds the last-fetched VRETs weekly data so the dark/day toggle can re-render without re-fetching.
+let currentVRETs=null;
 
 function addLaunchBtn(){
     const b=document.createElement('div');b.id='sb-launch';
@@ -2048,10 +2851,23 @@ function initBoard(){
     document.getElementById('btn-fetch').onclick=doFetch;
     document.getElementById('btn-exit').onclick=exitBoard;
     document.getElementById('btn-snip').onclick=doSnip;
-    document.getElementById('btn-dark').onclick=()=>{const root=document.getElementById('sb-root');root.classList.toggle('dark-mode');const isDark=root.classList.contains('dark-mode');localStorage.setItem('syncboard_dark',isDark?'1':'0');document.getElementById('btn-dark').textContent=isDark?'\u2600':'\u263D';if(currentMetrics){renderIB(currentMetrics);renderOB(currentMetrics);renderLPPercents(currentMetrics);renderCharts(currentMetrics);}};
+    document.getElementById('btn-dark').onclick=()=>{const root=document.getElementById('sb-root');root.classList.toggle('dark-mode');const isDark=root.classList.contains('dark-mode');localStorage.setItem('syncboard_dark',isDark?'1':'0');document.getElementById('btn-dark').textContent=isDark?'\u2600':'\u263D';if(currentMetrics){renderIB(currentMetrics);renderOB(currentMetrics);renderLPPercents(currentMetrics);renderCharts(currentMetrics);}
+        // Re-render the Hourly tab too (colors follow day/dark) without re-fetching.
+        if(currentHourly&&currentHourly.data){renderHourlyTables(currentHourly.data,currentHourly.totalHours);}
+        // Re-render the EOS Wash tab colors on theme change.
+        if(currentEOSWash){renderEOSWash(currentEOSWash);}
+        // Re-render the VRETs tab colors on theme change.
+        if(currentVRETs){renderVRETsTab(currentVRETs);}};
     // Restore dark mode preference
     if(localStorage.getItem('syncboard_dark')==='1'){document.getElementById('sb-root').classList.add('dark-mode');document.getElementById('btn-dark').textContent='\u2600';}
     document.getElementById('btn-fetch-hourly')?.addEventListener('click',fetchHourlyData);
+    document.getElementById('btn-fetch-eoswash')?.addEventListener('click',fetchEOSWashData);
+    document.getElementById('btn-email-eoswash')?.addEventListener('click',emailEOSWash);
+    document.getElementById('btn-fetch-vrets')?.addEventListener('click',fetchVRETsData);
+    // Populate the VRETs week selector and default goal input on init.
+    vretPopulateWeeks();
+    { const gi=document.getElementById('vrets-goal-input'); if(gi&&!gi.value)gi.value=vretLoadGoal();
+      if(gi)gi.addEventListener('change',()=>{vretSaveGoal(parseFloat(gi.value)||vretLoadGoal());if(currentVRETs){currentVRETs.goal=parseFloat(gi.value)||currentVRETs.goal;renderVRETsTab(currentVRETs);updateVRETsPanel(currentVRETs);}}); }
     document.getElementById('btn-clear-targets')?.addEventListener('click',()=>{
         ['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-density-target','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-density-target','sort-goal','sort-rate-target'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
         saveTargetsUI();updateTargetRows();
@@ -2064,7 +2880,33 @@ function initBoard(){
     sel.onchange=e=>{config.site=e.target.value;if(SITE_SCHEDULES[config.site]){config.days=SITE_SCHEDULES[config.site].days;config.nights=SITE_SCHEDULES[config.site].nights;}saveConfig(config);refreshSettingsInputs();currentMetrics=null;clearBoard();updatePeriodDots();};
     document.getElementById('shift-select').onchange=e=>{config.shiftType=e.target.value;saveConfig(config);currentMetrics=null;clearBoard();updatePeriodDots();doFetch();};
     document.querySelectorAll('.target-input').forEach(inp=>{inp.addEventListener('input',updateTargetRows);inp.addEventListener('change',()=>{saveTargetsUI();if(currentMetrics)renderTargets(currentMetrics);});});
-    document.querySelectorAll('.nav-tab').forEach(tab=>tab.onclick=()=>{document.querySelectorAll('.nav-tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));tab.classList.add('active');const target=document.getElementById('tab-'+tab.dataset.tab);if(target)target.classList.add('active');});
+    document.querySelectorAll('.nav-tab').forEach(tab=>tab.onclick=()=>{
+        document.querySelectorAll('.nav-tab').forEach(t=>t.classList.remove('active'));
+        // Clear any leftover inline display (an older build set style.display inline, which
+        // overrides the CSS class and leaves a hidden tab still taking up space). Force each
+        // non-selected tab to display:none inline, and the selected one to display:block.
+        document.querySelectorAll('.tab-content').forEach(t=>{t.classList.remove('active');t.style.display='none';});
+        tab.classList.add('active');
+        const target=document.getElementById('tab-'+tab.dataset.tab);
+        if(target){target.classList.add('active');target.style.display='block';}
+        window.scrollTo(0,0);
+        // Auto-load the Hourly tab the first time it's opened.
+        if(tab.dataset.tab==='hourly'){
+            const ht=document.getElementById('hourly-tables');
+            if(ht&&ht.innerHTML.trim()===''){fetchHourlyData();}
+        }
+        // Auto-load the EOS Wash tab the first time it's opened.
+        if(tab.dataset.tab==='eoswash'){
+            const et=document.getElementById('eoswash-content');
+            if(et&&et.innerHTML.trim()===''){fetchEOSWashData();}
+        }
+        // Auto-load the VRETs tab the first time it's opened.
+        if(tab.dataset.tab==='vrets'){
+            vretPopulateWeeks();
+            const vc=document.getElementById('vrets-content');
+            if(vc&&vc.innerHTML.trim()===''){fetchVRETsData();}
+        }
+    });
     const sup=loadSupport();Object.keys(sup).forEach(id=>{const el=document.getElementById(id);if(el)el.value=sup[id];});
     document.querySelectorAll('.support-input,.callout-textarea').forEach(el=>el.addEventListener('change',()=>{const d={};document.querySelectorAll('.support-input,.callout-textarea').forEach(e=>{d[e.id]=e.value;});saveSupport(d);}));
     renderActions();updatePeriodDots();setInterval(updatePeriodDots,60000);
@@ -2082,11 +2924,32 @@ function refreshSettingsInputs(){
     ['ns-full-sh','ns-full-sm','ns-full-eh','ns-full-em','ns-p1-sh','ns-p1-sm','ns-p1-eh','ns-p1-em','ns-p2-sh','ns-p2-sm','ns-p2-eh','ns-p2-em','ns-p3-sh','ns-p3-sm','ns-p3-eh','ns-p3-em'].forEach((id,i)=>{const vals=[ns.full.sh,ns.full.sm,ns.full.eh,ns.full.em,ns.p1.sh,ns.p1.sm,ns.p1.eh,ns.p1.em,ns.p2.sh,ns.p2.sm,ns.p2.eh,ns.p2.em,ns.p3.sh,ns.p3.sm,ns.p3.eh,ns.p3.em];const el=document.getElementById(id);if(el)el.value=vals[i];});
 }
 
+// Undo anything doSnip() may have left behind if a capture was aborted or hung.
+// A stuck Snip leaves #sb-root force-sized (min-width/width 1400px, height auto) and the
+// #snip-fix <style> injected, which breaks the layout and pushes tab content below the fold.
+function resetSnipState(){
+    const root=document.getElementById('sb-root');
+    if(root){root.style.overflow='';root.style.height='';root.style.minWidth='';root.style.width='';}
+    const leftover=document.getElementById('snip-fix');
+    if(leftover&&leftover.parentNode)leftover.parentNode.removeChild(leftover);
+    const rp=root&&root.querySelector('.sync-right');
+    if(rp){rp.style.position='';rp.style.maxHeight='';rp.style.overflow='';rp.style.top='';rp.style.minHeight='';}
+    const sl=root&&root.querySelector('.sync-layout');
+    if(sl){sl.style.gridTemplateColumns='';sl.style.alignItems='';}
+    const btn=document.getElementById('btn-snip');
+    if(btn){btn.textContent='\uD83D\uDCF7 Snip';btn.disabled=false;}
+}
 function doSnip(){
     if(typeof html2canvas==='undefined'){alert('Screenshot library still loading. Try again in a moment.');return;}
+    // Clear any leftover state from a previous aborted capture before starting a new one.
+    resetSnipState();
     const root=document.getElementById('sb-root');
     const btn=document.getElementById('btn-snip');
     btn.textContent='\u23F3 Capturing...';btn.disabled=true;
+    // Safety net: if html2canvas hangs or never restores, force cleanup after 15s so the
+    // board can never get stuck in "Capturing..." with a broken layout.
+    const snipSafety=setTimeout(()=>{try{resetSnipState();}catch(e){}},15000);
+    window._snipSafety=snipSafety;
     // Temporarily remove sticky/scroll constraints so full content is captured
     const rightPanel=root.querySelector('.sync-right');
     const syncLayout=root.querySelector('.sync-layout');
@@ -2116,6 +2979,7 @@ function doSnip(){
     });
     setTimeout(()=>{
         html2canvas(root,{backgroundColor:isDark?'#1a1a2e':'#ffffff',scale:1.5,useCORS:true,logging:false,windowHeight:root.scrollHeight,height:root.scrollHeight}).then(canvas=>{
+            clearTimeout(snipSafety);
             // Restore textareas
             textareaBackups.forEach(b=>{const div=b.parent.querySelector('div');if(div&&!div.querySelector){}b.next?b.parent.insertBefore(b.ta,b.next):b.parent.appendChild(b.ta);if(div&&div.parentNode)div.parentNode.removeChild(div);});
             // Restore styles
@@ -2130,7 +2994,7 @@ function doSnip(){
                     }).catch(()=>{downloadBlob(blob);btn.textContent='\uD83D\uDCF7 Snip';btn.disabled=false;});
                 } else {downloadBlob(blob);btn.textContent='\uD83D\uDCF7 Snip';btn.disabled=false;}
             },'image/png');
-        }).catch(e=>{document.head.removeChild(style);if(rightPanel){rightPanel.style.position=origStyles.rPos;rightPanel.style.maxHeight=origStyles.rMax;rightPanel.style.overflow=origStyles.rOvf;rightPanel.style.top=origStyles.rTop;}if(syncLayout){syncLayout.style.gridTemplateColumns=origStyles.sGrid;syncLayout.style.alignItems=origStyles.sAlign||'';}root.style.overflow='';root.style.height='';console.error('Snip failed:',e);btn.textContent='\uD83D\uDCF7 Snip';btn.disabled=false;alert('Screenshot failed: '+e.message);});
+        }).catch(e=>{clearTimeout(snipSafety);try{if(document.getElementById('snip-fix'))document.head.removeChild(style);}catch(_){}if(rightPanel){rightPanel.style.position=origStyles.rPos;rightPanel.style.maxHeight=origStyles.rMax;rightPanel.style.overflow=origStyles.rOvf;rightPanel.style.top=origStyles.rTop;rightPanel.style.minHeight=origStyles.rMinH||'';}if(syncLayout){syncLayout.style.gridTemplateColumns=origStyles.sGrid;syncLayout.style.alignItems=origStyles.sAlign||'';}root.style.overflow='';root.style.height='';root.style.minWidth='';root.style.width='';console.error('Snip failed:',e);btn.textContent='\uD83D\uDCF7 Snip';btn.disabled=false;alert('Screenshot failed: '+e.message);});
     },150);
 }
 function downloadBlob(blob){
