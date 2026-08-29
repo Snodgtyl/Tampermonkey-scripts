@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      13.8.0
+// @version      13.9.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -14,6 +14,7 @@
 // @connect      guided-coaching.corp.amazon.com
 // @connect      fcmenu-iad-regionalized.corp.amazon.com
 // @connect      alps-iad.iad.proxy.amazon.com
+// @connect      hooks.slack.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -38,7 +39,7 @@ const SITE_SCHEDULES = {
     QXX6: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:18,sm:30,eh:6,em:15},p1:{sh:19,sm:0,eh:22,em:30},p2:{sh:22,sm:31,eh:2,em:0},p3:{sh:2,sm:0,eh:5,em:30}} },
     SAV7: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:18,sm:30,eh:6,em:15},p1:{sh:19,sm:0,eh:22,em:30},p2:{sh:22,sm:31,eh:2,em:0},p3:{sh:2,sm:0,eh:5,em:30}} },
 };
-const PROCESS_IDS = { stow:'1003035', palletStow:'1003041', pick:'1003065', sort:'1003009', obDock:'1003021', icqa:'1003030', vretPack:'1003056', vretPick:'1003034', rsr:'01003012' };
+const PROCESS_IDS = { stow:'1003035', palletStow:'1003041', pick:'1003065', sort:'1003009', obDock:'1003021', icqa:'1003030', vretPack:'1003056', vretPick:'1003034', rsr:'01003012', wallBuilder:'4300006861' };
 // ICQA DC% (Direct Count %):
 //   numerator   = "Library Deep" (Direct Count) functions: SBC - Library Deep + Other Library Deep
 //   denominator = report GRAND TOTAL paid hours (all functions), read from summary tfoot total row
@@ -51,6 +52,179 @@ const DEFAULT_CONFIG = {
     nights:{ full:{sh:17,sm:45,eh:5,em:30}, p1:{sh:18,sm:15,eh:21,em:45}, p2:{sh:22,sm:15,eh:1,em:15}, p3:{sh:1,sm:15,eh:4,em:45} },
     targets:{}
 };
+
+// ============================ FLOW (Cages-on-dock / runway) ============================
+// Ported from the Flow Analyzer (PPR) userscript by erpadil so the hourly Flow tables
+// carry the same cages-on-dock, runway/backlog health, and Slack notifications.
+// Per-site cage density (units per cage). STOW = inbound dock (IDRT/CTI); LOAD = outbound
+// staged cartons (Pick/Fluid Load). Static per site (not pulled from FCLM).
+const SITE_CAGE_DENSITY_STOW = { AVP8:22, HGR5:27, KRB1:20, KRB2:17, KRB3:19, KRB4:21, KRB6:20, QXX6:20, SAV7:19 };
+const SITE_CAGE_DENSITY_LOAD = { AVP8:19, HGR5:28, KRB1:19, KRB2:19, KRB3:18, KRB4:19, KRB6:18, QXX6:19, SAV7:18 };
+// Runway/backlog thresholds (hours). Inbound: LOW runway = bad. Outbound: HIGH backlog = bad.
+const RUNWAY_RED=0.5, RUNWAY_YELLOW=1.0;       // inbound stow: <30m red, <1h yellow
+const LOAD_BACKLOG_GREEN=1.5, LOAD_BACKLOG_RED=2.0; // outbound load: <=1.5h green, >2h red
+// Slack workflow webhooks (hardcoded, from the Flow Analyzer). SOS = shift cage counts,
+// JOB_BALANCE = a one-line summary each time the flow view is fetched (so the team sees
+// the tool being used). Fire-and-forget; failures never block the UI.
+const SLACK_SOS_WEBHOOK_URL='https://hooks.slack.com/triggers/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';
+const SLACK_JOB_BALANCE_WEBHOOK_URL='https://hooks.slack.com/triggers/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';
+const SOS_LOG_KEY='syncboard_sosLog_v1';
+
+function flowCageDensity(site,mode){
+    const t=mode==='load'?SITE_CAGE_DENSITY_LOAD:SITE_CAGE_DENSITY_STOW;
+    return t[String(site||'').toUpperCase()]||0;
+}
+function loadSosLog(){try{const s=localStorage.getItem(SOS_LOG_KEY);const a=s?JSON.parse(s):[];return Array.isArray(a)?a:[];}catch(e){return[];}}
+function saveSosLog(log){try{localStorage.setItem(SOS_LOG_KEY,JSON.stringify(log));}catch(e){}}
+// Latest saved SOS cage count for a site + direction ('IB'|'OB').
+function getSosRecord(site,direction){
+    if(!site)return null;
+    const want=String(site).toUpperCase(),wantDir=direction?String(direction).toUpperCase():null;
+    const log=loadSosLog();
+    for(let i=log.length-1;i>=0;i--){
+        if(log[i].site!==want)continue;
+        if(wantDir&&(log[i].direction||'').toUpperCase()!==wantDir)continue;
+        return log[i];
+    }
+    return null;
+}
+function saveSosRecord(site,cages,density,direction){
+    if(!site)return null;
+    const entry={site:String(site).toUpperCase(),cages:Number(cages)||0,density:Number(density)||0,savedAt:new Date().toISOString()};
+    if(direction)entry.direction=String(direction).toUpperCase();
+    const log=loadSosLog();log.push(entry);saveSosLog(log);
+    return entry;
+}
+// Fire-and-forget POST to a Slack workflow webhook. Never throws.
+function postToSlack(url,payload,label){
+    if(!url)return;
+    const body=JSON.stringify(payload),tag=label||'Slack webhook';
+    try{
+        if(typeof GM_xmlhttpRequest==='function'){
+            GM_xmlhttpRequest({method:'POST',url,headers:{'Content-Type':'application/json'},data:body,
+                onload:(r)=>{if(r.status<200||r.status>=300)console.warn('[SB-Slack] '+tag+' HTTP',r.status);},
+                onerror:(e)=>console.warn('[SB-Slack] '+tag+' failed:',e)});
+        }else{
+            fetch(url,{method:'POST',mode:'no-cors',headers:{'Content-Type':'application/json'},body}).catch(e=>console.warn('[SB-Slack] '+tag+' fetch failed:',e));
+        }
+    }catch(e){console.warn('[SB-Slack] '+tag+' error:',e);}
+}
+function fmtSlackTime(iso){try{return new Date(iso).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});}catch(e){return iso;}}
+// SOS Slack message (mirrors the Flow Analyzer's single `message` variable).
+function postSosToSlack(rec){
+    const cases=(Number(rec.cages)||0)*(Number(rec.density)||0);
+    const dir=rec.direction?rec.direction+' | ':'';
+    const message='SOS Cages | '+dir+rec.site+' | '+Math.round(rec.cages)+' cages @ density '+rec.density+
+        ' (~'+Math.round(cases)+' cases) | '+fmtSlackTime(rec.savedAt);
+    postToSlack(SLACK_SOS_WEBHOOK_URL,{message},'SOS Slack webhook');
+}
+// Job-balance Slack message posted when a flow view is fetched.
+function postJobBalanceToSlack(s){
+    const dir=s.direction?s.direction+' | ':'';
+    const totalCages=Math.round(Number(s.cages)||0);
+    const message=dir+s.site+' | Total Cages: '+totalCages.toLocaleString()+' | Avg Runway: '+(s.runwayText||'N/A')+
+        ' | '+(s.status||'N/A')+' | '+fmtSlackTime(new Date().toISOString());
+    postToSlack(SLACK_JOB_BALANCE_WEBHOOK_URL,{message},'Job Balance Slack webhook');
+}
+// Post a "flow view fetched" summary to the job-balance Slack channel. Headlines the OB
+// dock (falls back to IB): current cages on dock + runway/backlog status. Fire-and-forget.
+function postHourlyFlowToSlack(hourlyData,config){
+    if(!hourlyData||!hourlyData.length)return;
+    const site=(config.site||'').toUpperCase();
+    // Prefer OB if there's outbound activity, else IB.
+    const obActive=hourlyData.some(h=>(h.ob&&(h.ob.pickUnits>0||h.ob.loadedUnits>0)));
+    const dir=obActive?'OB':'IB';
+    const rec=getSosRecord(site,dir);
+    const density=(rec&&rec.density>0)?rec.density:flowCageDensity(site,obActive?'load':'stow');
+    // Find the latest hour with flow and its cages (walkCages already set h.ob.cages/h.ib.cages).
+    let cages=0,status='N/A',runwayText='N/A';
+    for(let i=hourlyData.length-1;i>=0;i--){
+        const h=hourlyData[i];
+        if(obActive){
+            if(h.ob&&(h.ob.pickUnits>0||h.ob.loadedUnits>0)){
+                cages=h.ob.cages||0;const clear=h.ob.loadedRate||0;const cod=cages*density;
+                const b=dockHealthBucket(cod,clear,'load',true);
+                status=b?b.charAt(0).toUpperCase()+b.slice(1):'N/A';
+                runwayText=(clear>0)?((cod/clear<1)?Math.round(cod/clear*60)+'m':(cod/clear).toFixed(1)+'h'):'\u221E';
+                break;
+            }
+        }else if(h.ib&&(h.ib.rsrVol>0||h.ib.stowUnits>0)){
+            cages=h.ib.cages||0;const clear=h.ib.stowUnits||0;const cod=cages*density;
+            const b=dockHealthBucket(cod,clear,'stow',true);
+            status=b?b.charAt(0).toUpperCase()+b.slice(1):'N/A';
+            runwayText=(clear>0)?((cod/clear<1)?Math.round(cod/clear*60)+'m':(cod/clear).toFixed(1)+'h'):'1h+';
+            break;
+        }
+    }
+    postJobBalanceToSlack({site,cages,status,runwayText,direction:obActive?'Outbound':'Inbound'});
+}
+// Prefill the hourly SOS inputs: densities from the site table, cages from the last saved
+// record for the current site + direction. Called on init and after a save.
+function initSosControls(){
+    const site=(loadConfig().site||'').toUpperCase();
+    const ibD=document.getElementById('sos-ib-density'),obD=document.getElementById('sos-ob-density');
+    if(ibD&&!ibD.value){const d=flowCageDensity(site,'stow');if(d)ibD.value=d;}
+    if(obD&&!obD.value){const d=flowCageDensity(site,'load');if(d)obD.value=d;}
+    const ibRec=getSosRecord(site,'IB'),obRec=getSosRecord(site,'OB');
+    const ibC=document.getElementById('sos-ib-cages'),obC=document.getElementById('sos-ob-cages');
+    if(ibC&&!ibC.value&&ibRec)ibC.value=Math.round(ibRec.cages);
+    if(obC&&!obC.value&&obRec)obC.value=Math.round(obRec.cages);
+    updateSosNote();
+}
+function updateSosNote(){
+    const note=document.getElementById('sos-note');if(!note)return;
+    const site=(loadConfig().site||'').toUpperCase();
+    const ib=getSosRecord(site,'IB'),ob=getSosRecord(site,'OB');
+    const bits=[];
+    if(ib)bits.push('IB '+Math.round(ib.cages)+' @ '+fmtSlackTime(ib.savedAt));
+    if(ob)bits.push('OB '+Math.round(ob.cages)+' @ '+fmtSlackTime(ob.savedAt));
+    note.textContent=bits.length?('Saved: '+bits.join('  |  ')):('No saved SOS for '+site+'.');
+}
+// Save the SOS cage count for a direction, persist locally, and post to the SOS Slack webhook.
+function saveSosFromUi(direction){
+    const site=(loadConfig().site||'').toUpperCase();
+    const isIB=direction==='IB';
+    const cages=parseFloat(document.getElementById(isIB?'sos-ib-cages':'sos-ob-cages')?.value)||0;
+    const density=parseFloat(document.getElementById(isIB?'sos-ib-density':'sos-ob-density')?.value)||flowCageDensity(site,isIB?'stow':'load');
+    const rec=saveSosRecord(site,cages,density,direction);
+    if(rec)postSosToSlack(rec);
+    updateSosNote();
+    const btn=document.getElementById(isIB?'btn-save-sos-ib':'btn-save-sos-ob');
+    if(btn){const t=btn.textContent;btn.textContent='\u2713 Saved';setTimeout(()=>{btn.textContent=t;},1500);}
+    // Re-render so the newly-saved SOS seeds the cage walk immediately.
+    if(currentHourly&&currentHourly.data)renderHourlyTables(currentHourly.data,currentHourly.totalHours);
+}
+// Classify hours-of-work-on-dock into a health bucket (Flow Analyzer model).
+//   mode 'load' (outbound): backlog HIGH = bad. <1.5h healthy, 1.5-2h warning, >=2h critical.
+//   mode 'stow' (inbound):  runway LOW = bad. >=1h healthy, 30-59m warning, <=29m/empty critical.
+// Returns null when the hour is idle (no flow) so it's excluded from tallies.
+function dockHealthBucket(casesOnDock,clearRate,mode,hasFlow){
+    if(casesOnDock==null||isNaN(casesOnDock))return null;
+    if(!hasFlow)return null;
+    if(mode==='load'){
+        if(casesOnDock<=0)return 'healthy';
+        if(!(clearRate>0))return 'critical';
+        const h=casesOnDock/clearRate;
+        return h<LOAD_BACKLOG_GREEN?'healthy':h<LOAD_BACKLOG_RED?'warning':'critical';
+    }
+    if(casesOnDock<=0)return 'critical';
+    if(!(clearRate>0))return 'healthy';
+    const h=casesOnDock/clearRate;
+    return h>=RUNWAY_YELLOW?'healthy':h>=RUNWAY_RED?'warning':'critical';
+}
+// Walk the hours building a running cages-on-dock balance seeded from SOS, floored at 0.
+// inflowKey/outflowKey pick which per-hour volume adds vs clears the dock. Sets h[cageProp].
+// Returns the final running balance.
+function walkCages(hours,inflowKey,outflowKey,seedCages,density,cageProp){
+    if(!(density>0))return 0;
+    let running=Number(seedCages)||0;
+    hours.forEach(h=>{
+        const inflow=h[inflowKey]||0,outflow=h[outflowKey]||0;
+        running=Math.max(0,running+(inflow-outflow)/density);
+        h[cageProp]=running;
+    });
+    return running;
+}
 
 function loadConfig(){try{const s=localStorage.getItem(STORAGE_KEY);if(s){const c={...DEFAULT_CONFIG,...JSON.parse(s)};
     // Always use SITE_SCHEDULES for the selected site's period times (source of truth)
@@ -98,7 +272,37 @@ function parseFnRollup(html){
     }
     // For OB Dock: Fluid Load Jobs = FluidLoadCase Jobs (tfoot index 1) + FluidLoadTote Jobs (tfoot index 7)
     const fluidLoadJobs=units+fluidLoadToteJobs;
-    return{totalUnits:units,directHours:hours,rate,headcount:hc,palletCases,eachUnits,caseUnits,fluidLoadJobs};
+    // OB Dock "Loaded Cartons Rate" = the Fluid Load - Case function's JPH (554.52 in the report),
+    // read off that function group's own "Total" row. Numerics in that row are
+    // [hours, jobs, JPH, each-unit, each-uph, case-unit, case-uph]; JPH = index 2.
+    let fluidCaseJPH=0,fluidCaseJobs=0;
+    let foundFLC=false;
+    for(const row of rows){
+        if(!foundFLC&&Array.from(row.querySelectorAll('th,td,a')).some(c=>/fluid\s*load\s*[-\u2013]?\s*case/i.test(c.textContent.trim())))foundFLC=true;
+        if(foundFLC){
+            const cellTexts=Array.from(row.querySelectorAll('td')).map(c=>c.textContent.trim());
+            if(cellTexts.includes('Total')){
+                const nums=[];cellTexts.forEach(c=>{const v=parseFloat(c.replace(/,/g,''));if(!isNaN(v))nums.push(v);});
+                if(nums.length>=3){fluidCaseJobs=Math.round(nums[1]);fluidCaseJPH=nums[2];}
+                break;
+            }
+        }
+    }
+    return{totalUnits:units,directHours:hours,rate,headcount:hc,palletCases,eachUnits,caseUnits,fluidLoadJobs,fluidCaseJPH,fluidCaseJobs};
+}
+// Wall Builder report (process 4300006861): total paid hours = tfoot total row's
+// "size-total highlighted" cell (data-column="9"), e.g. 27.45. Used as Wall Builder HC per hour.
+function parseWallBuilderHours(html){
+    try{
+        const doc=new DOMParser().parseFromString(html,'text/html');
+        const tr=doc.querySelector('tfoot tr.total.empl-all')||doc.querySelector('tr.total.empl-all')||doc.querySelector('tfoot tr.total')||doc.querySelector('tfoot tr');
+        if(!tr)return 0;
+        const cell=tr.querySelector('td.size-total')||tr.querySelector('td[data-column="9"]');
+        if(cell){const v=parseFloat(cell.textContent.replace(/,/g,''));if(!isNaN(v))return v;}
+        // Fallback: last numeric cell in the total row.
+        const nums=Array.from(tr.querySelectorAll('td')).map(c=>parseFloat(c.textContent.replace(/,/g,''))).filter(v=>!isNaN(v));
+        return nums.length?nums[nums.length-1]:0;
+    }catch(e){return 0;}
 }
 
 function parsePPR(html){
@@ -669,9 +873,6 @@ function attemptLPFetch(site,resolve,isRetry){
                     });
                     // Pick rate from UnderatedRatesAndHours (Cartons value is the diluted rate)
                     fetchLPPageAutoRate(planId,'UnderatedRatesAndHours',sundayStr,'Transfer Out Pick - Small',(v)=>{results.topRate=v;done++;checkDone();});
-                    // Capture per-process-path planned rates (DeratedRates, Forecast/Units) for the EOS Wash
-                    // % to LP column. No extra network cost beyond this one page fetch.
-                    fetchEOSPlannedRates(planId,sundayStr);
                     fetchLPPageAutoRate(planId,'Density',sundayStr,'Case Transfer In',(v)=>{results.ibDensityLP=v;done++;checkDone();});
                     fetchLPPageAutoRate(planId,'Density',sundayStr,'DA Bldg to Bldg Transfer TOTAL',(v)=>{results.obDensityLP=v;done++;checkDone();});
                     // BB Goals: Week Capacity (Cartons) for today's day from IB and DA
@@ -744,38 +945,6 @@ function fetchLPPageAuto(planId,pageName,sundayStr,fieldName,targetKey,callback)
     });
 }
 
-// EOS Wash: capture per-process-path PLANNED RATES from the GalaxyBI DeratedRates page
-// (type=Forecast, packType=Units) keyed by line-item name, and cache them in localStorage.
-// Used as the denominator for the EOS Wash "% to LP" column (actual rate / planned rate).
-function fetchEOSPlannedRates(planId,sundayStr){
-    const site=loadConfig().site;
-    const url=`https://galaxybi.aka.corp.amazon.com/api/metadata/pageUrl?pageName=DeratedRates&planId=${planId}&site=${site}`;
-    GM_xmlhttpRequest({method:'GET',url,headers:{'Accept':'*/*','Content-Type':'application/json'},
-        onload:function(resp){
-            try{
-                const t=resp.responseText.trim();if(!t.startsWith('{'))return;
-                const s3=JSON.parse(t).url;if(!s3)return;
-                GM_xmlhttpRequest({method:'GET',url:s3,headers:{'Accept':'*/*'},
-                    onload:function(s3r){
-                        try{
-                            const rows=JSON.parse(s3r.responseText);
-                            const rates={};
-                            rows.forEach(r=>{
-                                if(r.date!==sundayStr)return;
-                                if(r.type!=='Forecast'||r.packType!=='Units')return;
-                                const li=(r.lineItem||'').trim();if(!li)return;
-                                const v=parseFloat(r.value);if(!isNaN(v)&&v>0)rates[li]=v;
-                            });
-                            try{localStorage.setItem('syncboard_eos_rates',JSON.stringify(rates));}catch(e){}
-                            console.log('[SB-EOS] planned rates cached:',Object.keys(rates).length,'line items');
-                        }catch(e){console.warn('[SB-EOS] rates parse err',e);}
-                    }
-                });
-            }catch(e){console.warn('[SB-EOS] rates err',e);}
-        }
-    });
-}
-function loadEOSPlannedRates(){try{const s=localStorage.getItem('syncboard_eos_rates');return s?JSON.parse(s):{};}catch(e){return{};}}
 function fetchLPPageAutoRate(planId,pageName,sundayStr,targetLineItem,callback){
     const site=loadConfig().site;
     const url=`https://galaxybi.aka.corp.amazon.com/api/metadata/pageUrl?pageName=${pageName}&planId=${planId}&site=${site}`;
@@ -1597,7 +1766,7 @@ function buildHTML(){return `
 </div>
 </div>
 <div id="vret-panel" style="background:#fff;border:2px solid #000;border-radius:4px;border-left:4px solid #e65100;padding:10px 14px;margin-top:6px;">
-<h3 style="font-size:11px;font-weight:700;margin-bottom:6px;">VRETs (Weekly Pack) <span style="margin-left:8px;font-size:10px;background:#fff3e0;color:#e65100;padding:2px 8px;border-radius:4px;font-weight:700;">see VRETs tab</span></h3>
+<h3 style="font-size:11px;font-weight:700;margin-bottom:6px;">VRETs (Weekly Pack \u2013 Units) <span style="margin-left:8px;font-size:10px;background:#fff3e0;color:#e65100;padding:2px 8px;border-radius:4px;font-weight:700;">see VRETs tab</span></h3>
 <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;font-size:12px;">
 <div><span style="color:#333;font-size:10px;">PACK WTD</span><br><strong id="sync-vret-wtd" style="font-size:16px;">\u2014</strong></div>
 <div><span style="color:#333;font-size:10px;">WEEK GOAL</span><br><strong id="sync-vret-goal" style="font-size:16px;">\u2014</strong></div>
@@ -1668,7 +1837,15 @@ function buildHTML(){return `
 </div></main>
 
 <main id="tab-hourly" class="tab-content"><div class="hourly-container">
-<div class="section-header"><h2>Hourly Breakdown</h2><button id="btn-fetch-hourly" class="btn btn-primary">\u25B6 Fetch Hourly</button><span id="hourly-status" class="meta-text"></span></div>
+<div class="section-header"><h2>Hourly Flow</h2><button id="btn-fetch-hourly" class="btn btn-primary">\u25B6 Fetch Hourly</button><span id="hourly-status" class="meta-text"></span></div>
+<div class="sos-bar" style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;background:#fff;border:2px solid #000;border-radius:4px;padding:8px 14px;margin-bottom:10px;">
+<strong style="font-size:12px;">Start-of-Shift Cages:</strong>
+<label style="font-size:12px;">IB (Received) <input type="number" id="sos-ib-cages" class="target-input" style="width:70px;" min="0" step="1"> @ <input type="number" id="sos-ib-density" class="target-input" style="width:60px;" min="0" step="0.1" title="cases/cage"></label>
+<label style="font-size:12px;">OB (Loaded) <input type="number" id="sos-ob-cages" class="target-input" style="width:70px;" min="0" step="1"> @ <input type="number" id="sos-ob-density" class="target-input" style="width:60px;" min="0" step="0.1" title="cartons/cage"></label>
+<button id="btn-save-sos-ib" class="btn" style="font-size:11px;padding:5px 10px;">\uD83D\uDCBE Save IB SOS</button>
+<button id="btn-save-sos-ob" class="btn" style="font-size:11px;padding:5px 10px;">\uD83D\uDCBE Save OB SOS</button>
+<span id="sos-note" style="font-size:11px;color:#666;"></span>
+</div>
 <div id="hourly-tables"></div>
 </div></main>
 
@@ -1826,6 +2003,18 @@ function buildCSS2(){return `
 .hourly-section.ib-hourly{border-left:4px solid #1565c0;}
 .hourly-section.ob-hourly{border-left:4px solid #e65100;}
 .hourly-section.sort-hourly{border-left:4px solid #6a1b9a;}
+.hourly-section.ob-flow-hourly{border-left:4px solid #e65100;}
+.hourly-section.ib-flow-hourly{border-left:4px solid #1565c0;}
+/* OB Flow table: hours as rows, centered cells, light zebra striping (Hour + Cartons Pick tinted) */
+.flow-table{border-collapse:collapse;width:100%;}
+.flow-table th,.flow-table td{padding:9px 12px;text-align:center;font-size:12.5px;border-bottom:1px solid #e0e0e0;white-space:nowrap;}
+.flow-table th{background:#f5f5f5;font-weight:700;border-bottom:2px solid #ccc;}
+.flow-table tbody tr:nth-child(even){background:#fafafa;}
+.flow-table td:nth-child(2){background:rgba(255,243,224,0.55);}
+#sb-root.dark-mode .flow-table th{background:#12294d!important;border-color:#444!important;}
+#sb-root.dark-mode .flow-table td{border-color:#333!important;}
+#sb-root.dark-mode .flow-table tbody tr:nth-child(even){background:#123055!important;}
+#sb-root.dark-mode .flow-table td:nth-child(2){background:#1a3a2e!important;}
 /* EOS Wash */
 .eoswash-container{padding:4px 0;}
 .eoswash-section{background:#fff;border:2px solid #000;border-radius:4px;padding:12px 16px;margin-bottom:10px;}
@@ -1922,6 +2111,20 @@ function buildCSS2(){return `
 #sb-root.dark-mode .hourly-container,#sb-root.dark-mode .hourly-section{background:#0f3460!important;border-color:#444!important;color:#e0e0e0!important;}
 #sb-root.dark-mode .hourly-section h3{color:#e0e0e0!important;}
 #sb-root.dark-mode .hourly-section .metrics-table th,#sb-root.dark-mode .hourly-section .metrics-table td{color:#e0e0e0!important;border-color:#444!important;}
+/* Dark-mode Flow section distinction: keep the blue (IB) / orange (OB) accent borders
+   (the blanket .hourly-section border-color:#444 above would otherwise flatten them),
+   thicken them, and add a matching full outline + tinted header so IB vs OB read clearly. */
+#sb-root.dark-mode .hourly-section.ib-flow-hourly{border:2px solid #2a6fc0!important;border-left:6px solid #4a9eff!important;}
+#sb-root.dark-mode .hourly-section.ob-flow-hourly{border:2px solid #b85c1a!important;border-left:6px solid #ff9800!important;}
+#sb-root.dark-mode .ib-flow-hourly h3{color:#7ab8ff!important;}
+#sb-root.dark-mode .ob-flow-hourly h3{color:#ffb74d!important;}
+#sb-root.dark-mode .ib-flow-hourly .flow-table th{background:#123a63!important;color:#cfe4ff!important;}
+#sb-root.dark-mode .ob-flow-hourly .flow-table th{background:#4a2e14!important;color:#ffe0b8!important;}
+/* Hourly SOS cage bar dark-mode */
+#sb-root.dark-mode .sos-bar{background:#0f3460!important;border-color:#444!important;color:#e0e0e0!important;}
+#sb-root.dark-mode .sos-bar strong,#sb-root.dark-mode .sos-bar label,#sb-root.dark-mode .sos-bar span{color:#e0e0e0!important;}
+/* Flow table (own .flow-table styling, NOT .metrics-table) so inline green/red cell colors survive dark mode. */
+#sb-root.dark-mode .flow-table td,#sb-root.dark-mode .flow-table th{color:#e0e0e0;}
 /* EOS Wash dark-mode */
 #sb-root.dark-mode .eoswash-section{background:#0f3460!important;border-color:#444!important;color:#e0e0e0!important;}
 #sb-root.dark-mode .eoswash-section h3{color:#e0e0e0!important;}
@@ -1994,9 +2197,14 @@ async function fetchHourlyData(){
     }
     const totalHours=hours.length;
 
-    // Fetch each hour in parallel (same as fetchPeriod)
+    // Fetch each hour in parallel (same as fetchPeriod). Wall Builder (4300006861) uses a
+    // different report shape, so fetch it separately per hour and parse its total paid hours.
+    const wbUrl=(hr)=>{let sDate=new Date(startDate);if(hr.sh<12&&startDate.getHours()>=12){sDate.setDate(sDate.getDate()+1);}let eDate=new Date(sDate);if(hr.eh<hr.sh)eDate.setDate(eDate.getDate()+1);return buildFnUrl(site,PROCESS_IDS.wallBuilder,sDate,hr.sh,hr.sm,eDate,hr.eh,hr.em);};
     try{
-        const results=await Promise.all(hours.map(hr=>fetchPeriod(site,startDate,hr)));
+        const [results,wallBuilderHrs]=await Promise.all([
+            Promise.all(hours.map(hr=>fetchPeriod(site,startDate,hr))),
+            Promise.all(hours.map(async hr=>{try{return parseWallBuilderHours(await fetchHTML(wbUrl(hr)));}catch(e){return 0;}}))
+        ]);
         const hourlyData=results.map((raw,i)=>{
             const stow=raw.stow||{},pStow=raw.palletStow||{},pick=raw.pick||{},obDock=raw.obDock||{},sort=raw.sort||{},ppr=raw.ppr||{},rsr=raw.rsr||{};
             const palletCases=pStow.palletCases||0;
@@ -2013,8 +2221,18 @@ async function fetchHourlyData(){
             const obIndirect=daHrs>obPickDH?daHrs-obPickDH:0;
             return{
                 label:hours[i].label,
-                ib:{totalStow:ibU,stowUnits:stow.totalUnits||0,palletUnits:pStow.totalUnits||0,rate:stow.rate||0,rsrRate:rsr.rate||0,directHours:ibDH,indirectHours:ibIndirect,totalHours:ibTotalHrs,directPct:ibTotalHrs>0?(ibDH/ibTotalHrs)*100:0,indirectPct:ibTotalHrs>0?(ibIndirect/ibTotalHrs)*100:0,cplh:cplhHrs>0?ibU/cplhHrs:0,pctToOP:(ppr.ibPlannedHrs||0)>0?(ibTotalHrs/ppr.ibPlannedHrs)*100:0},
-                ob:{pickUnits:pick.totalUnits||0,loadedUnits:obDock.fluidLoadJobs||0,pickRate:pick.rate||0,directHours:obPickDH,indirectHours:obIndirect,totalHours:daHrs,directPct:daHrs>0?(obPickDH/daHrs)*100:0,indirectPct:daHrs>0?(obIndirect/daHrs)*100:0,cplh:daHrs>0?(obDock.fluidLoadJobs||0)/daHrs:0,pctToOP:(ppr.daTransferPlan||0)>0?(daHrs/ppr.daTransferPlan)*100:0},
+                ib:{totalStow:ibU,stowUnits:stow.totalUnits||0,palletUnits:pStow.totalUnits||0,rate:stow.rate||0,rsrRate:rsr.rate||0,
+                    // Flow view fields (new IB hourly style): received vs stowed balance.
+                    rsrVol:rsr.totalUnits||0,          // Cases Received = RSR/IDRT support volume
+                    rsrHC:rsr.headcount||0,            // Receive HC (active AAs receiving)
+                    stowHC:stow.headcount||0,          // Stow HC (active AAs stowing)
+                    directHours:ibDH,indirectHours:ibIndirect,totalHours:ibTotalHrs,directPct:ibTotalHrs>0?(ibDH/ibTotalHrs)*100:0,indirectPct:ibTotalHrs>0?(ibIndirect/ibTotalHrs)*100:0,cplh:cplhHrs>0?ibU/cplhHrs:0,pctToOP:(ppr.ibPlannedHrs||0)>0?(ibTotalHrs/ppr.ibPlannedHrs)*100:0},
+                ob:{pickUnits:pick.totalUnits||0,loadedUnits:obDock.fluidLoadJobs||0,pickRate:pick.rate||0,directHours:obPickDH,indirectHours:obIndirect,totalHours:daHrs,directPct:daHrs>0?(obPickDH/daHrs)*100:0,indirectPct:daHrs>0?(obIndirect/daHrs)*100:0,cplh:daHrs>0?(obDock.fluidLoadJobs||0)/daHrs:0,pctToOP:(ppr.daTransferPlan||0)>0?(daHrs/ppr.daTransferPlan)*100:0,
+                    // Flow view fields (new OB hourly style)
+                    pickHC:pick.headcount||0,               // active AAs in Transfer Out Pick this hour
+                    loadedHC:obDock.headcount||0,            // active AAs on the dock this hour
+                    wallBuilderHC:wallBuilderHrs[i]||0,      // Wall Builder total paid hours this hour
+                    loadedRate:obDock.fluidCaseJPH||0},      // Loaded Cartons Rate = Fluid Load - Case JPH
                 sort:{totalUnits:sort.totalUnits||0,rate:sort.rate||0,directHours:sort.directHours||0,cplh:(sort.directHours||0)>0?sort.totalUnits/sort.directHours:0}
             };
         });
@@ -2034,33 +2252,22 @@ function renderHourlyTables(hourlyData,totalHours){
     // Remember the data so the dark/day toggle can re-render colors without re-fetching.
     currentHourly={data:hourlyData,totalHours:totalHours};
     const config=loadConfig();
-    const ibGoal=parseFloat(document.getElementById('ib-goal-input')?.value)||0;
-    const obGoal=parseFloat(document.getElementById('ob-goal-input')?.value)||0;
+    // Sort table still uses goal/per-hour target for its cumulative "Sync Metrics" row.
     const sortGoal=parseFloat(document.getElementById('sort-goal')?.value)||0;
-    const ibRateT=parseFloat(document.getElementById('ib-rate-target')?.value)||0;
-    const obRateT=parseFloat(document.getElementById('ob-rate-target')?.value)||0;
-    const ibCplhT=parseFloat(document.getElementById('ib-cplh-target')?.value)||0;
-    const obCplhT=parseFloat(document.getElementById('ob-cplh-target')?.value)||0;
-
-    const ibPerHr=ibGoal>0?Math.round(ibGoal/totalHours):0;
-    const obPerHr=obGoal>0?Math.round(obGoal/totalHours):0;
     const sortPerHr=sortGoal>0?Math.round(sortGoal/totalHours):0;
 
     function condBg(actual,target){if(!actual||actual<=0||!target||target<=0)return'';return actual>=target?'background:rgba(46,125,50,0.12)':actual>=target*0.9?'background:rgba(230,81,0,0.1)':'background:rgba(198,40,40,0.1)';}
     function fv(v,d=0){if(!v||isNaN(v)||v===0)return'';return Number(v).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d});}
-    function fvPct(v){if(!v||isNaN(v)||v===0)return'';return v.toFixed(1)+'%';}
     function actTarget(actual,target,decimals=0){const a=fv(actual,decimals);const t=fv(target,decimals);if(!a&&!t)return'';if(!t)return a;if(!a)return'— / '+t;return a+' / '+t;}
 
     // Headers
     const headers=hourlyData.map(h=>'<th>'+h.label+'</th>').join('');
     const totalHeader='<th>Total</th>';
 
-    // Calculate cumulative totals
-    let ibCum=0,obCum=0,sortCum=0;
-    const ibCums=[],obCums=[],sortCums=[];
-    hourlyData.forEach(h=>{ibCum+=h.ib.totalStow;obCum+=h.ob.pickUnits;sortCum+=h.sort.totalUnits;ibCums.push(ibCum);obCums.push(obCum);sortCums.push(sortCum);});
+    // Cumulative Sorted total for the Sort table's running "Sync Metrics" row.
+    let sortCum=0;const sortCums=[];
+    hourlyData.forEach(h=>{sortCum+=h.sort.totalUnits;sortCums.push(sortCum);});
 
-    // IB Table
     function buildTable(title,cssClass,rows){
         return `<section class="hourly-section ${cssClass}"><h3>${title}</h3><div style="overflow-x:auto;"><table class="metrics-table"><thead><tr><th></th>${headers}${totalHeader}</tr></thead><tbody>${rows}</tbody></table></div></section>`;
     }
@@ -2078,29 +2285,6 @@ function renderHourlyTables(hourlyData,totalHours){
         return`<tr class="row-sync"><td class="bold">${label}</td>${cells}<td style="font-weight:700;">${actTarget(cums[cums.length-1]||0,goal)}</td></tr>`;
     }
 
-    const ibTargetRow=ibPerHr>0?`<tr class="row-target"><td class="bold">Target (per hr)</td>${hourlyData.map((_,i)=>`<td>${fv(ibPerHr*(i+1))}</td>`).join('')}<td style="font-weight:700;">${fv(ibGoal)}</td></tr>`:'';
-    const ibRows=ibTargetRow+
-        ibCumRow('Sync Metrics (Running Total)',ibCums,ibPerHr,ibGoal)+
-        ibRow('Cases Stowed',h=>h.ib.stowUnits)+
-        ibRow('Pallets Stowed',h=>h.ib.palletUnits)+
-        ibRateRow('Stow Rate',h=>h.ib.rate,ibRateT)+
-        ibRateRow('RSR (Receive Rate)',h=>h.ib.rsrRate,0)+
-        ibRow('Direct Hours',h=>h.ib.directHours,0,2)+
-        ibRow('Indirect Hours',h=>h.ib.indirectHours,0,2)+
-        ibRow('Total Hours',h=>h.ib.totalHours,0,2)+
-        `<tr class="row-cplh"><td class="bold">CPLH</td>${hourlyData.map(h=>{const v=h.ib.cplh;const style=ibCplhT&&v>0?(v>=ibCplhT?'background:rgba(46,125,50,0.12)':v>=ibCplhT*0.9?'background:rgba(230,81,0,0.1)':'background:rgba(198,40,40,0.1)'):'';return`<td style="${style}">${fv(v,2)}</td>`;}).join('')}<td style="font-weight:700;">${actTarget(ibCum>0&&hourlyData.reduce((s,h)=>s+h.ib.totalHours,0)>0?ibCum/hourlyData.reduce((s,h)=>s+h.ib.totalHours,0):0,ibCplhT,2)}</td></tr>`;
-
-    const obTargetRow=obPerHr>0?`<tr class="row-target"><td class="bold">Target (per hr)</td>${hourlyData.map((_,i)=>`<td>${fv(obPerHr*(i+1))}</td>`).join('')}<td style="font-weight:700;">${fv(obGoal)}</td></tr>`:'';
-    const obRows=obTargetRow+
-        ibCumRow('Sync Metrics (Running Total)',obCums,obPerHr,obGoal)+
-        ibRow('Picked',h=>h.ob.pickUnits)+
-        ibRow('Loaded',h=>h.ob.loadedUnits)+
-        ibRateRow('Pick Rate',h=>h.ob.pickRate,obRateT)+
-        ibRow('Direct Hours',h=>h.ob.directHours,0,2)+
-        ibRow('Indirect Hours',h=>h.ob.indirectHours,0,2)+
-        ibRow('Total Hours',h=>h.ob.totalHours,0,2)+
-        `<tr class="row-cplh"><td class="bold">CPLH</td>${hourlyData.map(h=>{const v=h.ob.cplh;const style=obCplhT&&v>0?(v>=obCplhT?'background:rgba(46,125,50,0.12)':v>=obCplhT*0.9?'background:rgba(230,81,0,0.1)':'background:rgba(198,40,40,0.1)'):'';return`<td style="${style}">${fv(v,2)}</td>`;}).join('')}<td style="font-weight:700;">${actTarget(obCum>0&&hourlyData.reduce((s,h)=>s+h.ob.totalHours,0)>0?obCum/hourlyData.reduce((s,h)=>s+h.ob.totalHours,0):0,obCplhT,2)}</td></tr>`;
-
     let sortHTML='';
     const hasSortData=hourlyData.some(h=>h.sort.totalUnits>0);
     if(hasSortData){
@@ -2114,7 +2298,125 @@ function renderHourlyTables(hourlyData,totalHours){
         sortHTML=buildTable('SORT | Hourly','sort-hourly',sortRows);
     }
 
-    container.innerHTML=buildTable('INBOUND | Hourly','ib-hourly',ibRows)+buildTable('OUTBOUND | Hourly','ob-hourly',obRows)+sortHTML;
+    function bucketLabel(b){return b==='healthy'?'Healthy':b==='warning'?'Warning':b==='critical'?'Critical':'\u2014';}
+    // Runway text for a status cell tooltip.
+    function runwayTxt(cases,rate){if(!(rate>0))return cases>0?'\u221E (nothing clearing)':'0';const hh=cases/rate;return hh<1?Math.round(hh*60)+'m':hh.toFixed(1)+'h';}
+    // Status rendered as a tinted chip so Healthy/Warning/Critical pop in BOTH themes
+    // (dark mode gets a solid pill; light mode a soft tint). tip = optional title attr.
+    function statusBadge(bucket,dk,tip){
+        if(!bucket)return `<td style="color:#888;"${tip||''}>\u2014</td>`;
+        const map=dk
+            ?{healthy:['#0f5132','#69f0ae'],warning:['#5a3a00','#ffcc80'],critical:['#5c1a1a','#ff8a80']}
+            :{healthy:['#e8f5e9','#1b5e20'],warning:['#fff3e0','#e65100'],critical:['#ffebee','#b71c1c']};
+        const [bg,fg]=map[bucket];
+        return `<td${tip||''}><span style="display:inline-block;padding:2px 10px;border-radius:10px;background:${bg};color:${fg};font-weight:700;font-size:11.5px;">${bucketLabel(bucket)}</span></td>`;
+    }
+
+    // ---- OB "Flow" hourly table (hours as rows). Status = runway/backlog health. ----
+    // Flow Balance = Loaded Cartons / Cartons Pick (%). Deviation = |Balance-100|.
+    // Cages on Dock = running (picked - loaded)/density seeded from saved OB SOS. Status:
+    // outbound backlog HIGH = bad (<1.5h Healthy, 1.5-2h Warning, >=2h Critical).
+    function buildOBFlowTable(){
+        const dk=document.getElementById('sb-root')?.classList.contains('dark-mode');
+        const GREEN=dk?'#69f0ae':'#2e7d32',RED=dk?'#ff5252':'#c62828';
+        const site=(config.site||'').toUpperCase();
+        const obRec=getSosRecord(site,'OB');
+        const density=(obRec&&obRec.density>0)?obRec.density:flowCageDensity(site,'load');
+        const seed=obRec?obRec.cages:0;
+        // Walk cages on dock (picked adds, loaded clears).
+        if(density>0)walkCages(hourlyData.map(h=>h.ob),'pickUnits','loadedUnits',seed,density,'cages');
+        const cols=['Hour','Cartons Pick','Loaded Cartons','Difference','Cages on Dock','Cartons Pick HC','Cartons Pick Rate','Loaded Cartons HC','Wall Builder HC','Loaded Cartons Rate','Flow Balance','Flow Deviation','Status'];
+        const head='<tr>'+cols.map(c=>`<th>${c}</th>`).join('')+'</tr>';
+        const rows=hourlyData.map(h=>{
+            const o=h.ob;
+            const pick=o.pickUnits||0,loaded=o.loadedUnits||0;
+            const diff=pick-loaded;
+            const balance=pick>0?(loaded/pick*100):0;
+            const deviation=balance>0?Math.abs(balance-100):0;
+            const balColor=balance>=100?GREEN:RED;
+            const hasFlow=(pick>0||loaded>0);
+            // Clear rate = per-associate load rate (Loaded Cartons Rate = Fluid Load - Case JPH).
+            const clearRate=o.loadedRate||0;
+            const casesOnDock=(density>0&&o.cages!=null)?o.cages*density:null;
+            const bucket=(density>0)?dockHealthBucket(casesOnDock,clearRate,'load',hasFlow):(hasFlow?(balance>=100?'healthy':'warning'):null);
+            const cagesTxt=(density>0&&o.cages!=null)?Math.round(o.cages).toLocaleString():'\u2014';
+            const cagesColor=(o.cages!=null&&o.cages<=0)?GREEN:(dk?'#e0e0e0':'#155724');
+            const rwTip=casesOnDock!=null?(' title="'+runwayTxt(casesOnDock,clearRate)+' of backlog on dock"'):'';
+            return `<tr>
+                <td style="text-align:left;font-weight:600;">${h.label}</td>
+                <td>${fv(pick)}</td>
+                <td>${fv(loaded)}</td>
+                <td style="color:${diff>=0?GREEN:RED};font-weight:600;">${pick||loaded?fv(diff):''}</td>
+                <td style="color:${cagesColor};font-weight:700;">${cagesTxt}</td>
+                <td>${o.pickHC>0?fv(o.pickHC,2):'\u2014'}</td>
+                <td>${o.pickRate>0?fv(o.pickRate,1):'\u2014'}</td>
+                <td>${o.loadedHC>0?fv(o.loadedHC,2):'\u2014'}</td>
+                <td>${o.wallBuilderHC>0?fv(o.wallBuilderHC,2):'\u2014'}</td>
+                <td>${o.loadedRate>0?fv(o.loadedRate,1):'\u2014'}</td>
+                <td style="color:${balColor};font-weight:700;">${balance>0?balance.toFixed(1)+'%':'\u2014'}</td>
+                <td style="color:${balColor};font-weight:600;">${balance>0?deviation.toFixed(1)+'%':'\u2014'}</td>
+                ${statusBadge(bucket,dk,rwTip)}
+            </tr>`;
+        }).join('');
+        return `<section class="hourly-section ob-flow-hourly"><h3>OUTBOUND | Flow (Hourly)</h3><div style="overflow-x:auto;"><table class="flow-table"><thead>${head}</thead><tbody>${rows}</tbody></table></div></section>`;
+    }
+
+    // ---- IB "Flow" hourly table (hours as rows). Status = runway health. ----
+    // Cases Received = RSR/IDRT support volume; Cases Stowed = Case Transfer In.
+    // Flow Balance = Cases Stowed / Cases Received. Cages on Dock = running (received - stowed)/
+    // density seeded from saved IB SOS. Status: inbound runway LOW = bad (>=1h Healthy,
+    // 30-59m Warning, <=29m/empty Critical). Clear rate = whole stow team's throughput (cases stowed).
+    function buildIBFlowTable(){
+        const dk=document.getElementById('sb-root')?.classList.contains('dark-mode');
+        const GREEN=dk?'#69f0ae':'#2e7d32',RED=dk?'#ff5252':'#c62828';
+        const site=(config.site||'').toUpperCase();
+        const ibRec=getSosRecord(site,'IB');
+        const density=(ibRec&&ibRec.density>0)?ibRec.density:flowCageDensity(site,'stow');
+        const seed=ibRec?ibRec.cages:0;
+        if(density>0)walkCages(hourlyData.map(h=>h.ib),'rsrVol','stowUnits',seed,density,'cages');
+        const cols=['Hour','Cases Received','Cases Stowed','Difference','Cages on Dock','Receive HC','RSR (Receive Rate)','Stow HC','Stow Rate','Flow Balance','Flow Deviation','Status'];
+        const head='<tr>'+cols.map(c=>`<th>${c}</th>`).join('')+'</tr>';
+        const rows=hourlyData.map(h=>{
+            const b=h.ib;
+            const received=b.rsrVol||0,stowed=b.stowUnits||0;
+            const diff=received-stowed;
+            const balance=received>0?(stowed/received*100):0;
+            const deviation=balance>0?Math.abs(balance-100):0;
+            const balColor=balance>=100?GREEN:RED;
+            const hasFlow=(received>0||stowed>0);
+            // Clear rate = whole stow team's throughput that hour (Cases Stowed).
+            const clearRate=stowed;
+            const casesOnDock=(density>0&&b.cages!=null)?b.cages*density:null;
+            const bucket=(density>0)?dockHealthBucket(casesOnDock,clearRate,'stow',hasFlow):(hasFlow?(balance>=100?'healthy':'warning'):null);
+            const cagesTxt=(density>0&&b.cages!=null)?Math.round(b.cages).toLocaleString():'\u2014';
+            const cagesColor=(b.cages!=null&&b.cages<=0)?RED:(dk?'#e0e0e0':'#155724');
+            const rwTip=casesOnDock!=null?(' title="'+runwayTxt(casesOnDock,clearRate)+' of runway on dock"'):'';
+            return `<tr>
+                <td style="text-align:left;font-weight:600;">${h.label}</td>
+                <td>${fv(received)}</td>
+                <td>${fv(stowed)}</td>
+                <td style="color:${diff<=0?GREEN:RED};font-weight:600;">${received||stowed?fv(diff):''}</td>
+                <td style="color:${cagesColor};font-weight:700;">${cagesTxt}</td>
+                <td>${b.rsrHC>0?fv(b.rsrHC,2):'\u2014'}</td>
+                <td>${b.rsrRate>0?fv(b.rsrRate,1):'\u2014'}</td>
+                <td>${b.stowHC>0?fv(b.stowHC,2):'\u2014'}</td>
+                <td>${b.rate>0?fv(b.rate,1):'\u2014'}</td>
+                <td style="color:${balColor};font-weight:700;">${balance>0?balance.toFixed(1)+'%':'\u2014'}</td>
+                <td style="color:${balColor};font-weight:600;">${balance>0?deviation.toFixed(1)+'%':'\u2014'}</td>
+                ${statusBadge(bucket,dk,rwTip)}
+            </tr>`;
+        }).join('');
+        return `<section class="hourly-section ib-flow-hourly"><h3>INBOUND | Flow (Hourly)</h3><div style="overflow-x:auto;"><table class="flow-table"><thead>${head}</thead><tbody>${rows}</tbody></table></div></section>`;
+    }
+
+    // Flow-only hourly tab: IB flow, OB flow, and Sort (if present). Old detailed
+    // per-metric tables are intentionally dropped per the Flow-only design.
+    container.innerHTML=buildIBFlowTable()+buildOBFlowTable()+sortHTML;
+
+    // Post a one-line "tool in use" summary to the job-balance Slack channel so
+    // the team sees the flow view is being used (Erik's request). Uses the OB
+    // (outbound) dock state as the headline, falling back to IB. Fire-and-forget.
+    try{ postHourlyFlowToSlack(hourlyData,config); }catch(e){ /* never block render */ }
 
     // Blank out future hour columns (hours that haven't started yet)
     const now=new Date();
@@ -2204,9 +2506,12 @@ function vretFmtDate(d){return d.getFullYear()+'/'+String(d.getMonth()+1).padSta
 function vretDayName(d){return['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()];}
 function vretDateShort(d){return String(d.getMonth()+1).padStart(2,'0')+'/'+String(d.getDate()).padStart(2,'0');}
 
-// Pull one process's EACH-Total for a time window (reuses buildFnUrl/parseFnRollup).
+// Pull one process's EACH-Total (UNITS) for a time window (reuses buildFnUrl/parseFnRollup).
+// VRETs are tracked in UNITS (the EACH-Total column, parseFnRollup.eachUnits = td.numeric
+// index 3), NOT the Jobs column. Falls back to totalUnits (Jobs) only if the report has no
+// each column for this process.
 async function vretFetchOne(site,pid,sd,sh,sm,ed,eh,em){
-    try{const html=await fetchHTML(buildFnUrl(site,pid,sd,sh,sm,ed,eh,em));const r=parseFnRollup(html);return r.totalUnits||0;}catch(e){return 0;}
+    try{const html=await fetchHTML(buildFnUrl(site,pid,sd,sh,sm,ed,eh,em));const r=parseFnRollup(html);return r.eachUnits||r.totalUnits||0;}catch(e){return 0;}
 }
 // Pull the full week (weekStart..today) day+night Pack/Pick per day.
 async function fetchVRETsWeek(site,weekStart,today){
@@ -2301,8 +2606,8 @@ function renderVRETsTab(v){
     const statusColor=onTarget?'#22c55e':'#ef4444';
 
     const kpis=`<div class="vrets-kpis">
-        <div class="vrets-kpi"><div class="k-label">PACK WEEKLY GOAL</div><div class="k-val">${fmtN(goal)}</div><div class="k-sub">Goal per shift: ${fmtN(perShiftGoal)}</div></div>
-        <div class="vrets-kpi"><div class="k-label">PACK WTD</div><div class="k-val">${wtdPack>=goal?fmtN(wtdPack):fmtN(wtdPack)+' / '+fmtN(wtdGoal)}</div><div class="vrets-bar"><div style="width:${Math.min(progressPct,100)}%"></div></div><div class="k-sub">${progressPct.toFixed(1)}%</div></div>
+        <div class="vrets-kpi"><div class="k-label">PACK WEEKLY GOAL (UNITS)</div><div class="k-val">${fmtN(goal)}</div><div class="k-sub">Goal per shift: ${fmtN(perShiftGoal)}</div></div>
+        <div class="vrets-kpi"><div class="k-label">PACK WTD (UNITS)</div><div class="k-val">${wtdPack>=goal?fmtN(wtdPack):fmtN(wtdPack)+' / '+fmtN(wtdGoal)}</div><div class="vrets-bar"><div style="width:${Math.min(progressPct,100)}%"></div></div><div class="k-sub">${progressPct.toFixed(1)}%</div></div>
         <div class="vrets-kpi"><div class="k-label">DELTA (VS GOAL)</div><div class="k-val" style="color:${statusColor};">${fmtN(delta)}</div><div class="k-sub" style="color:${statusColor};">\u25CF ${status}</div></div>
     </div>`;
 
@@ -2468,7 +2773,6 @@ function renderEOSWash(data){
     const content=document.getElementById('eoswash-content');if(!content)return;
     const ppr=(data&&data.ppr)||{};
     const caseVols=(data&&data.caseVols)||{};
-    const rates=loadEOSPlannedRates();
     const dc=cfDensityColors();
     // Read existing Sync-tab plan inputs (no re-entry).
     const gv=id=>{const el=document.getElementById(id);if(!el)return 0;const raw=(el.value!=null&&el.value!=='')?el.value:el.textContent;return parseFloat(String(raw).replace(/,/g,''))||0;};
@@ -2505,8 +2809,6 @@ function renderEOSWash(data){
     const bg=(pct)=>{if(pct==null||isNaN(pct)||pct===0)return '';if(pct>=100)return `background:${dc.goodBg};color:${dc.goodTxt};`;if(pct>=95)return `background:${dc.warnBg};color:${dc.warnTxt};`;return `background:${dc.badBg};color:${dc.badTxt};`;};
     const varBg=(v)=>{if(v==null||isNaN(v)||v===0)return '';return v>=0?`background:${dc.goodBg};color:${dc.goodTxt};`:`background:${dc.badBg};color:${dc.badTxt};`;};
 
-    // Map a PPR line-item name to the GalaxyBI DeratedRates planned-rate key (names differ slightly).
-    const RATE_KEY={'Transfer Out Pick - Total':'Transfer Out Pick - Small','RC Sort - Total':'RC Sort','Non_FC_Controllable':'Non FC Controllable'};
     // Only these rows produce real throughput VOLUME (in cases). Support / Lead-PA / Problem
     // Solve / Non-FC / Admin rows do NOT produce volume, so their Volume/Rate/% to LP are blank
     // and only Hours + Hours Variance show.
@@ -2529,13 +2831,24 @@ function renderEOSWash(data){
         const vol=showsVol?caseVol(pprName,d):null;
         const hrs=d.hrs;
         const rate=(showsVol&&vol!=null&&hrs>0)?vol/hrs:(showsVol?d.rate:null);
-        const rateKey=RATE_KEY[pprName]||pprName;
-        const planRate=rates[rateKey]||rates[pprName]||d.planRate||0;
-        // % to LP: volume rows use actual rate / planned rate. Support/indirect rows (no volume)
-        // fall back to the PPR's own % to Plan (ratioToPlan), matching the Excel.
-        let pctLP=(showsVol&&rate>0&&planRate>0)?(rate/planRate)*100:0;
-        if(!showsVol&&d.ratio!=null&&d.ratio!==0)pctLP=d.ratio;
+        // % to LP = the PPR report's own "% to Plan" (ratioToPlan) for EVERY row. PPR already
+        // computes it against the correct planned rate; the DeratedRates cache rates are on a
+        // different (derated/period) basis, so actual-rate/plan-rate produced wrong values.
+        // Blank rows with no computable ratio, and blank support rows with absurd ratios
+        // (near-zero planned hours can produce e.g. 1264%, which is meaningless).
+        let pctLP=(d.ratio!=null&&d.ratio!==0)?d.ratio:0;
+        if(!showsVol&&pctLP>300)pctLP=0; // suppress meaningless support-row ratios
         const hoursVar=d.planVar; // straight from PPR (planVarianceSeconds), + = under plan
+        // Diagnostic: raw inputs behind every EOS Wash "% to LP" and "Hours Variance" cell so
+        // any row can be reconciled against PPR / the cached LP planned rates.
+        console.log('[SB-EOS row] '+label+
+            ' | showsVol='+showsVol+
+            ' vol='+(vol==null?'n/a':vol)+
+            ' hrs='+(hrs==null?'n/a':Number(hrs).toFixed(2))+
+            ' actualRate='+(rate==null?'n/a':Number(rate).toFixed(2))+
+            ' pprRatioToPlan='+(d.ratio==null?'n/a':Number(d.ratio).toFixed(1)+'%')+
+            ' => %toLP='+(pctLP>0?pctLP.toFixed(1)+'%':'(blank)')+
+            ' | planVarianceHrs='+(hoursVar==null?'n/a':Number(hoursVar).toFixed(2)));
         return `<tr>
             <td style="text-align:left;">${label}</td>
             <td>${vol!=null?fv(vol):''}</td>
@@ -2897,6 +3210,10 @@ function initBoard(){
     vretPopulateWeeks();
     { const gi=document.getElementById('vrets-goal-input'); if(gi&&!gi.value)gi.value=vretLoadGoal();
       if(gi)gi.addEventListener('change',()=>{vretSaveGoal(parseFloat(gi.value)||vretLoadGoal());if(currentVRETs){currentVRETs.goal=parseFloat(gi.value)||currentVRETs.goal;renderVRETsTab(currentVRETs);updateVRETsPanel(currentVRETs);}}); }
+    // SOS cages (hourly Flow): prefill density from the site table + last saved counts; wire Save + Slack post.
+    initSosControls();
+    document.getElementById('btn-save-sos-ib')?.addEventListener('click',()=>saveSosFromUi('IB'));
+    document.getElementById('btn-save-sos-ob')?.addEventListener('click',()=>saveSosFromUi('OB'));
     document.getElementById('btn-clear-targets')?.addEventListener('click',()=>{
         ['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-density-target','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-density-target','sort-goal','sort-rate-target'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
         saveTargetsUI();updateTargetRows();
@@ -3032,30 +3349,65 @@ function downloadBlob(blob){
     document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);
 }
 
+// Silently refresh an expired FCLM/Midway session by loading the portal in a hidden iframe
+// (same pattern used for ALPS/GalaxyBI re-auth), then re-run the fetch WITHOUT a page reload
+// so the board stays open. Called when a fetch returns a total blackout after the quick retry.
+function reauthFclmAndRetry(){
+    console.log('[SB] FCLM session appears expired \u2014 refreshing via hidden iframe...');
+    let done=false;
+    const iframe=document.createElement('iframe');
+    iframe.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;';
+    iframe.src='https://fclm-portal.amazon.com/';
+    const finish=()=>{if(done)return;done=true;try{if(iframe.parentNode)iframe.parentNode.removeChild(iframe);}catch(e){}
+        // Re-run the fetch tagged 'reauth' so a still-empty result reloads instead of looping.
+        doFetch('reauth');};
+    iframe.onload=()=>{setTimeout(finish,1500);}; // give the cookie a moment to settle
+    document.body.appendChild(iframe);
+    // Safety: if the iframe never fires onload (blocked/timeout), still retry after 6s.
+    setTimeout(finish,6000);
+}
+
 async function doFetch(isRetry){
     config=loadConfig();config.site=document.getElementById('site-select').value;config.shiftType=document.getElementById('shift-select').value;saveConfig(config);
     const btn=document.getElementById('btn-fetch');btn.disabled=true;btn.textContent=isRetry?'\u23F3 Retrying...':'\u23F3 Fetching...';
     try{
         const raw=await fetchAllData(config);
-        // Detect session expiry: if all data comes back as zeros AND we're within the shift window, auth likely expired
-        const stowU=raw.full?.stow?.totalUnits||0;const pickU=raw.full?.pick?.totalUnits||0;const stowH=raw.full?.stow?.directHours||0;
-        const ibPPRHrs=raw.full?.ppr?.ibActualHrs||0;
+        // Session-expiry detection. A stale FCLM session returns a TOTAL blackout (every report
+        // empty). The old check only looked at IB stow/PPR, so it false-fired whenever stow
+        // happened to be 0 for the window even though OB / EOS / LP clearly had data (session was
+        // fine). Now we consider the session ALIVE if ANY data source returned a signal:
+        //   IB stow, IB PPR hrs, OB pick, OB dock/DA hrs, or the whole-shift PPR total hours.
+        const f=raw.full||{};const ppr=f.ppr||{};
+        const anySignal=(
+            (f.stow?.totalUnits||0)>0 || (f.stow?.directHours||0)>0 ||
+            (f.pick?.totalUnits||0)>0 || (f.pick?.directHours||0)>0 ||
+            (f.obDock?.fluidLoadJobs||0)>0 ||
+            (ppr.ibActualHrs||0)>0 || (ppr.obActualHrs||0)>0 || (ppr.daTransferHrs||0)>0 || (ppr.totHrs||0)>0
+        );
         // Only treat empty as a stale session if we're currently within the shift time window (data should exist)
         const now=new Date(),cm=now.getHours()*60+now.getMinutes();
         const sched=config.shiftType==='Nights'?config.nights:config.days;
         const p1Start=sched.p1.sh*60+sched.p1.sm;
         const shiftActive=config.shiftType==='Nights'?(cm>=p1Start||cm<sched.full.eh*60+sched.full.em):(cm>=p1Start&&cm<=sched.full.eh*60+sched.full.em);
-        if(stowU===0&&pickU===0&&stowH===0&&ibPPRHrs===0&&shiftActive){
-            // First empty result during an active shift is almost always a stale FCLM session that
-            // re-authenticates on a second fetch. Auto-retry once silently (no popup) instead of
-            // making the user click OK + Get Data again. Only surface the message if the retry is
-            // also empty (genuine auth failure needing an F5).
+        if(!anySignal&&shiftActive){
+            // A tab left open for hours lets the FCLM/Midway session cookie expire in the
+            // background; the next Get Data then hits a login redirect (empty data). A manual F5
+            // works only because reloading re-runs the Midway handshake. We do that same re-auth
+            // WITHOUT a reload: load the FCLM portal in a hidden iframe to refresh the cookie,
+            // wait, then auto-retry the fetch. isRetry===undefined -> quick immediate retry;
+            // isRetry==='reauth' -> we've already tried the iframe re-auth once.
             if(!isRetry){
                 setStatus('\u21BB Refreshing data...');
-                return doFetch(true);
+                return doFetch('quick');
             }
-            setStatus('\u26A0\uFE0F Session expired');
-            alert('\u26A0\uFE0F FCLM session expired \u2014 no data returned after retry.\n\nPlease refresh this page (F5) to re-authenticate, then try Get Data again.');
+            if(isRetry==='quick'){
+                setStatus('\u21BB Re-authenticating FCLM session...');
+                return reauthFclmAndRetry();
+            }
+            // isRetry==='reauth' - the silent re-auth didn't take (Midway fully expired, needs a
+            // badge tap). Reload the page to force the interactive Midway handshake.
+            setStatus('\u26A0\uFE0F Session expired \u2014 reloading to re-authenticate\u2026');
+            setTimeout(()=>{location.reload();},1200);
             btn.disabled=false;btn.textContent='\u25B6 Get Data';return;
         }
         currentMetrics=processData(raw);
