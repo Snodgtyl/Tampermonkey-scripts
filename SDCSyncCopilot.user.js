@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      14.0.0
+// @version      14.1.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -39,7 +39,7 @@ const SITE_SCHEDULES = {
     QXX6: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:18,sm:30,eh:6,em:15},p1:{sh:19,sm:0,eh:22,em:30},p2:{sh:22,sm:31,eh:2,em:0},p3:{sh:2,sm:0,eh:5,em:30}} },
     SAV7: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:18,sm:30,eh:6,em:15},p1:{sh:19,sm:0,eh:22,em:30},p2:{sh:22,sm:31,eh:2,em:0},p3:{sh:2,sm:0,eh:5,em:30}} },
 };
-const PROCESS_IDS = { stow:'1003035', palletStow:'1003041', pick:'1003065', sort:'1003009', obDock:'1003021', icqa:'1003030', vretPack:'1003056', vretPick:'1003034', rsr:'01003012', wallBuilder:'4300006861' };
+const PROCESS_IDS = { stow:'1003035', palletStow:'1003041', pick:'1003065', sort:'1003009', obDock:'1003021', icqa:'1003030', vretPack:'1003056', vretPick:'1003034', rsr:'01003012' };
 // ICQA DC% (Direct Count %):
 //   numerator   = "Library Deep" (Direct Count) functions: SBC - Library Deep + Other Library Deep
 //   denominator = report GRAND TOTAL paid hours (all functions), read from summary tfoot total row
@@ -276,6 +276,20 @@ function parseFnRollup(html){
     // FluidLoadTote Jobs is index 7 in OB Dock report tfoot
     if(cells.length>=8){fluidLoadToteJobs=parseInt(cells[7].textContent.replace(/,/g,''),10)||0;}}
     const links=doc.querySelectorAll('a[href*="employeeId="]');const ids=new Set();links.forEach(l=>{const m=l.href.match(/employeeId=([^&]+)/);if(m)ids.add(m[1]);});hc=ids.size;
+    // Wall Builder HEADCOUNT (# AAs) from the OB Dock report. The report renders ONE <table> per
+    // function, each with a <caption> naming it (e.g. "Wall Builder [1540335693954]"). Find the
+    // table whose caption is Wall Builder and count its unique employee rows (employeeId= links).
+    // Absent on non-OB-dock reports (no such caption) -> stays 0.
+    let wallBuilderHC=0;
+    {
+        const wbIds=new Set();
+        doc.querySelectorAll('table').forEach(tbl=>{
+            const cap=(tbl.querySelector('caption')?.textContent||'').trim();
+            if(!/wall\s*builder/i.test(cap))return;
+            tbl.querySelectorAll('a[href*="employeeId="]').forEach(l=>{const m=l.href.match(/employeeId=([^&]+)/);if(m)wbIds.add(m[1]);});
+        });
+        wallBuilderHC=wbIds.size;
+    }
     // For palletStow: get CASE_UNIT from "Pallet Transfer In" Total row (6th numeric = index 5)
     let palletCases=0;
     const rows=doc.querySelectorAll('tr');let foundPTI=false;
@@ -354,25 +368,11 @@ function parseFnRollup(html){
     // Diagnostic: only log when this looks like the OB Dock report (has fluid-load jobs), so we
     // can verify the pallet-verified + sort-site pallet-tote cases are added to loaded volume.
     if(units>0||fluidLoadToteJobs>0||transshipPalletCases>0||palletizeToteJobs>0){
-        console.log('[SB-DA loaded] fluidCaseJobs='+units+' fluidToteJobs='+fluidLoadToteJobs+' transshipPalletCases='+transshipPalletCases+' palletizeToteJobs='+palletizeToteJobs+' palletizeToteCases='+palletizeToteCases+' => loadedUnits(cases)='+fluidLoadJobs);
+        console.log('[SB-DA loaded] fluidCaseJobs='+units+' fluidToteJobs='+fluidLoadToteJobs+' transshipPalletCases='+transshipPalletCases+' palletizeToteJobs='+palletizeToteJobs+' palletizeToteCases='+palletizeToteCases+' wallBuilderHC='+wallBuilderHC+' => loadedUnits(cases)='+fluidLoadJobs);
     }
-    return{totalUnits:units,directHours:hours,rate,headcount:hc,palletCases,eachUnits,caseUnits,fluidLoadJobs,fluidCaseJPH,fluidCaseJobs,transshipPalletCases,palletizeToteJobs,palletizeToteCases};
+    return{totalUnits:units,directHours:hours,rate,headcount:hc,palletCases,eachUnits,caseUnits,fluidLoadJobs,fluidCaseJPH,fluidCaseJobs,transshipPalletCases,palletizeToteJobs,palletizeToteCases,wallBuilderHC};
 }
 // Wall Builder report (process 4300006861): total paid hours = tfoot total row's
-// "size-total highlighted" cell (data-column="9"), e.g. 27.45. Used as Wall Builder HC per hour.
-function parseWallBuilderHours(html){
-    try{
-        const doc=new DOMParser().parseFromString(html,'text/html');
-        const tr=doc.querySelector('tfoot tr.total.empl-all')||doc.querySelector('tr.total.empl-all')||doc.querySelector('tfoot tr.total')||doc.querySelector('tfoot tr');
-        if(!tr)return 0;
-        const cell=tr.querySelector('td.size-total')||tr.querySelector('td[data-column="9"]');
-        if(cell){const v=parseFloat(cell.textContent.replace(/,/g,''));if(!isNaN(v))return v;}
-        // Fallback: last numeric cell in the total row.
-        const nums=Array.from(tr.querySelectorAll('td')).map(c=>parseFloat(c.textContent.replace(/,/g,''))).filter(v=>!isNaN(v));
-        return nums.length?nums[nums.length-1]:0;
-    }catch(e){return 0;}
-}
-
 function parsePPR(html){
     const doc=new DOMParser().parseFromString(html,'text/html');
     let ibPlan=0,ibAct=0,obPlan=0,obAct=0,daTransferHrs=0,daTransferPlan=0,caseStowReserveHrs=0;
@@ -2270,14 +2270,11 @@ async function fetchHourlyData(){
     }
     const totalHours=hours.length;
 
-    // Fetch each hour in parallel (same as fetchPeriod). Wall Builder (4300006861) uses a
-    // different report shape, so fetch it separately per hour and parse its total paid hours.
-    const wbUrl=(hr)=>{let sDate=new Date(startDate);if(hr.sh<12&&startDate.getHours()>=12){sDate.setDate(sDate.getDate()+1);}let eDate=new Date(sDate);if(hr.eh<hr.sh)eDate.setDate(eDate.getDate()+1);return buildFnUrl(site,PROCESS_IDS.wallBuilder,sDate,hr.sh,hr.sm,eDate,hr.eh,hr.em);};
+    // Fetch each hour in parallel (same as fetchPeriod). Wall Builder HC comes FROM the OB Dock
+    // (1003021) report itself (parseFnRollup.wallBuilderHC counts AAs under the Wall Builder
+    // function) — no separate fetch needed.
     try{
-        const [results,wallBuilderHrs]=await Promise.all([
-            Promise.all(hours.map(hr=>fetchPeriod(site,startDate,hr))),
-            Promise.all(hours.map(async hr=>{try{return parseWallBuilderHours(await fetchHTML(wbUrl(hr)));}catch(e){return 0;}}))
-        ]);
+        const results=await Promise.all(hours.map(hr=>fetchPeriod(site,startDate,hr)));
         const hourlyData=results.map((raw,i)=>{
             const stow=raw.stow||{},pStow=raw.palletStow||{},pick=raw.pick||{},obDock=raw.obDock||{},sort=raw.sort||{},ppr=raw.ppr||{},rsr=raw.rsr||{};
             const palletCases=pStow.palletCases||0;
@@ -2304,7 +2301,7 @@ async function fetchHourlyData(){
                     // Flow view fields (new OB hourly style)
                     pickHC:pick.headcount||0,               // active AAs in Transfer Out Pick this hour
                     loadedHC:obDock.headcount||0,            // active AAs on the dock this hour
-                    wallBuilderHC:wallBuilderHrs[i]||0,      // Wall Builder total paid hours this hour
+                    wallBuilderHC:obDock.wallBuilderHC||0,   // Wall Builder HEADCOUNT (# AAs) from OB Dock report
                     loadedRate:obDock.fluidCaseJPH||0},      // Loaded Cartons Rate = Fluid Load - Case JPH
                 sort:{totalUnits:sort.totalUnits||0,rate:sort.rate||0,directHours:sort.directHours||0,cplh:(sort.directHours||0)>0?sort.totalUnits/sort.directHours:0}
             };
