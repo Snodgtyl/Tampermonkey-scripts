@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      13.9.0
+// @version      14.0.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -63,11 +63,25 @@ const SITE_CAGE_DENSITY_LOAD = { AVP8:19, HGR5:28, KRB1:19, KRB2:19, KRB3:18, KR
 // Runway/backlog thresholds (hours). Inbound: LOW runway = bad. Outbound: HIGH backlog = bad.
 const RUNWAY_RED=0.5, RUNWAY_YELLOW=1.0;       // inbound stow: <30m red, <1h yellow
 const LOAD_BACKLOG_GREEN=1.5, LOAD_BACKLOG_RED=2.0; // outbound load: <=1.5h green, >2h red
-// Slack workflow webhooks (hardcoded, from the Flow Analyzer). SOS = shift cage counts,
-// JOB_BALANCE = a one-line summary each time the flow view is fetched (so the team sees
-// the tool being used). Fire-and-forget; failures never block the UI.
-const SLACK_SOS_WEBHOOK_URL='https://hooks.slack.com/triggers/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';
-const SLACK_JOB_BALANCE_WEBHOOK_URL='https://hooks.slack.com/triggers/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';
+// Slack workflow webhooks. SOS = shift cage counts, JOB_BALANCE = a one-line summary each
+// time the flow view is fetched (so the team sees the tool being used). Fire-and-forget.
+// SECURITY: the URLs are NOT hardcoded here (a committed webhook URL is a secret and gets
+// flagged/leaked when pushed to a public repo). They live only in this browser's
+// localStorage and are entered once via Settings. If unset, the Slack posts are simply
+// skipped (no error). Rotate the Slack workflow trigger if a URL was ever committed.
+// Slack workflow webhooks. Hardcoded so the triggers ALWAYS fire for every user out of the
+// box (no setup). SOS = shift cage counts; JOB_BALANCE = a usage summary each flow fetch.
+// SECURITY NOTE: this file is published on public GitHub, so these URLs are exposed. Treat
+// them as non-secret and rotatable — if abused, rotate the Slack workflow trigger and update
+// the constants below. Settings -> Slack Webhooks can override per-browser if needed.
+const SLACK_SOS_DEFAULT='https://hooks.slack.com/triggers/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';
+const SLACK_JOB_BALANCE_DEFAULT='https://hooks.slack.com/triggers/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';
+const SLACK_SOS_KEY='syncboard_slack_sos_url';
+const SLACK_JOB_BALANCE_KEY='syncboard_slack_jobbalance_url';
+// Read the per-browser override if one was saved in Settings; otherwise use the hardcoded
+// default so the triggers always work. A saved empty string ('') intentionally disables it.
+function getSlackSosUrl(){try{const v=localStorage.getItem(SLACK_SOS_KEY);return v!=null?v:SLACK_SOS_DEFAULT;}catch(e){return SLACK_SOS_DEFAULT;}}
+function getSlackJobBalanceUrl(){try{const v=localStorage.getItem(SLACK_JOB_BALANCE_KEY);return v!=null?v:SLACK_JOB_BALANCE_DEFAULT;}catch(e){return SLACK_JOB_BALANCE_DEFAULT;}}
 const SOS_LOG_KEY='syncboard_sosLog_v1';
 
 function flowCageDensity(site,mode){
@@ -116,7 +130,7 @@ function postSosToSlack(rec){
     const dir=rec.direction?rec.direction+' | ':'';
     const message='SOS Cages | '+dir+rec.site+' | '+Math.round(rec.cages)+' cages @ density '+rec.density+
         ' (~'+Math.round(cases)+' cases) | '+fmtSlackTime(rec.savedAt);
-    postToSlack(SLACK_SOS_WEBHOOK_URL,{message},'SOS Slack webhook');
+    postToSlack(getSlackSosUrl(),{message},'SOS Slack webhook');
 }
 // Job-balance Slack message posted when a flow view is fetched.
 function postJobBalanceToSlack(s){
@@ -124,7 +138,7 @@ function postJobBalanceToSlack(s){
     const totalCages=Math.round(Number(s.cages)||0);
     const message=dir+s.site+' | Total Cages: '+totalCages.toLocaleString()+' | Avg Runway: '+(s.runwayText||'N/A')+
         ' | '+(s.status||'N/A')+' | '+fmtSlackTime(new Date().toISOString());
-    postToSlack(SLACK_JOB_BALANCE_WEBHOOK_URL,{message},'Job Balance Slack webhook');
+    postToSlack(getSlackJobBalanceUrl(),{message},'Job Balance Slack webhook');
 }
 // Post a "flow view fetched" summary to the job-balance Slack channel. Headlines the OB
 // dock (falls back to IB): current cages on dock + runway/backlog status. Fire-and-forget.
@@ -270,8 +284,57 @@ function parseFnRollup(html){
         if(foundPTI){const cellTexts=Array.from(row.querySelectorAll('td')).map(c=>c.textContent.trim());
             if(cellTexts.includes('Total')){const nums=[];cellTexts.forEach(c=>{const v=parseFloat(c.replace(/,/g,''));if(!isNaN(v))nums.push(v);});if(nums.length>=6)palletCases=Math.round(nums[5]);break;}}
     }
-    // For OB Dock: Fluid Load Jobs = FluidLoadCase Jobs (tfoot index 1) + FluidLoadTote Jobs (tfoot index 7)
-    const fluidLoadJobs=units+fluidLoadToteJobs;
+    // TransshipPalletVerified cases: pallets that were loaded/verified but NOT counted by Fluid
+    // Load. They live under the "Transfer Out" function's Total row (the TransshipPalletVerified
+    // Case-UNIT column, e.g. 856 cases / 7 pallets in the sample). Parse that row and take its
+    // Case value so DA/loaded volume includes pallet-loaded cases, not just fluid-load cases.
+    // Row numerics (TransshipPalletVerified): [Jobs, EACH-UNIT, EACH-UPH?, Case-UNIT, Case-UPH?,
+    // Pallet-UNIT, ...]; we want the Case-UNIT — the largest of the mid values. To stay robust we
+    // read the "Transfer Out" Total row's numerics and pick the Case-UNIT by position after Jobs.
+    let transshipPalletCases=0;
+    let foundTO=false;
+    for(const row of rows){
+        // Match the exact "Transfer Out" function label (not "Transfer Out Pick"/"Dock"/"5S"/etc).
+        if(!foundTO&&Array.from(row.querySelectorAll('th,td,a')).some(c=>/^transfer\s*out$/i.test(c.textContent.trim())))foundTO=true;
+        if(foundTO){
+            const cellTexts=Array.from(row.querySelectorAll('td')).map(c=>c.textContent.trim());
+            if(cellTexts.includes('Total')){
+                const nums=[];cellTexts.forEach(c=>{const v=parseFloat(c.replace(/,/g,''));if(!isNaN(v))nums.push(v);});
+                // nums for TransshipPalletVerified Total: [Jobs, EACH-UNIT, Case-UNIT, Pallet-UNIT].
+                // Case-UNIT is index 2 (856 in the sample: [7, 1879, 856, 7]).
+                if(nums.length>=3)transshipPalletCases=Math.round(nums[2]);
+                break;
+            }
+        }
+    }
+    // SORT SITES ONLY: "Palletize - Tote" work (ScanToteToPallet). On sort sites totes get
+    // palletized and that volume isn't in Fluid Load. This section is ABSENT on non-sort sites
+    // (e.g. KRB3), so we search for it and simply bypass when missing (contributes 0). We keep
+    // CPLH in CASES, so we only add a CASE value here. The ScanToteToPallet section shows
+    // Jobs/Tote (e.g. 2269) and EACH (e.g. 20624) but not always a Case column; palletizeToteCases
+    // is filled only when a Case value exists, and palletizeToteJobs is captured for reference.
+    let palletizeToteCases=0,palletizeToteJobs=0;
+    let foundPT=false;
+    for(const row of rows){
+        if(!foundPT&&Array.from(row.querySelectorAll('th,td,a')).some(c=>/palletize\s*[-\u2013]?\s*tote/i.test(c.textContent.trim())))foundPT=true;
+        if(foundPT){
+            const cellTexts=Array.from(row.querySelectorAll('td')).map(c=>c.textContent.trim());
+            if(cellTexts.includes('Total')){
+                const nums=[];cellTexts.forEach(c=>{const v=parseFloat(c.replace(/,/g,''));if(!isNaN(v))nums.push(v);});
+                // nums: [Jobs, JPH, EACH-UNIT, EACH-UPH, Tote-UNIT, Tote-UPH, ...]. Jobs=index0.
+                // A Case column for palletized totes isn't present in the sample, so we do NOT
+                // guess a case value here (would corrupt the cases-basis CPLH). Once the sort-site
+                // CASE source is confirmed, set palletizeToteCases from the right column below.
+                if(nums.length>=1)palletizeToteJobs=Math.round(nums[0]);
+                break;
+            }
+        }
+    }
+    // For OB Dock loaded volume (CASES): Fluid Load Case cases + Fluid Load Tote jobs +
+    // TransshipPalletVerified cases + (sort-site) palletized-tote CASES. Any source that isn't in
+    // the report contributes 0, so non-sort sites are unaffected. palletizeToteCases stays 0 until
+    // the sort-site case source is confirmed (palletizeToteJobs is logged for reference only).
+    const fluidLoadJobs=units+fluidLoadToteJobs+transshipPalletCases+palletizeToteCases;
     // OB Dock "Loaded Cartons Rate" = the Fluid Load - Case function's JPH (554.52 in the report),
     // read off that function group's own "Total" row. Numerics in that row are
     // [hours, jobs, JPH, each-unit, each-uph, case-unit, case-uph]; JPH = index 2.
@@ -288,7 +351,12 @@ function parseFnRollup(html){
             }
         }
     }
-    return{totalUnits:units,directHours:hours,rate,headcount:hc,palletCases,eachUnits,caseUnits,fluidLoadJobs,fluidCaseJPH,fluidCaseJobs};
+    // Diagnostic: only log when this looks like the OB Dock report (has fluid-load jobs), so we
+    // can verify the pallet-verified + sort-site pallet-tote cases are added to loaded volume.
+    if(units>0||fluidLoadToteJobs>0||transshipPalletCases>0||palletizeToteJobs>0){
+        console.log('[SB-DA loaded] fluidCaseJobs='+units+' fluidToteJobs='+fluidLoadToteJobs+' transshipPalletCases='+transshipPalletCases+' palletizeToteJobs='+palletizeToteJobs+' palletizeToteCases='+palletizeToteCases+' => loadedUnits(cases)='+fluidLoadJobs);
+    }
+    return{totalUnits:units,directHours:hours,rate,headcount:hc,palletCases,eachUnits,caseUnits,fluidLoadJobs,fluidCaseJPH,fluidCaseJobs,transshipPalletCases,palletizeToteJobs,palletizeToteCases};
 }
 // Wall Builder report (process 4300006861): total paid hours = tfoot total row's
 // "size-total highlighted" cell (data-column="9"), e.g. 27.45. Used as Wall Builder HC per hour.
@@ -1902,6 +1970,11 @@ function buildHTML(){return `
 </tbody></table></div>
 <div class="settings-card"><h2>Config</h2><div class="setting-row"><label>Schedule Type</label><select id="settings-sched-type" class="select-input"><option value="3P">3P</option><option value="4Q">4Q</option></select></div>
 <button id="btn-save-settings" class="btn btn-primary">\uD83D\uDCBE Save Settings</button><p class="settings-note">Saved to browser localStorage.</p></div>
+<div class="settings-card"><h2>Slack Webhooks (local only)</h2>
+<p class="settings-note" style="margin-top:0;">Paste the Slack workflow trigger URLs once. Stored ONLY in this browser (never in the script file), so they aren't exposed if the code is shared or pushed to GitHub. Leave blank to disable Slack posts.</p>
+<div class="setting-row"><label>SOS cages</label><input type="text" id="slack-sos-url" class="select-input" placeholder="https://hooks.slack.com/triggers/\u2026" style="flex:1;min-width:280px;"></div>
+<div class="setting-row"><label>Job balance</label><input type="text" id="slack-jobbalance-url" class="select-input" placeholder="https://hooks.slack.com/triggers/\u2026" style="flex:1;min-width:280px;"></div>
+<button id="btn-save-slack" class="btn btn-primary">\uD83D\uDCBE Save Slack URLs</button> <span id="slack-save-note" class="settings-note" style="margin-left:8px;"></span></div>
 </div></main>
 `;}
 
@@ -2309,7 +2382,9 @@ function renderHourlyTables(hourlyData,totalHours){
             ?{healthy:['#0f5132','#69f0ae'],warning:['#5a3a00','#ffcc80'],critical:['#5c1a1a','#ff8a80']}
             :{healthy:['#e8f5e9','#1b5e20'],warning:['#fff3e0','#e65100'],critical:['#ffebee','#b71c1c']};
         const [bg,fg]=map[bucket];
-        return `<td${tip||''}><span style="display:inline-block;padding:2px 10px;border-radius:10px;background:${bg};color:${fg};font-weight:700;font-size:11.5px;">${bucketLabel(bucket)}</span></td>`;
+        // color/background use !important so the snip's blanket color-override style can't wash
+        // the pill out (html2canvas honors inline !important over author !important rules).
+        return `<td${tip||''}><span style="display:inline-block;padding:2px 10px;border-radius:10px;background:${bg}!important;color:${fg}!important;font-weight:700;font-size:11.5px;">${bucketLabel(bucket)}</span></td>`;
     }
 
     // ---- OB "Flow" hourly table (hours as rows). Status = runway/backlog health. ----
@@ -2346,15 +2421,15 @@ function renderHourlyTables(hourlyData,totalHours){
                 <td style="text-align:left;font-weight:600;">${h.label}</td>
                 <td>${fv(pick)}</td>
                 <td>${fv(loaded)}</td>
-                <td style="color:${diff>=0?GREEN:RED};font-weight:600;">${pick||loaded?fv(diff):''}</td>
-                <td style="color:${cagesColor};font-weight:700;">${cagesTxt}</td>
+                <td style="color:${diff>=0?GREEN:RED}!important;font-weight:600;">${pick||loaded?fv(diff):''}</td>
+                <td style="color:${cagesColor}!important;font-weight:700;">${cagesTxt}</td>
                 <td>${o.pickHC>0?fv(o.pickHC,2):'\u2014'}</td>
                 <td>${o.pickRate>0?fv(o.pickRate,1):'\u2014'}</td>
                 <td>${o.loadedHC>0?fv(o.loadedHC,2):'\u2014'}</td>
                 <td>${o.wallBuilderHC>0?fv(o.wallBuilderHC,2):'\u2014'}</td>
                 <td>${o.loadedRate>0?fv(o.loadedRate,1):'\u2014'}</td>
-                <td style="color:${balColor};font-weight:700;">${balance>0?balance.toFixed(1)+'%':'\u2014'}</td>
-                <td style="color:${balColor};font-weight:600;">${balance>0?deviation.toFixed(1)+'%':'\u2014'}</td>
+                <td style="color:${balColor}!important;font-weight:700;">${balance>0?balance.toFixed(1)+'%':'\u2014'}</td>
+                <td style="color:${balColor}!important;font-weight:600;">${balance>0?deviation.toFixed(1)+'%':'\u2014'}</td>
                 ${statusBadge(bucket,dk,rwTip)}
             </tr>`;
         }).join('');
@@ -2395,14 +2470,14 @@ function renderHourlyTables(hourlyData,totalHours){
                 <td style="text-align:left;font-weight:600;">${h.label}</td>
                 <td>${fv(received)}</td>
                 <td>${fv(stowed)}</td>
-                <td style="color:${diff<=0?GREEN:RED};font-weight:600;">${received||stowed?fv(diff):''}</td>
-                <td style="color:${cagesColor};font-weight:700;">${cagesTxt}</td>
+                <td style="color:${diff<=0?GREEN:RED}!important;font-weight:600;">${received||stowed?fv(diff):''}</td>
+                <td style="color:${cagesColor}!important;font-weight:700;">${cagesTxt}</td>
                 <td>${b.rsrHC>0?fv(b.rsrHC,2):'\u2014'}</td>
                 <td>${b.rsrRate>0?fv(b.rsrRate,1):'\u2014'}</td>
                 <td>${b.stowHC>0?fv(b.stowHC,2):'\u2014'}</td>
                 <td>${b.rate>0?fv(b.rate,1):'\u2014'}</td>
-                <td style="color:${balColor};font-weight:700;">${balance>0?balance.toFixed(1)+'%':'\u2014'}</td>
-                <td style="color:${balColor};font-weight:600;">${balance>0?deviation.toFixed(1)+'%':'\u2014'}</td>
+                <td style="color:${balColor}!important;font-weight:700;">${balance>0?balance.toFixed(1)+'%':'\u2014'}</td>
+                <td style="color:${balColor}!important;font-weight:600;">${balance>0?deviation.toFixed(1)+'%':'\u2014'}</td>
                 ${statusBadge(bucket,dk,rwTip)}
             </tr>`;
         }).join('');
@@ -3223,6 +3298,15 @@ function initBoard(){
     document.getElementById('btn-add-action')?.addEventListener('click',()=>{const a=loadActions();a.push({item:'',owner:'',status:'Open'});saveActions(a);renderActions();});
     document.getElementById('btn-clear-actions')?.addEventListener('click',()=>{if(confirm('Clear all actions?')){saveActions([]);renderActions();}});
     document.getElementById('btn-save-settings')?.addEventListener('click',saveSettingsUI);
+    // Prefill the Settings Slack fields from localStorage (the only place the URLs live).
+    { const sos=document.getElementById('slack-sos-url'),jb=document.getElementById('slack-jobbalance-url');
+      if(sos)sos.value=getSlackSosUrl();if(jb)jb.value=getSlackJobBalanceUrl(); }
+    document.getElementById('btn-save-slack')?.addEventListener('click',()=>{
+        const sos=(document.getElementById('slack-sos-url')?.value||'').trim();
+        const jb=(document.getElementById('slack-jobbalance-url')?.value||'').trim();
+        try{localStorage.setItem(SLACK_SOS_KEY,sos);localStorage.setItem(SLACK_JOB_BALANCE_KEY,jb);}catch(e){}
+        const note=document.getElementById('slack-save-note');if(note){note.textContent='\u2713 Saved (this browser only)';setTimeout(()=>{note.textContent='';},2500);}
+    });
     sel.onchange=e=>{config.site=e.target.value;if(SITE_SCHEDULES[config.site]){config.days=SITE_SCHEDULES[config.site].days;config.nights=SITE_SCHEDULES[config.site].nights;}saveConfig(config);refreshSettingsInputs();currentMetrics=null;clearBoard();updatePeriodDots();};
     document.getElementById('shift-select').onchange=e=>{config.shiftType=e.target.value;saveConfig(config);currentMetrics=null;clearBoard();updatePeriodDots();doFetch();};
     document.querySelectorAll('.target-input').forEach(inp=>{inp.addEventListener('input',updateTargetRows);inp.addEventListener('change',()=>{saveTargetsUI();if(currentMetrics)renderTargets(currentMetrics);});});
@@ -3491,6 +3575,10 @@ async function doFetch(isRetry){
         });
         // Retry charts if Chart.js wasn't ready yet
         if(typeof Chart==='undefined'){setTimeout(()=>{if(typeof Chart!=='undefined'&&currentMetrics)renderCharts(currentMetrics);},2000);}
+        // Kick off the weekly VRETs pull in the BACKGROUND (not awaited) so the compact VRETs
+        // panel on the Sync tab fills in without the user having to open the VRETs tab first.
+        // fetchVRETsData updates both the tab and the panel when it resolves.
+        fetchVRETsData();
     }catch(err){console.error(err);setStatus('\u26A0\uFE0F '+err.message);alert('Fetch failed: '+err.message+'\n\nMake sure you are on Amazon network and authenticated to Midway.');}
     finally{btn.disabled=false;btn.textContent='\u25B6 Get Data';}
 }
