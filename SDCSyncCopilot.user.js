@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      14.13.0
+// @version      14.13.2
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -1034,8 +1034,15 @@ function fetchOsCount(def,config){
         });
     });
 }
-// Fetch every OpenSearch count (bin collision, ship failed moves, ...).
-function fetchOsCounts(config){OS_COUNTS.forEach(def=>fetchOsCount(def,config));}
+// Fetch every OpenSearch count (bin collision, ship failed moves, ...). Show the "open OpenSearch"
+// note only if EVERY count failed (i.e. the session isn't established — the new-user case).
+function fetchOsCounts(config){
+    Promise.all(OS_COUNTS.map(def=>fetchOsCount(def,config))).then(results=>{
+        const anyOk=results.some(r=>r===true);
+        const note=document.getElementById('os-session-note');
+        if(note)note.style.display=anyOk?'none':'';
+    });
+}
 function renderOsCount(elId,count){
     const el=document.getElementById(elId);
     if(el)el.textContent=(count==null||isNaN(count))?'\u2014':Number(count).toLocaleString();
@@ -2220,7 +2227,7 @@ function updatePeriodDots(){
 // === HTML ===
 function buildHTML(){return `
 <nav class="topnav"><div class="topnav-left"><span class="logo"><svg width="28" height="28" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="46" fill="#333A44" stroke="#4a9eff" stroke-width="4"/><path d="M25 65 L25 40 L50 28 L75 40 L75 65 Z" fill="none" stroke="#E8EAED" stroke-width="3" stroke-linejoin="round"/><line x1="25" y1="65" x2="75" y2="65" stroke="#E8EAED" stroke-width="3"/><rect x="30" y="45" width="16" height="20" fill="none" stroke="#E8EAED" stroke-width="2"/><line x1="30" y1="50" x2="46" y2="50" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="55" x2="46" y2="55" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="60" x2="46" y2="60" stroke="#E8EAED" stroke-width="1.5"/><rect x="54" y="48" width="14" height="17" fill="none" stroke="#E8EAED" stroke-width="2"/><rect x="57" y="52" width="4" height="5" fill="#E8EAED"/><rect x="62" y="55" width="3" height="4" fill="#E8EAED"/></svg></span><h1 class="site-title">FC Sync Board<span style="display:block;font-size:10px;font-weight:400;color:#aaa;margin-top:-2px;">by snodgtyl</span></h1>
-<div class="nav-tabs"><button class="nav-tab active" data-tab="sync">Sync IB-OB</button><button class="nav-tab" data-tab="hourly">Hourly</button><button class="nav-tab" data-tab="eoswash">EOS Wash</button><button class="nav-tab" data-tab="faststart">Fast Start</button><button class="nav-tab" data-tab="vrets">VRETs</button><button class="nav-tab" data-tab="settings">Settings</button></div></div>
+<div class="nav-tabs"><button class="nav-tab active" data-tab="sync">Sync IB-OB</button><button class="nav-tab" data-tab="hourly">Hourly</button><button class="nav-tab" data-tab="faststart">Fast Start</button><button class="nav-tab" data-tab="vrets">VRETs</button><button class="nav-tab" data-tab="eoswash">EOS Wash</button><button class="nav-tab" data-tab="settings">Settings</button></div></div>
 <div class="topnav-right"><select id="site-select" class="select-input"></select><select id="shift-select" class="select-input"><option value="Days">Days</option><option value="Nights">Nights</option></select>
 <div class="period-indicator"><span class="period-dot" id="dot-p1">P1</span><span class="period-dot" id="dot-p2">P2</span><span class="period-dot" id="dot-p3">P3</span></div>
 <button id="btn-fetch" class="btn btn-primary">\u25B6 Get Data</button><button id="btn-snip" class="btn btn-snip">\uD83D\uDCF7 Snip</button><button id="btn-dark" class="btn" style="background:#333;color:#fff;border-color:#333;">\u263D</button><button id="btn-exit" class="btn btn-danger">\u2715 Exit</button><span id="last-update" class="meta-text">Ready</span></div></nav>
@@ -2332,6 +2339,7 @@ function buildHTML(){return `
 <div><span style="color:#333;font-size:10px;">SHIP FM COUNT</span><br><strong id="atlas-shipfm-count" style="font-size:16px;">\u2014</strong></div>
 </div>
 <div id="atlas-session-note" style="display:none;font-size:10px;color:#c62828;margin-top:4px;">\u26A0\uFE0F ATLAS DPMO session expired \u2014 <a href="https://atlas.qubit.amazon.dev/defect-dashboard" target="_blank" style="color:#1565c0;text-decoration:underline;font-weight:700;">open ATLAS</a> to sign in, then click Get Data.</div>
+<div id="os-session-note" style="display:none;font-size:10px;color:#c62828;margin-top:2px;">\u26A0\uFE0F Counts unavailable \u2014 <a href="https://moc.prod.atlas-opensearch.qubit.amazon.dev/_dashboards/app/dashboards?security_tenant=global" target="_blank" style="color:#1565c0;text-decoration:underline;font-weight:700;">open OpenSearch</a> to sign in, then click Get Data.</div>
 <div style="text-align:right;font-size:9px;color:#888;margin-top:6px;" id="icqa-gca-updated">\u2014</div>
 </div>
 <div class="site-cplh-panel" id="site-cplh-panel" style="background:#fff;border:2px solid #000;border-radius:4px;padding:10px 14px;margin-top:6px;">
@@ -2611,9 +2619,10 @@ function buildCSS(){return `
 /* View toggle (Shift Plan Targets / Current Day / Prior Day) in the panel title */
 .day-toggle{font-size:11px;padding:5px 10px;border:1px solid #888;background:#eee;color:#333;cursor:pointer;font-weight:700;}
 .day-toggle.active{background:#1565c0;color:#fff;border-color:#1565c0;}
-/* !important needed to beat the generic "dark-mode .btn{color:#000}" rule (these are also .btn). */
-#sb-root.dark-mode .day-toggle{background:#16213e!important;color:#fff!important;border-color:#555!important;}
-#sb-root.dark-mode .day-toggle.active{background:#1565c0!important;color:#fff!important;border-color:#1565c0!important;}
+/* Higher specificity (.targets-panel .day-toggle) so it beats the later ".targets-panel *"
+   rule AND the generic ".btn{color:#000}" rule. Inactive AND active are both white in dark mode. */
+#sb-root.dark-mode .targets-panel .day-toggle{background:#16213e!important;color:#fff!important;border-color:#555!important;}
+#sb-root.dark-mode .targets-panel .day-toggle.active{background:#1565c0!important;color:#fff!important;border-color:#1565c0!important;}
 /* 24hr Reporting day tables (Plan/Actual/Variance) — bigger text/cells than the target tables. */
 .day-report-title{text-align:center;font-weight:700;font-size:15px;margin:4px 0 10px;color:#000;}
 #sb-root.dark-mode .day-report-title{color:#fff!important;}
