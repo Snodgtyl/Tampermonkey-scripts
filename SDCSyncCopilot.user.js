@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      14.2.0
+// @version      14.13.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -12,6 +12,8 @@
 // @connect      galaxybiprintfile-prod.s3.us-west-2.amazonaws.com
 // @connect      midway-auth.amazon.com
 // @connect      guided-coaching.corp.amazon.com
+// @connect      atlas.qubit.amazon.dev
+// @connect      moc.prod.atlas-opensearch.qubit.amazon.dev
 // @connect      fcmenu-iad-regionalized.corp.amazon.com
 // @connect      alps-iad.iad.proxy.amazon.com
 // @connect      hooks.slack.com
@@ -268,6 +270,11 @@ function getShiftDates(config){
 async function fetchHTML(url){const r=await fetch(url,{credentials:'include'});if(!r.ok)throw new Error('HTTP '+r.status);return r.text();}
 function buildFnUrl(site,pid,sd,sh,sm,ed,eh,em){return`/reports/functionRollup?reportFormat=HTML&warehouseId=${site}&processId=${pid}&maxIntradayDays=1&spanType=Intraday&startDateIntraday=${encodeURIComponent(fmtDate(sd))}&startHourIntraday=${sh}&startMinuteIntraday=${sm}&endDateIntraday=${encodeURIComponent(fmtDate(ed))}&endHourIntraday=${eh}&endMinuteIntraday=${em}`;}
 function buildPPRUrl(site,sd,sh,sm,ed,eh,em){return`/reports/processPathRollup?reportFormat=HTML&warehouseId=${site}&maxIntradayDays=1&spanType=Intraday&startDateIntraday=${encodeURIComponent(fmtDate(sd))}&startHourIntraday=${sh}&startMinuteIntraday=${sm}&endDateIntraday=${encodeURIComponent(fmtDate(ed))}&endHourIntraday=${eh}&endMinuteIntraday=${em}&_adjustPlanHours=on&_hideEmptyLineItems=on&employmentType=AllEmployees`;}
+// Same as buildPPRUrl but allows a multi-day INTRADAY window (maxIntradayDays=8) so a full week
+// can be requested while STILL getting the server-rendered PPR (spanType=Week renders client-side
+// and its rows aren't in the fetched HTML). Used for the weekly ICQA RO rate so it reuses the
+// exact shift calc (parseICQARow on the IC/QA/CS row) over a Sunday->now window.
+function buildPPRUrlMultiDay(site,sd,sh,sm,ed,eh,em){return`/reports/processPathRollup?reportFormat=HTML&warehouseId=${site}&maxIntradayDays=8&spanType=Intraday&startDateIntraday=${encodeURIComponent(fmtDate(sd))}&startHourIntraday=${sh}&startMinuteIntraday=${sm}&endDateIntraday=${encodeURIComponent(fmtDate(ed))}&endHourIntraday=${eh}&endMinuteIntraday=${em}&_adjustPlanHours=on&_hideEmptyLineItems=on&employmentType=AllEmployees`;}
 
 function parseFnRollup(html){
     const doc=new DOMParser().parseFromString(html,'text/html');
@@ -445,11 +452,23 @@ function parsePPR(html){
 // Parses the "IC/QA/CS" line item row (id="ppr.detail.support.support.ICQACS") off a
 // PPR (processPathRollup) report page — its Rate column is the ICQA "RO Rate".
 function parseICQARow(doc){
-    const row=doc.getElementById('ppr.detail.support.support.ICQACS');
+    // Intraday PPR: the row has a stable id. Week-span PPR renders the same line item WITHOUT
+    // that id, so fall back to finding the row by its visible "IC/QA/CS" (or "ICQA") label.
+    let row=doc.getElementById('ppr.detail.support.support.ICQACS');
+    if(!row){
+        const rows=doc.querySelectorAll('tr');
+        for(const tr of rows){
+            const firstCell=tr.querySelector('th,td');
+            const label=(firstCell?firstCell.textContent:'').replace(/\s+/g,' ').trim();
+            // Match "IC/QA/CS", "ICQA/CS", "IC/QA", "ICQA" etc. at the start of the row label.
+            if(/^ic\s*\/?\s*qa(\s*\/?\s*cs)?\b/i.test(label)||/^icqa\b/i.test(label)){row=tr;break;}
+        }
+    }
     if(!row)return{vol:0,hrs:0,rate:0};
     let vol=0,hrs=0,rate=0;
+    // Preferred path: read by the FCLM cell classes (present on the id-based Intraday row).
     row.querySelectorAll('td').forEach(c=>{
-        const cls=c.className;
+        const cls=c.className||'';
         const div=c.querySelector('div.original');
         const txt=(div?div.textContent:c.textContent).trim().replace(/,/g,'');
         const v=parseFloat(txt);
@@ -458,6 +477,16 @@ function parseICQARow(doc){
         else if(cls.includes('actualTimeSeconds'))hrs=v;
         else if(cls.includes('actualProductivity'))rate=v;
     });
+    // Fallback for the Week row (no FCLM cell classes): the standard PPR column order is
+    // [label, Planned Vol, Planned Hrs, Planned Rate, Actual Vol, Actual Hrs, Actual Rate, ...].
+    // Pull the numeric cells and take Actual Vol/Hrs/Rate by position, then derive rate if needed.
+    if(vol===0&&hrs===0&&rate===0){
+        const cells=Array.from(row.querySelectorAll('td'));
+        const nums=cells.map(c=>{const d=c.querySelector('div.original');const t=(d?d.textContent:c.textContent).trim().replace(/,/g,'');const v=parseFloat(t);return isNaN(v)?null:v;}).filter(v=>v!==null);
+        // nums: [PlanVol, PlanHrs, PlanRate, ActVol, ActHrs, ActRate, ...]
+        if(nums.length>=6){vol=nums[3];hrs=nums[4];rate=nums[5];}
+        else if(nums.length>=3){vol=nums[0];hrs=nums[1];rate=nums[2];}
+    }
     if(rate===0&&hrs>0)rate=vol/hrs;
     return{vol,hrs,rate};
 }
@@ -751,13 +780,38 @@ async function fetchIcqaRO(config,raw){
         setEl('icqa-ro-shift-actual',shiftRate>0?fmt(shiftRate,2):'\u2014');
         if(target>0&&shiftRate>0){const p=(shiftRate/target)*100;const el=setEl('icqa-ro-shift-pct',fmtPct(p));setPctClass(el,p);}
         else setEl('icqa-ro-shift-pct','\u2014');
-        // Week: one extra PPR fetch using the report's own Week span
-        const weekUrl=buildPPRUrlWeek(config.site,getWeekSunday());
-        const weekHtml=await fetchHTML(weekUrl);
-        const weekIcqa=parseICQARow(new DOMParser().parseFromString(weekHtml,'text/html'));
-        setEl('icqa-ro-week-actual',weekIcqa.rate>0?fmt(weekIcqa.rate,2):'\u2014');
-        if(target>0&&weekIcqa.rate>0){const p=(weekIcqa.rate/target)*100;const el=setEl('icqa-ro-week-pct',fmtPct(p));setPctClass(el,p);}
-        else setEl('icqa-ro-week-pct','\u2014');
+        // Week: use the SAME calc as the shift — the PPR IC/QA/CS row's actualVolume /
+        // actualTimeSeconds via parseICQARow. The shift works because it uses the INTRADAY PPR
+        // (server-rendered). The problem with the earlier attempts was spanType=Week, whose PPR
+        // renders client-side (data not in the fetched HTML). Fix: fetch the INTRADAY PPR over a
+        // Multi-day (maxIntradayDays=8) Intraday PPR now renders CLIENT-SIDE (its IC/QA/CS row
+        // isn't in the fetched HTML). The SINGLE-DAY (maxIntradayDays=1) Intraday PPR is still
+        // server-rendered and works (that's how the shift value is read). So: fetch a 1-day PPR for
+        // EACH day of the week so far (Sunday -> today), parse each with parseICQARow, and sum the
+        // IC/QA/CS volume + hours across the days. Week RO rate = totalVol / totalHrs.
+        try{
+            const weekSun=getWeekSunday();
+            const today=new Date();
+            const dayFetches=[];
+            for(let d=new Date(weekSun);d<=today;d.setDate(d.getDate()+1)){
+                const day=new Date(d);
+                const isToday=day.toDateString()===today.toDateString();
+                const eh=isToday?today.getHours():23, em=isToday?today.getMinutes():59;
+                const url=buildPPRUrl(config.site,day,0,0,day,eh,em);   // 1-day Intraday PPR (server-rendered)
+                dayFetches.push(fetchHTML(url).then(h=>parseICQARow(new DOMParser().parseFromString(h,'text/html'))).catch(()=>({vol:0,hrs:0,rate:0})));
+            }
+            const dayResults=await Promise.all(dayFetches);
+            let totVol=0,totHrs=0;
+            dayResults.forEach(r=>{totVol+=(r.vol||0);totHrs+=(r.hrs||0);});
+            const weekRate=totHrs>0?totVol/totHrs:0;
+            console.log('[SB-ICQA-RO] Week (summed 1-day PPRs): days='+dayResults.length+' vol='+totVol+' hrs='+totHrs.toFixed(2)+' rate='+weekRate.toFixed(2));
+            setEl('icqa-ro-week-actual',weekRate>0?fmt(weekRate,2):'\u2014');
+            if(target>0&&weekRate>0){const p=(weekRate/target)*100;const el=setEl('icqa-ro-week-pct',fmtPct(p));setPctClass(el,p);}
+            else setEl('icqa-ro-week-pct','\u2014');
+        }catch(we){
+            console.warn('[SB-ICQA-RO] Week fetch failed:',we.message,'(session/URL issue?)');
+            setEl('icqa-ro-week-actual','\u2014');setEl('icqa-ro-week-pct','\u2014');
+        }
     }catch(e){console.warn('[SB] ICQA RO fetch error:',e.message);}
 }
 
@@ -798,6 +852,193 @@ async function fetchIcqaDC(config){
         const weekEl=document.getElementById('icqa-dc-week-actual');
         if(weekEl&&weekDC.totalHours>0){weekEl.style.color=weekDC.pct>=70?'#2e7d32':'#c62828';}
     }catch(e){console.warn('[SB-DC] ICQA DC% fetch error:',e.message,e.stack);}
+}
+
+// === ICQA: ATLAS Qubit defect metrics (Bin Collision, Ship Failed Moves) ===
+// The ATLAS defect dashboard (atlas.qubit.amazon.dev) exposes a cookie-authed GraphQL
+// endpoint. Auth is the Midway SSO cookie (amzn_sso_token) which GM_xmlhttpRequest sends
+// automatically — same model as GalaxyBI/GCA, NOT AWS SigV4 — so we can replay it in the
+// background. It uses an Apollo PERSISTED QUERY (operationName "getMetrics"), identified by a
+// sha256Hash. If ATLAS ever changes that query the hash changes and the call returns
+// PersistedQueryNotFound; recapture the hash from DevTools if that happens.
+// variables.relativeTime is SECONDS back from now — we set it to seconds-since-shift-SOS so it
+// tracks shift-to-date (matching how the dashboard is read for the shift). warehouseType is
+// "Supplemental" for these SDC sites (as captured).
+const ATLAS_GQL_URL='https://atlas.qubit.amazon.dev/graphql';
+const ATLAS_GETMETRICS_HASH='7e9652a8ba7b9a27e0cfab2ba2ec2ca41e4bb8296d523a41896c36811776e0a4';
+// Metrics we surface, by their ATLAS metric `name`, with the label shown in the ICQA panel.
+const ATLAS_METRICS=[
+    {name:'STOW_BIN_COLLISION',elBase:'atlas-binc',label:'Bin Collision'},
+    {name:'SHIP_FAILED_MOVES',elBase:'atlas-shipfm',label:'Ship Failed Moves'}
+];
+// Seconds from shift SOS (full period start) to now, for the relativeTime window. Falls back to
+// 2.5h (9000s) if the shift start can't be resolved or is in the future.
+function atlasRelativeSeconds(config){
+    try{
+        // Count from P1 SOS (the actual shift start, e.g. 18:15), NOT the board's "full" window
+        // which opens 30 min earlier (17:45) for other metrics. The ATLAS dashboard measures from
+        // SOS, so anchoring here makes the board's DPMO window match the dashboard's.
+        const sched=config.shiftType==='Nights'?config.nights:config.days;
+        const p1=sched.p1;
+        const now=new Date();
+        const sos=new Date(now);
+        sos.setHours(p1.sh,p1.sm,0,0);
+        // Nights: if it's morning (before noon), the shift started yesterday evening.
+        if(config.shiftType==='Nights'&&now.getHours()<12){sos.setDate(sos.getDate()-1);}
+        // If SOS is somehow still in the future (e.g. pre-shift), fall back below.
+        const secs=Math.floor((now.getTime()-sos.getTime())/1000);
+        if(secs>0&&secs<26*3600)return secs;   // sane bound: 0..26h
+    }catch(e){}
+    return 9000; // 2.5h default
+}
+async function fetchIcqaAtlas(config){
+    const cfg=config||loadConfig();
+    const site=cfg.site;
+    const relativeTime=atlasRelativeSeconds(cfg);
+    const body=JSON.stringify({
+        operationName:'getMetrics',
+        variables:{region:'NA',relativeTime,warehouse:site,warehouseType:'Supplemental'},
+        extensions:{persistedQuery:{version:1,sha256Hash:ATLAS_GETMETRICS_HASH}}
+    });
+    return new Promise((resolve)=>{
+        if(typeof GM_xmlhttpRequest!=='function'){console.warn('[SB-ATLAS] GM_xmlhttpRequest unavailable');resolve(false);return;}
+        GM_xmlhttpRequest({
+            method:'POST',
+            url:ATLAS_GQL_URL,
+            headers:{'Content-Type':'application/json','Accept':'*/*'},
+            data:body,
+            onload:function(resp){
+                try{
+                    const data=JSON.parse(resp.responseText);
+                    // PersistedQueryNotFound surfaces as an errors[] entry — flag it clearly.
+                    if(data.errors&&data.errors.length){
+                        console.warn('[SB-ATLAS] GraphQL errors:',JSON.stringify(data.errors).slice(0,300));
+                    }
+                    const metrics=data?.data?.warehouseMetrics?.metrics;
+                    if(!Array.isArray(metrics)){console.warn('[SB-ATLAS] no metrics array in response');renderAtlasMetrics(null);resolve(false);return;}
+                    const byName={};metrics.forEach(m=>{if(m&&m.name)byName[m.name]=m;});
+                    console.log('[SB-ATLAS] binC='+(byName.STOW_BIN_COLLISION?byName.STOW_BIN_COLLISION.value+'/'+byName.STOW_BIN_COLLISION.threshold:'n/a')+' shipFM='+(byName.SHIP_FAILED_MOVES?byName.SHIP_FAILED_MOVES.value+'/'+byName.SHIP_FAILED_MOVES.threshold:'n/a')+' relSec='+relativeTime);
+                    renderAtlasMetrics(byName);
+                    resolve(true);
+                }catch(e){
+                    // Non-JSON = almost certainly a Midway login redirect (session expired).
+                    console.warn('[SB-ATLAS] parse error (session expired? visit atlas.qubit.amazon.dev to auth):',e.message);
+                    renderAtlasMetrics(null);
+                    resolve(false);
+                }
+            },
+            onerror:function(e){console.warn('[SB-ATLAS] fetch error:',e&&e.error);renderAtlasMetrics(null);resolve(false);},
+            ontimeout:function(){console.warn('[SB-ATLAS] timeout');renderAtlasMetrics(null);resolve(false);}
+        });
+    });
+}
+// Paint the ATLAS metric rows. DPMO: LOWER is better, so green when value <= threshold, red over,
+// amber within 10% under. byName=null clears to em-dashes (fetch failed).
+function renderAtlasMetrics(byName){
+    ATLAS_METRICS.forEach(def=>{
+        const valEl=document.getElementById(def.elBase+'-value');
+        const tgtEl=document.getElementById(def.elBase+'-threshold');
+        const m=byName?byName[def.name]:null;
+        if(!m){if(valEl){valEl.textContent='\u2014';valEl.style.color='';}if(tgtEl)tgtEl.textContent='\u2014';return;}
+        const v=Number(m.value)||0;
+        const t=(m.threshold==null)?null:Number(m.threshold);
+        if(valEl){
+            valEl.textContent=v.toLocaleString();
+            // Color the value by threshold: green under / amber within 10% / red over (DPMO lower is better).
+            if(t!=null&&t>0)valEl.style.color=v<=t?'#2e7d32':(v<=t*1.1?'#e65100':'#c62828');
+            else valEl.style.color='';
+        }
+        if(tgtEl)tgtEl.textContent=(t!=null)?t.toLocaleString():'\u2014';
+    });
+    // Show the "session expired" note only when the ATLAS DPMO fetch failed (byName is null).
+    // The counts come from OpenSearch (a different session), so this note is DPMO-specific.
+    const note=document.getElementById('atlas-session-note');
+    if(note)note.style.display=byName?'none':'';
+}
+
+// === ICQA: OpenSearch raw Bin Collision COUNT (separate from the ATLAS DPMO) ===
+// The ATLAS OpenSearch dashboard (moc.prod.atlas-opensearch.qubit.amazon.dev) exposes the raw
+// event COUNT (not DPMO) via its Kibana/OpenSearch internal search endpoint. Auth is a cookie
+// (security_authentication), so GM_xmlhttpRequest can replay it. The endpoint REQUIRES the
+// osd-xsrf + osd-version headers (Kibana CSRF guard) or it 400s. We read rawResponse.hits.total.
+// The query body is templated with warehouse_id:<site> and a timestamp range = shift SOS->now (UTC).
+const OS_SEARCH_URL='https://moc.prod.atlas-opensearch.qubit.amazon.dev/_dashboards/internal/search/opensearch';
+const OS_XSRF_HEADERS={'Content-Type':'application/json','osd-xsrf':'osd-fetch','osd-version':'2.13.0','Accept':'*/*'};
+// Build the shift SOS -> now window as UTC ISO strings, anchored at P1 SOS (matching the ATLAS DPMO).
+function osShiftRangeISO(config){
+    const sched=config.shiftType==='Nights'?config.nights:config.days;
+    const p1=sched.p1;
+    const now=new Date();
+    const sos=new Date(now);
+    sos.setHours(p1.sh,p1.sm,0,0);
+    if(config.shiftType==='Nights'&&now.getHours()<12){sos.setDate(sos.getDate()-1);}
+    if(sos.getTime()>now.getTime())sos.setDate(sos.getDate()-1); // safety: never future
+    return{gte:sos.toISOString(),lte:now.toISOString()};
+}
+// The raw event COUNTS we pull from OpenSearch. Same endpoint/body shape for each; only the
+// `type` filter (and the aggs field, which we don't read) differ. count = rawResponse.hits.total.
+const OS_COUNTS=[
+    {type:'STOW_BIN_COLLISIONS',aggField:'container.keyword',elId:'atlas-binc-count',label:'bin collision'},
+    {type:'SHIP_FAILED_MOVES',aggField:'failure_reason.keyword',elId:'atlas-shipfm-count',label:'ship failed moves'}
+];
+// Generic OpenSearch count fetch for one metric type over the shift SOS->now window.
+function fetchOsCount(def,config){
+    const cfg=config||loadConfig();
+    const site=cfg.site;
+    const {gte,lte}=osShiftRangeISO(cfg);
+    // Mirror the dashboard's query body; only warehouse_id, type, timestamp range, and preference vary.
+    // NOTE: `preference` is a sibling of `body` under `params` (NOT inside `body`). Nesting it
+    // inside body triggers OpenSearch "Unknown key for a VALUE_NUMBER in [preference]" (HTTP 400).
+    const body=JSON.stringify({params:{index:'atlas*',
+        body:{
+            aggs:{"2":{terms:{field:def.aggField,order:{_count:'desc'},size:20}}},
+            size:0,stored_fields:['*'],script_fields:{},
+            docvalue_fields:[{field:'@timestamp',format:'date_time'},{field:'timestamp',format:'date_time'}],
+            _source:{excludes:[]},
+            query:{bool:{
+                must:[{query_string:{analyze_wildcard:true,query:'warehouse_id:'+site,time_zone:'America/Los_Angeles'}}],
+                filter:[
+                    {bool:{should:[{match:{type:def.type}}],minimum_should_match:1}},
+                    {range:{timestamp:{gte,lte,format:'strict_date_optional_time'}}}
+                ],should:[],must_not:[]}}
+        },
+        preference:Date.now()
+    }});
+    return new Promise((resolve)=>{
+        if(typeof GM_xmlhttpRequest!=='function'){renderOsCount(def.elId,null);resolve(false);return;}
+        GM_xmlhttpRequest({
+            method:'POST',url:OS_SEARCH_URL,headers:OS_XSRF_HEADERS,data:body,
+            onload:function(resp){
+                const txt=resp.responseText||'';
+                // Expired session redirects to a federate/login HTML page instead of JSON.
+                if(/<html|<!doctype|federate|idp\.|authorize|login/i.test(txt.slice(0,500))){
+                    console.warn('[SB-OS] '+def.label+' session expired (got login/HTML) \u2014 open the OpenSearch dashboard + sign in, then Get Data.');
+                    renderOsCount(def.elId,null);resolve(false);return;
+                }
+                try{
+                    const data=JSON.parse(txt);
+                    // hits.total may be a number (as captured) or {value:n}.
+                    const total=data?.rawResponse?.hits?.total;
+                    const count=(typeof total==='object'&&total)?Number(total.value):Number(total);
+                    if(isNaN(count)){console.warn('[SB-OS] '+def.label+' no hits.total. status='+resp.status+' first 200:',txt.slice(0,200));renderOsCount(def.elId,null);resolve(false);return;}
+                    console.log('[SB-OS] '+def.label+' count='+count+' window '+gte+'..'+lte);
+                    renderOsCount(def.elId,count);
+                    resolve(true);
+                }catch(e){
+                    console.warn('[SB-OS] '+def.label+' parse error (session expired?):',e.message,'first 200:',txt.slice(0,200));
+                    renderOsCount(def.elId,null);resolve(false);
+                }
+            },
+            onerror:function(e){console.warn('[SB-OS] '+def.label+' fetch error (osd-xsrf/CORS?):',e&&e.error);renderOsCount(def.elId,null);resolve(false);},
+            ontimeout:function(){console.warn('[SB-OS] '+def.label+' timeout');renderOsCount(def.elId,null);resolve(false);}
+        });
+    });
+}
+// Fetch every OpenSearch count (bin collision, ship failed moves, ...).
+function fetchOsCounts(config){OS_COUNTS.forEach(def=>fetchOsCount(def,config));}
+function renderOsCount(elId,count){
+    const el=document.getElementById(elId);
+    if(el)el.textContent=(count==null||isNaN(count))?'\u2014':Number(count).toLocaleString();
 }
 
 // === ICQA: GCA's (Coaching to Deliver, target 0) ===
@@ -950,9 +1191,156 @@ async function fetch24hrData(site){
     }catch(e){console.warn('[SB] 24hr data fetch error:',e.message);return{ibVol24:0,obVol24:0,ibDensity24:0,obDensity24:0};}
 }
 
+// === PRIOR-DAY 24hr REPORTING (yesterday 00:00-23:59) ===
+// Fetches the full prior calendar day so the Shift Plan Targets panel's "Prior Day" view can
+// show Plan (LP, already cached) vs Actual (produced yesterday) vs Variance. Actuals:
+//   IB/DA volume + density -> same sources as fetch24hrData (stow, palletStow, TO fluid+dock)
+//   IB/DA/Throughput CPLH  -> computed EXACTLY like the shift: volume / PPR hours, but over the
+//                             00:00-23:59 window (PPR ibActualHrs / daTransferHrs / throughputHrs).
+// dayOffset: 0 = today (00:00 -> now), 1 = yesterday (00:00 -> 23:59). Used by both the
+// Current Day and Prior Day views of the Shift Plan Targets panel.
+async function fetchDayData(site,dayOffset){
+    try{
+        const off=dayOffset||0;
+        const d=new Date();d.setDate(d.getDate()-off);
+        const start=new Date(d);start.setHours(0,0,0,0);
+        const end=new Date(d);
+        // For today, end = now (partial day so far); for a past day, end = 23:59.
+        const eh=off===0?end.getHours():23, em=off===0?end.getMinutes():59;
+        const stowUrl=buildFnUrl(site,PROCESS_IDS.stow,start,0,0,end,eh,em);
+        const palletStowUrl=buildFnUrl(site,PROCESS_IDS.palletStow,start,0,0,end,eh,em);
+        const toFluidUrl=buildFnUrl(site,PROCESS_IDS.toFluidLoad,start,0,0,end,eh,em);
+        const toDockUrl=buildFnUrl(site,PROCESS_IDS.toDock,start,0,0,end,eh,em);
+        // PPR over the window for the hours (IB actual, DA transfer, throughput).
+        const pprUrl=buildPPRUrl(site,start,0,0,end,eh,em);
+        const [stowHtml,palletStowHtml,toFluidHtml,toDockHtml,pprHtml]=await Promise.all([
+            fetchHTML(stowUrl),fetchHTML(palletStowUrl),fetchHTML(toFluidUrl),fetchHTML(toDockUrl),fetchHTML(pprUrl)
+        ]);
+        const stow=parseFnRollup(stowHtml);
+        const pStow=parseFnRollup(palletStowHtml);
+        const toFluid=parseToFluidLoad(toFluidHtml);
+        const toDock=parseToDock(toDockHtml);
+        const ppr=parsePPR(pprHtml);
+        const palletCases=pStow.palletCases||0;
+        const ibVol=(stow.totalUnits||0)+palletCases;
+        const obVol=(toFluid.jobs||0)+(toDock.caseUnits||0);
+        const ibDensity=(stow.caseUnits||0)>0?(stow.eachUnits||0)/(stow.caseUnits||1):0;
+        const obDensity=(toFluid.caseUnits||0)>0?(toFluid.eachUnits||0)/(toFluid.caseUnits||1):0;
+        // CPLH — same formulas as the shift (renderIB/renderOB/Site CPLH), over this window.
+        const ibHrs=ppr.ibActualHrs||0;
+        const daHrs=ppr.daTransferHrs||0;
+        const tHrs=ppr.throughputHrs||0;
+        const ibCplh=ibHrs>0?ibVol/ibHrs:0;
+        const obCplh=daHrs>0?obVol/daHrs:0;
+        const siteVol=obVol+(stow.totalUnits||0)+palletCases;
+        const siteCplh=tHrs>0?siteVol/tHrs:0;
+        console.log('[SB-Day'+off+'] '+fmtDate(start)+' ibVol='+ibVol+' obVol='+obVol+' ibCplh='+ibCplh.toFixed(2)+' obCplh='+obCplh.toFixed(2)+' siteCplh='+siteCplh.toFixed(2)+' (ibHrs='+ibHrs+' daHrs='+daHrs+' tHrs='+tHrs+')');
+        return{dateStr:fmtDate(start),ibVol,obVol,ibDensity,obDensity,ibCplh,obCplh,siteCplh,ibHrs,daHrs,tHrs};
+    }catch(e){console.warn('[SB-Day] fetch error:',e.message);return null;}
+}
+
 // === LABOR PLANNING (LP) CPLH — Manual Input + Auto-fetch attempt ===
 function loadLPValues(){
     try{const s=localStorage.getItem('syncboard_lp');return s?JSON.parse(s):{};}catch(e){return{};}
+}
+// Fill the Shift Plan Targets panel's read-only LP rows from cached LP values. Called on init
+// (so they show before a fetch) and again by renderLPPercents after each fetch. Safe if the
+// spans or values are missing (shows an em-dash).
+function seedShiftPlanLPRows(){
+    const lp=loadLPValues()||{};
+    const put=(id,v)=>{const el=document.getElementById(id);if(el){const n=parseFloat(v)||0;el.textContent=n>0?n.toFixed(2):'\u2014';}};
+    put('spt-ib-lp-cplh',lp.ibCplh);
+    put('spt-ob-lp-cplh',lp.obCplh);
+    put('spt-ib-lp-density',lp.ibDensityLP);
+    put('spt-ob-lp-density',lp.obDensityLP);
+    put('spt-site-lp-cplh',lp.siteCplh);
+}
+// ---- Shift Plan Targets panel: 3-view toggle (Shift Plan Targets / Current Day / Prior Day) ----
+// The two day views share the same Plan/Actual/Variance table shape. dayData[0]=today (00:00->now),
+// dayData[1]=yesterday (full day). Fetched on first open of each; invalidated on Get Data.
+const dayData=[null,null];       // [todayResult, yesterdayResult]
+const dayLoading=[false,false];
+// Which view: 'targets' (shift plan), 'current' (day 0), 'prior' (day 1).
+function setDayView(which){
+    const views={targets:'spt-targets-view',current:'spt-current-view',prior:'spt-prior-view'};
+    const btns={targets:'btn-view-targets',current:'btn-view-current',prior:'btn-view-prior'};
+    Object.keys(views).forEach(k=>{
+        const v=document.getElementById(views[k]);if(v)v.style.display=(k===which)?'':'none';
+        const b=document.getElementById(btns[k]);if(b)b.classList.toggle('active',k===which);
+    });
+    // Dept Backlog only shows for the day views (Current / Prior), not Shift Plan Targets.
+    const dept=document.getElementById('spt-dept-backlog');
+    if(dept)dept.style.display=(which==='current'||which==='prior')?'':'none';
+    if(which==='current')ensureDay(0);
+    else if(which==='prior')ensureDay(1);
+}
+// Fetch a day's data on demand (offset 0=today,1=yesterday), cache it, then render.
+function ensureDay(off){
+    if(dayData[off]){renderDayView(off,dayData[off]);return;}
+    if(dayLoading[off])return;
+    dayLoading[off]=true;
+    const status=document.getElementById(off===0?'spt-current-status':'spt-prior-status');
+    if(status)status.textContent='Fetching\u2026';
+    fetchDayData(loadConfig().site,off).then(d=>{
+        dayLoading[off]=false;dayData[off]=d;
+        if(d){renderDayView(off,d);if(status)status.textContent='\u2713 '+d.dateStr;}
+        else if(status)status.textContent='\u26A0 Fetch failed \u2014 try Get Data first';
+    });
+}
+// Render a Plan/Actual/Variance day view. prefix 'cd' (current) or 'pd' (prior). Plan = cached LP
+// (single daily plan); Actual = the day's produced data; Variance = (Actual-Plan)/Plan %.
+function renderDayView(off,d){
+    const lp=loadLPValues()||{};
+    const prefix=off===0?'cd':'pd';
+    const dateEl=document.getElementById(off===0?'spt-current-date':'spt-prior-date');
+    if(dateEl)dateEl.textContent=d.dateStr||(off===0?'Current Day':'Prior Day');
+    const fmtNum=(v,dec)=>{const n=Number(v)||0;return n>0?(dec!=null?n.toFixed(dec):Math.round(n).toLocaleString()):'\u2014';};
+    const setRow=(base,plan,act,dec)=>{
+        const planEl=document.getElementById(prefix+'-'+base+'-plan');
+        const actEl=document.getElementById(prefix+'-'+base+'-act');
+        const varEl=document.getElementById(prefix+'-'+base+'-var');
+        if(planEl)planEl.textContent=fmtNum(plan,dec);
+        if(actEl)actEl.textContent=fmtNum(act,dec);
+        if(varEl){
+            const p=Number(plan)||0,a=Number(act)||0;
+            if(p>0){
+                const diff=a-p;                       // raw difference (Actual - Plan)
+                const pct=(diff/p)*100;               // percent difference
+                const diffStr=(diff>=0?'+':'')+(dec!=null?diff.toFixed(dec):Math.round(diff).toLocaleString());
+                varEl.textContent=diffStr+' ('+(pct>=0?'+':'')+pct.toFixed(1)+'%)';
+                // Higher-is-better: green at/above plan, amber within 10% under, red below.
+                varEl.style.color=pct>=0?'#2e7d32':(pct>=-10?'#e65100':'#c62828');
+            }else{varEl.textContent='\u2014';varEl.style.color='';}
+        }
+    };
+    // BB Goal Plan: LP BB goals are keyed by DAY-OF-WEEK, so today and yesterday differ. For the
+    // prior day, use the separately-fetched yesterday goals if available; else fall back to today's.
+    const ibBB=(off===1&&priorBBGoals.ib>0)?priorBBGoals.ib:(parseFloat(lp.ibBBGoal)||0);
+    const obBB=(off===1&&priorBBGoals.ob>0)?priorBBGoals.ob:(parseFloat(lp.obBBGoal)||0);
+    setRow('ib-bb',ibBB,d.ibVol,null);
+    setRow('ib-den',parseFloat(lp.ibDensityLP)||0,d.ibDensity,2);
+    setRow('ib-cplh',parseFloat(lp.ibCplh)||0,d.ibCplh,2);
+    setRow('da-bb',obBB,d.obVol,null);
+    setRow('da-den',parseFloat(lp.obDensityLP)||0,d.obDensity,2);
+    setRow('da-cplh',parseFloat(lp.obCplh)||0,d.obCplh,2);
+    setRow('tp-cplh',parseFloat(lp.siteCplh)||0,d.siteCplh,2);
+    // For the prior day, kick off the yesterday-specific BB goal fetch once (day-of-week keyed).
+    if(off===1&&priorBBGoals.ib===0&&priorBBGoals.ob===0&&!priorBBGoals.loading)fetchPriorBBGoals();
+}
+// LP BB goals for YESTERDAY (day-of-week keyed). CPLH/density LP are weekly (same across the week),
+// but BB goals differ per day, so the prior-day view needs yesterday's specific BB goals.
+const priorBBGoals={ib:0,ob:0,loading:false};
+function fetchPriorBBGoals(){
+    const lp=loadLPValues()||{};
+    const planId=lp._planId, sundayStr=lp._sundayStr;
+    if(!planId||!sundayStr){console.warn('[SB-PriorBB] no cached planId/sundayStr yet \u2014 run Get Data first');return;}
+    const days=['SUNDAY','MONDAY','TUESDAY','WEDNESDAY','THURSDAY','FRIDAY','SATURDAY'];
+    const y=new Date();y.setDate(y.getDate()-1);
+    const yDay=days[y.getDay()];
+    priorBBGoals.loading=true;
+    let done=0;const check=()=>{if(done>=2){priorBBGoals.loading=false;console.log('[SB-PriorBB] '+yDay+' ib='+priorBBGoals.ib+' ob='+priorBBGoals.ob);if(dayData[1])renderDayView(1,dayData[1]);}};
+    fetchBBGoalFromLP(planId,'IB',sundayStr,(v)=>{priorBBGoals.ib=v||0;done++;check();},yDay);
+    fetchBBGoalFromLP(planId,'DA',sundayStr,(v)=>{priorBBGoals.ob=v||0;done++;check();},yDay);
 }
 function saveLPValues(lp){
     try{localStorage.setItem('syncboard_lp',JSON.stringify(lp));}catch(e){}
@@ -979,22 +1367,64 @@ function attemptLPFetch(site,resolve,isRetry){
         const endStr=end.getFullYear()+'-'+String(end.getMonth()+1).padStart(2,'0')+'-'+String(end.getDate()).padStart(2,'0');
         const reportsUrl=`https://galaxybi.aka.corp.amazon.com/api/folders/labor-planning/templates/lR8NujgNmqXM-print-file/reports?site=${site}&reportType=PUBLISHED&startReportDate=${sundayStr}&endReportDate=${endStr}&userName=snodgtyl`;
         console.log('[SB-LP] Fetching reports:',reportsUrl);
+        // Shared re-auth: GalaxyBI returns its SSO/login page as HTTP 200 HTML (not an error)
+        // when the session is expired, so BOTH a network error AND a non-JSON 200 must trigger
+        // the silent iframe re-auth. Without this, an expired session just resolves null and the
+        // "visit GalaxyBI" banner appears with no retry — which is the bug the user hit.
+        const reauthAndRetry=(why)=>{
+            if(isRetry){console.warn('[SB-LP] Still failing after re-auth ('+why+')');resolve(null);return;}
+            console.log('[SB-LP] '+why+' — refreshing GalaxyBI session via hidden iframe, then retrying...');
+            const iframe=document.createElement('iframe');
+            iframe.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;';
+            iframe.src='https://galaxybi.aka.corp.amazon.com/';
+            document.body.appendChild(iframe);
+            setTimeout(()=>{
+                if(iframe.parentNode)iframe.parentNode.removeChild(iframe);
+                console.log('[SB-LP] Retrying LP fetch after re-auth...');
+                attemptLPFetch(site,resolve,true);
+            },5000);
+        };
         GM_xmlhttpRequest({method:'GET',url:reportsUrl,
             headers:{'Accept':'*/*','Content-Type':'application/json'},
             onload:function(resp){
                 try{
                     const text=resp.responseText.trim();
                     if(!text.startsWith('[')&&!text.startsWith('{')){
+                        // Non-JSON 200 = almost always the GalaxyBI login/SSO page (expired session).
+                        // Route through the SAME silent re-auth as a network error instead of giving up.
+                        const looksLikeLogin=/<html|<!doctype|sign in|midway|login|federate/i.test(text);
                         console.warn('[SB-LP] Reports not JSON, status:',resp.status,'first 200:',text.substring(0,200));
-                        resolve(null);return;
+                        if(looksLikeLogin){reauthAndRetry('reports returned HTML login (status '+resp.status+')');}
+                        else resolve(null);
+                        return;
                     }
                     const data=JSON.parse(text);
                     const reports=data.reports||data||[];
-                    const finalReport=reports.find(r=>r.reportName&&r.reportName.toLowerCase().includes('final'));
-                    if(!finalReport||!finalReport.planId){console.warn('[SB-LP] No Final report found');resolve(null);return;}
+                    const withPlan=(Array.isArray(reports)?reports:[]).filter(r=>r&&r.planId);
+                    // Read a report's PUBLISHED-AT time. The site publishes two "Prelim" reports a
+                    // week (Wed and the FINAL Fri); they share the same name/reportDate, so we MUST
+                    // pick the one published LATEST (Friday), not the newest reportDate. Try the
+                    // common published-at field names; fall back to 0.
+                    const pubOf=(r)=>{
+                        const cand=r.publishedAt||r.publishedTime||r.publishTime||r.publishedDate||r.publishDate||
+                                   r.createdAt||r.createdTime||r.creationTime||r.lastModified||r.updatedAt||r.timestamp;
+                        const t=cand?new Date(cand).getTime():0;
+                        return isNaN(t)?0:t;
+                    };
+                    // Diagnostic: dump each report with its name/planId/publishedAt so we can confirm
+                    // the selection picks the LATEST-published (Friday) plan, not the Wednesday one.
+                    console.log('[SB-LP] reports returned:',withPlan.length,
+                        withPlan.map(r=>({name:r.reportName,planId:r.planId,pub:pubOf(r),pubRaw:(r.publishedAt||r.publishedTime||r.publishTime||r.createdAt||'?'),keys:Object.keys(r)})));
+                    // Choose the report with the LATEST published-at time. (If none expose a pub time,
+                    // this falls back to the last report in the list.)
+                    let finalReport=null;
+                    if(withPlan.length){
+                        finalReport=withPlan.slice().sort((a,b)=>pubOf(b)-pubOf(a))[0];
+                    }
+                    if(!finalReport||!finalReport.planId){console.warn('[SB-LP] No usable report found (0 with a planId)');resolve(null);return;}
                     const planId=finalReport.planId;
-                    console.log('[SB-LP] Found:',finalReport.reportName,'planId=',planId);
-                    let done=0;const results={ibCplh:0,obCplh:0,siteCplh:0,ctiRate:0,topRate:0,ibDensityLP:0,obDensityLP:0,ibBBGoal:0,obBBGoal:0};
+                    console.log('[SB-LP] Using LATEST-published report:',finalReport.reportName,'planId=',planId,'publishedAt=',new Date(pubOf(finalReport)).toISOString());
+                    let done=0;const results={ibCplh:0,obCplh:0,siteCplh:0,ctiRate:0,topRate:0,ibDensityLP:0,obDensityLP:0,ibBBGoal:0,obBBGoal:0,_planId:planId,_sundayStr:sundayStr};
                     const checkDone=()=>{if(done>=9){saveLPValues(results);resolve(results);}};
                     fetchLPPageAuto(planId,'IB',sundayStr,'key','IB Total CPLH',(v)=>{results.ibCplh=v;done++;checkDone();});
                     fetchLPPageAuto(planId,'DA',sundayStr,'key','DA Bldg to Bldg Total - CPLH',(v)=>{results.obCplh=v;done++;checkDone();});
@@ -1021,23 +1451,13 @@ function attemptLPFetch(site,resolve,isRetry){
                 }catch(e){console.warn('[SB-LP] Parse error:',e);resolve(null);}
             },
             onerror:function(e){
-                if(!isRetry){
-                    console.log('[SB-LP] Auth failed, refreshing GalaxyBI session via iframe...');
-                    const iframe=document.createElement('iframe');
-                    iframe.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;';
-                    iframe.src='https://galaxybi.aka.corp.amazon.com/';
-                    document.body.appendChild(iframe);
-                    setTimeout(()=>{
-                        if(iframe.parentNode)iframe.parentNode.removeChild(iframe);
-                        console.log('[SB-LP] Retrying LP fetch after auth...');
-                        attemptLPFetch(site,resolve,true);
-                    },5000);
-                }else{
-                    console.warn('[SB-LP] Fetch error after retry:',e);
-                    resolve(null);
-                }
+                console.warn('[SB-LP] Reports network error:',e);
+                reauthAndRetry('reports network error');
             },
-            ontimeout:function(){resolve(null);}
+            ontimeout:function(){
+                console.warn('[SB-LP] Reports request timed out');
+                reauthAndRetry('reports timeout');
+            }
         });
 }
 
@@ -1134,12 +1554,13 @@ function fetchLPPageAutoRate(planId,pageName,sundayStr,targetLineItem,callback){
     });
 }
 
-function fetchBBGoalFromLP(planId,pageName,sundayStr,callback){
+function fetchBBGoalFromLP(planId,pageName,sundayStr,callback,dayName){
     const site=loadConfig().site;
     const url=`https://galaxybi.aka.corp.amazon.com/api/metadata/pageUrl?pageName=${pageName}&planId=${planId}&site=${site}`;
-    // Determine today's day name
+    // The BB goal is keyed by day-of-week. Default to today; caller can pass a specific day
+    // (e.g. yesterday) so the prior-day view shows that day's plan, not today's.
     const days=['SUNDAY','MONDAY','TUESDAY','WEDNESDAY','THURSDAY','FRIDAY','SATURDAY'];
-    const todayDay=days[new Date().getDay()];
+    const todayDay=dayName||days[new Date().getDay()];
     GM_xmlhttpRequest({method:'GET',url,headers:{'Accept':'*/*','Content-Type':'application/json'},
         onload:function(resp){
             try{
@@ -1235,6 +1656,14 @@ function renderLPPercents(metrics){
     const topDispEl=document.getElementById('lp-top-rate-display');if(topDispEl)topDispEl.textContent=topRate>0?topRate.toFixed(1):'\u2014';
     const ibDenDispEl=document.getElementById('lp-ib-density-display');if(ibDenDispEl)ibDenDispEl.textContent=ibDensityLP>0?ibDensityLP.toFixed(2):'\u2014';
     const obDenDispEl=document.getElementById('lp-ob-density-display');if(obDenDispEl)obDenDispEl.textContent=obDensityLP>0?obDensityLP.toFixed(2):'\u2014';
+    // Shift Plan Targets panel: mirror the LP targets as read-only rows alongside the shift-plan
+    // targets so the panel is a one-stop shop for both. Same LP values already fetched above.
+    const sptSet=(id,v,dec)=>{const el=document.getElementById(id);if(el)el.textContent=v>0?v.toFixed(dec):'\u2014';};
+    sptSet('spt-ib-lp-cplh',ibLpCplh,2);
+    sptSet('spt-ob-lp-cplh',obLpCplh,2);
+    sptSet('spt-ib-lp-density',ibDensityLP,2);
+    sptSet('spt-ob-lp-density',obDensityLP,2);
+    sptSet('spt-site-lp-cplh',siteLpCplh,2);
     // Conditional format IB Stow Rate cells based on LP CTI rate
     if(ctiRate>0){['ib-rate-p1','ib-rate-p2','ib-rate-p3','ib-rate-total'].forEach(id=>{const el=document.getElementById(id);if(!el)return;const v=parseFloat(el.textContent)||0;if(v<=0){el.style.background='';el.style.color='';return;}if(v>=ctiRate){el.style.background=cc.good;el.style.color=cc.txt;}else if(v>=ctiRate*0.95){el.style.background=cc.warn;el.style.color=cc.txt;}else{el.style.background=cc.bad;el.style.color=cc.txt;}});}
     // Conditional format IB CPLH cells based on LP CPLH
@@ -1791,7 +2220,7 @@ function updatePeriodDots(){
 // === HTML ===
 function buildHTML(){return `
 <nav class="topnav"><div class="topnav-left"><span class="logo"><svg width="28" height="28" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="46" fill="#333A44" stroke="#4a9eff" stroke-width="4"/><path d="M25 65 L25 40 L50 28 L75 40 L75 65 Z" fill="none" stroke="#E8EAED" stroke-width="3" stroke-linejoin="round"/><line x1="25" y1="65" x2="75" y2="65" stroke="#E8EAED" stroke-width="3"/><rect x="30" y="45" width="16" height="20" fill="none" stroke="#E8EAED" stroke-width="2"/><line x1="30" y1="50" x2="46" y2="50" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="55" x2="46" y2="55" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="60" x2="46" y2="60" stroke="#E8EAED" stroke-width="1.5"/><rect x="54" y="48" width="14" height="17" fill="none" stroke="#E8EAED" stroke-width="2"/><rect x="57" y="52" width="4" height="5" fill="#E8EAED"/><rect x="62" y="55" width="3" height="4" fill="#E8EAED"/></svg></span><h1 class="site-title">FC Sync Board<span style="display:block;font-size:10px;font-weight:400;color:#aaa;margin-top:-2px;">by snodgtyl</span></h1>
-<div class="nav-tabs"><button class="nav-tab active" data-tab="sync">Sync IB-OB</button><button class="nav-tab" data-tab="hourly">Hourly</button><button class="nav-tab" data-tab="eoswash">EOS Wash</button><button class="nav-tab" data-tab="vrets">VRETs</button><button class="nav-tab" data-tab="settings">Settings</button></div></div>
+<div class="nav-tabs"><button class="nav-tab active" data-tab="sync">Sync IB-OB</button><button class="nav-tab" data-tab="hourly">Hourly</button><button class="nav-tab" data-tab="eoswash">EOS Wash</button><button class="nav-tab" data-tab="faststart">Fast Start</button><button class="nav-tab" data-tab="vrets">VRETs</button><button class="nav-tab" data-tab="settings">Settings</button></div></div>
 <div class="topnav-right"><select id="site-select" class="select-input"></select><select id="shift-select" class="select-input"><option value="Days">Days</option><option value="Nights">Nights</option></select>
 <div class="period-indicator"><span class="period-dot" id="dot-p1">P1</span><span class="period-dot" id="dot-p2">P2</span><span class="period-dot" id="dot-p3">P3</span></div>
 <button id="btn-fetch" class="btn btn-primary">\u25B6 Get Data</button><button id="btn-snip" class="btn btn-snip">\uD83D\uDCF7 Snip</button><button id="btn-dark" class="btn" style="background:#333;color:#fff;border-color:#333;">\u263D</button><button id="btn-exit" class="btn btn-danger">\u2715 Exit</button><span id="last-update" class="meta-text">Ready</span></div></nav>
@@ -1893,6 +2322,16 @@ function buildHTML(){return `
 <div><span style="color:#333;font-size:10px;">WEEK DC%</span><br><strong id="icqa-dc-week-actual" style="font-size:16px;">\u2014</strong></div>
 <div><span style="color:#333;font-size:10px;">GOAL</span><br><strong id="icqa-dc-week-pct" style="font-size:16px;">70%</strong></div>
 </div>
+<div style="font-size:10px;font-weight:700;color:#555;margin:8px 0 2px;">Defects (ATLAS) <span style="font-weight:400;color:#888;font-size:9px;">shift-to-date DPMO \u00b7 lower is better</span></div>
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:12px;">
+<div><span style="color:#333;font-size:10px;">BIN COLLISION</span><br><strong id="atlas-binc-value" style="font-size:16px;">\u2014</strong></div>
+<div><span style="color:#333;font-size:10px;">THRESHOLD</span><br><strong id="atlas-binc-threshold" style="font-size:16px;">\u2014</strong></div>
+<div><span style="color:#333;font-size:10px;">BIN COLL COUNT</span><br><strong id="atlas-binc-count" style="font-size:16px;">\u2014</strong></div>
+<div><span style="color:#333;font-size:10px;">SHIP FAILED MOVES</span><br><strong id="atlas-shipfm-value" style="font-size:16px;">\u2014</strong></div>
+<div><span style="color:#333;font-size:10px;">THRESHOLD</span><br><strong id="atlas-shipfm-threshold" style="font-size:16px;">\u2014</strong></div>
+<div><span style="color:#333;font-size:10px;">SHIP FM COUNT</span><br><strong id="atlas-shipfm-count" style="font-size:16px;">\u2014</strong></div>
+</div>
+<div id="atlas-session-note" style="display:none;font-size:10px;color:#c62828;margin-top:4px;">\u26A0\uFE0F ATLAS DPMO session expired \u2014 <a href="https://atlas.qubit.amazon.dev/defect-dashboard" target="_blank" style="color:#1565c0;text-decoration:underline;font-weight:700;">open ATLAS</a> to sign in, then click Get Data.</div>
 <div style="text-align:right;font-size:9px;color:#888;margin-top:6px;" id="icqa-gca-updated">\u2014</div>
 </div>
 <div class="site-cplh-panel" id="site-cplh-panel" style="background:#fff;border:2px solid #000;border-radius:4px;padding:10px 14px;margin-top:6px;">
@@ -1949,14 +2388,19 @@ function buildHTML(){return `
 <div style="text-align:right;font-size:10px;color:#555;margin-top:2px;">24hr Density: <strong id="bb24-ob-density">\u2014</strong></div>
 </div>
 </div>
-<div class="targets-panel"><h3 class="panel-title" style="display:flex;justify-content:space-between;align-items:center;">Shift Plan Targets <button id="btn-clear-targets" class="btn btn-small btn-danger">Clear</button></h3>
+<div class="targets-panel"><h3 class="panel-title" style="display:flex;justify-content:space-between;align-items:center;">
+<span style="display:inline-flex;gap:0;"><button id="btn-view-targets" class="btn btn-small day-toggle active" style="border-radius:4px 0 0 4px;">Shift Plan Targets</button><button id="btn-view-current" class="btn btn-small day-toggle" style="border-radius:0;">Current Day</button><button id="btn-view-prior" class="btn btn-small day-toggle" style="border-radius:0 4px 4px 0;">Prior Day</button></span>
+<button id="btn-clear-targets" class="btn btn-small btn-danger">Clear</button></h3>
+<div id="spt-targets-view">
 <div class="target-groups-row">
 <div class="tg-compact"><h4>INBOUND</h4><table class="target-table"><thead><tr><th></th><th>Target</th><th>%</th></tr></thead><tbody>
 <tr><td>24 HR BB GOAL</td><td><span id="ib-bb-goal" style="font-weight:bold;">\u2014</span></td><td></td></tr>
 <tr><td>IB GOAL</td><td><input type="number" id="ib-goal-input" class="target-input"></td><td><span id="ib-goal-pct">\u2014</span></td></tr>
 <tr><td>STOW RATE</td><td><input type="number" id="ib-rate-target" class="target-input"></td><td><span id="ib-rate-pct">\u2014</span></td></tr>
 <tr><td>IB CPLH</td><td><input type="number" id="ib-cplh-target" class="target-input"></td><td><span id="ib-cplh-pct">\u2014</span></td></tr>
+<tr class="lp-row"><td>IB LP CPLH</td><td><span id="spt-ib-lp-cplh" class="lp-val">\u2014</span></td><td></td></tr>
 <tr><td>PLANNED DENSITY</td><td><input type="number" id="ib-density-target" class="target-input" step="0.01"></td><td><span id="ib-density-pct">\u2014</span></td></tr>
+<tr class="lp-row"><td>IB LP DENSITY</td><td><span id="spt-ib-lp-density" class="lp-val">\u2014</span></td><td></td></tr>
 <tr><td>SOS FAST START</td><td><input type="number" id="ib-fast-sos" class="target-input" value="13" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ib-fast-sos-pct">\u2014</span></td></tr>
 <tr><td>EOL FAST START</td><td><input type="number" id="ib-fast-eol" class="target-input" value="18" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ib-fast-eol-pct">\u2014</span></td></tr>
 </tbody></table></div>
@@ -1965,7 +2409,9 @@ function buildHTML(){return `
 <tr><td>DA GOAL</td><td><input type="number" id="ob-goal-input" class="target-input"></td><td><span id="ob-goal-pct">\u2014</span></td></tr>
 <tr><td>PICK RATE</td><td><input type="number" id="ob-rate-target" class="target-input"></td><td><span id="ob-rate-pct">\u2014</span></td></tr>
 <tr><td>DA CPLH</td><td><input type="number" id="ob-cplh-target" class="target-input"></td><td><span id="ob-cplh-pct">\u2014</span></td></tr>
+<tr class="lp-row"><td>DA LP CPLH</td><td><span id="spt-ob-lp-cplh" class="lp-val">\u2014</span></td><td></td></tr>
 <tr><td>PLANNED DENSITY</td><td><input type="number" id="ob-density-target" class="target-input" step="0.01"></td><td><span id="ob-density-pct">\u2014</span></td></tr>
+<tr class="lp-row"><td>DA LP DENSITY</td><td><span id="spt-ob-lp-density" class="lp-val">\u2014</span></td><td></td></tr>
 <tr><td>SOS FAST START</td><td><input type="number" id="ob-fast-sos" class="target-input" value="13" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ob-fast-sos-pct">\u2014</span></td></tr>
 <tr><td>EOL FAST START</td><td><input type="number" id="ob-fast-eol" class="target-input" value="18" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ob-fast-eol-pct">\u2014</span></td></tr>
 </tbody></table></div>
@@ -1976,8 +2422,58 @@ function buildHTML(){return `
 </tbody></table></div>
 <div class="sort-tgt" style="margin-top:6px;padding-top:6px;border-top:2px solid #000;"><h4 style="color:#333;">SITE</h4><table class="target-table"><tbody>
 <tr><td>SITE CPLH TARGET</td><td><input type="number" id="site-cplh-target" class="target-input" step="0.01"></td><td><span id="site-cplh-pct">\u2014</span></td></tr>
+<tr class="lp-row"><td>THROUGHPUT LP CPLH</td><td><span id="spt-site-lp-cplh" class="lp-val">\u2014</span></td><td></td></tr>
 </tbody></table></div>
+</div><!-- /spt-targets-view -->
+
+<div id="spt-current-view" style="display:none;">
+<div class="day-report-title">24hr Reporting \u2014 <span id="spt-current-date">Current Day</span></div>
+<table class="target-table day-table"><thead><tr><th></th><th>Plan</th><th>Actual</th><th>Variance</th></tr></thead><tbody>
+<tr><td>IB 24hr BB</td><td id="cd-ib-bb-plan">\u2014</td><td id="cd-ib-bb-act">\u2014</td><td id="cd-ib-bb-var">\u2014</td></tr>
+<tr><td>IB LP Density</td><td id="cd-ib-den-plan">\u2014</td><td id="cd-ib-den-act">\u2014</td><td id="cd-ib-den-var">\u2014</td></tr>
+<tr><td>IB LP CPLH</td><td id="cd-ib-cplh-plan">\u2014</td><td id="cd-ib-cplh-act">\u2014</td><td id="cd-ib-cplh-var">\u2014</td></tr>
+<tr class="day-gap"><td colspan="4"></td></tr>
+<tr><td>DA 24hr BB</td><td id="cd-da-bb-plan">\u2014</td><td id="cd-da-bb-act">\u2014</td><td id="cd-da-bb-var">\u2014</td></tr>
+<tr><td>DA LP Density</td><td id="cd-da-den-plan">\u2014</td><td id="cd-da-den-act">\u2014</td><td id="cd-da-den-var">\u2014</td></tr>
+<tr><td>DA LP CPLH</td><td id="cd-da-cplh-plan">\u2014</td><td id="cd-da-cplh-act">\u2014</td><td id="cd-da-cplh-var">\u2014</td></tr>
+<tr class="day-gap"><td colspan="4"></td></tr>
+<tr><td>Throughput LP CPLH</td><td id="cd-tp-cplh-plan">\u2014</td><td id="cd-tp-cplh-act">\u2014</td><td id="cd-tp-cplh-var">\u2014</td></tr>
+</tbody></table>
+<div id="spt-current-status" style="font-size:10px;color:#888;text-align:right;margin-top:6px;"></div>
 </div>
+
+<div id="spt-prior-view" style="display:none;">
+<div class="day-report-title">24hr Reporting \u2014 <span id="spt-prior-date">Prior Day</span></div>
+<table class="target-table day-table"><thead><tr><th></th><th>Plan</th><th>Actual</th><th>Variance</th></tr></thead><tbody>
+<tr><td>IB 24hr BB</td><td id="pd-ib-bb-plan">\u2014</td><td id="pd-ib-bb-act">\u2014</td><td id="pd-ib-bb-var">\u2014</td></tr>
+<tr><td>IB LP Density</td><td id="pd-ib-den-plan">\u2014</td><td id="pd-ib-den-act">\u2014</td><td id="pd-ib-den-var">\u2014</td></tr>
+<tr><td>IB LP CPLH</td><td id="pd-ib-cplh-plan">\u2014</td><td id="pd-ib-cplh-act">\u2014</td><td id="pd-ib-cplh-var">\u2014</td></tr>
+<tr class="day-gap"><td colspan="4"></td></tr>
+<tr><td>DA 24hr BB</td><td id="pd-da-bb-plan">\u2014</td><td id="pd-da-bb-act">\u2014</td><td id="pd-da-bb-var">\u2014</td></tr>
+<tr><td>DA LP Density</td><td id="pd-da-den-plan">\u2014</td><td id="pd-da-den-act">\u2014</td><td id="pd-da-den-var">\u2014</td></tr>
+<tr><td>DA LP CPLH</td><td id="pd-da-cplh-plan">\u2014</td><td id="pd-da-cplh-act">\u2014</td><td id="pd-da-cplh-var">\u2014</td></tr>
+<tr class="day-gap"><td colspan="4"></td></tr>
+<tr><td>Throughput LP CPLH</td><td id="pd-tp-cplh-plan">\u2014</td><td id="pd-tp-cplh-act">\u2014</td><td id="pd-tp-cplh-var">\u2014</td></tr>
+</tbody></table>
+<div id="spt-prior-status" style="font-size:10px;color:#888;text-align:right;margin-top:6px;"></div>
+</div>
+
+<!-- DEPT BACKLOG: shown only for the Current Day / Prior Day views (hidden for Shift Plan Targets) -->
+<div id="spt-dept-backlog" class="sort-tgt dept-tgt" style="display:none;margin-top:6px;padding-top:6px;border-top:2px solid #000;"><h4 style="color:#333;">DEPT BACKLOG</h4>
+<table class="target-table dept-table"><thead><tr><th></th><th>Units</th><th>Cases</th><th>Days (Units)</th><th>Days (Cases)</th><th>IPT Backlog</th></tr></thead><tbody>
+<tr><td>Inbound Backlog</td>
+<td><input type="text" id="dept-ib-units" class="dept-input"></td>
+<td><input type="text" id="dept-ib-cases" class="dept-input"></td>
+<td><input type="text" id="dept-ib-days-units" class="dept-input"></td>
+<td><input type="text" id="dept-ib-days-cases" class="dept-input"></td>
+<td><input type="text" id="dept-ib-ipt" class="dept-input"></td></tr>
+<tr><td>DA Backlog</td>
+<td><input type="text" id="dept-da-units" class="dept-input"></td>
+<td><input type="text" id="dept-da-cases" class="dept-input"></td>
+<td><input type="text" id="dept-da-days-units" class="dept-input"></td>
+<td><input type="text" id="dept-da-days-cases" class="dept-input"></td>
+<td><input type="text" id="dept-da-ipt" class="dept-input"></td></tr>
+</tbody></table></div>
 </div><!-- sync-right -->
 </div></main>
 
@@ -1997,6 +2493,20 @@ function buildHTML(){return `
 <main id="tab-eoswash" class="tab-content"><div class="eoswash-container">
 <div class="section-header"><h2>EOS Wash</h2><button id="btn-fetch-eoswash" class="btn btn-primary">\u25B6 Fetch EOS Wash</button><button id="btn-email-eoswash" class="btn" style="background:#1565c0;color:#fff;border-color:#1565c0;">\u2709 Email</button><span id="eoswash-status" class="meta-text"></span></div>
 <div id="eoswash-content"></div>
+</div></main>
+
+<main id="tab-faststart" class="tab-content"><div class="faststart-container">
+<div class="section-header"><h2>Fast Start Tracker</h2><span class="meta-text" style="font-size:11px;">Time-to-first-activity from clock-in (SDC)</span></div>
+<div class="fs-controls" style="display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;background:#fff;border:2px solid #000;border-radius:4px;padding:10px 14px;margin-bottom:10px;">
+<div><label style="display:block;font-size:11px;font-weight:700;margin-bottom:4px;">SITE</label><select id="fs-site" class="select-input"></select></div>
+<div><label style="display:block;font-size:11px;font-weight:700;margin-bottom:4px;">SHIFT START (DATE / TIME)</label><input type="datetime-local" id="fs-start-datetime" class="select-input" style="width:210px;"></div>
+<div><label style="display:block;font-size:11px;font-weight:700;margin-bottom:4px;">GOAL (MIN)</label><input type="number" id="fs-goal-time" class="target-input" value="20" min="1" max="60" style="width:80px;"></div>
+<div><label style="display:flex;align-items:center;gap:6px;font-size:12px;font-weight:600;cursor:pointer;margin-bottom:2px;"><input type="checkbox" id="fs-remove-nonfc" checked style="width:15px;height:15px;">Remove NonFC</label></div>
+<button id="btn-fetch-faststart" class="btn btn-primary">\u25B6 Run Fast Start</button>
+<span id="faststart-status" class="meta-text"></span>
+</div>
+<div id="fs-window-note" style="font-size:12px;color:#666;margin-bottom:10px;min-height:16px;"></div>
+<div id="faststart-content"></div>
 </div></main>
 
 <main id="tab-vrets" class="tab-content"><div class="vrets-container">
@@ -2086,6 +2596,37 @@ function buildCSS(){return `
 .target-table{width:100%;border-collapse:collapse;font-size:10px;}.target-table th{padding:2px 4px;font-size:9px;color:#333;text-align:center;border-bottom:2px solid #000;}.target-table th:first-child{text-align:left;}
 .target-table td{padding:2px 4px;border-bottom:1px solid #ccc;white-space:nowrap;}.target-table td:first-child{font-size:10px;color:#333;font-weight:600;}
 .target-input{width:68px;padding:3px 5px;background:#ffffcc;border:1px solid #000;color:#000;border-radius:3px;font-size:12px;text-align:right;font-weight:700;-moz-appearance:textfield;}
+/* LP rows in the Shift Plan Targets panel: read-only auto-filled LP targets, styled to read
+   as reference values (blue-grey, italic) distinct from the yellow editable target inputs. */
+.target-table tr.lp-row td{background:#eef3f8;}
+.target-table tr.lp-row td:first-child{color:#0F4C81;font-weight:600;font-style:italic;}
+.lp-val{display:inline-block;width:68px;padding:3px 5px;text-align:right;font-weight:700;color:#0F4C81;font-size:12px;}
+#sb-root.dark-mode .target-table tr.lp-row td{background:#123!important;}
+#sb-root.dark-mode .target-table tr.lp-row td:first-child,#sb-root.dark-mode .lp-val{color:#64b5f6!important;}
+/* Dept Backlog table: manual-entry inputs, one row per direction. Compact to fit the panel. */
+.dept-table th{font-size:8px;padding:2px 3px;text-align:center;}
+.dept-table td{padding:2px 3px;}
+.dept-input{width:52px;padding:3px 4px;background:#cfe8ff;border:1px solid #000;color:#000;border-radius:3px;font-size:11px;text-align:right;font-weight:600;}
+#sb-root.dark-mode .dept-input{background:#1e3a5f!important;color:#cfe8ff!important;border-color:#777!important;}
+/* View toggle (Shift Plan Targets / Current Day / Prior Day) in the panel title */
+.day-toggle{font-size:11px;padding:5px 10px;border:1px solid #888;background:#eee;color:#333;cursor:pointer;font-weight:700;}
+.day-toggle.active{background:#1565c0;color:#fff;border-color:#1565c0;}
+/* !important needed to beat the generic "dark-mode .btn{color:#000}" rule (these are also .btn). */
+#sb-root.dark-mode .day-toggle{background:#16213e!important;color:#fff!important;border-color:#555!important;}
+#sb-root.dark-mode .day-toggle.active{background:#1565c0!important;color:#fff!important;border-color:#1565c0!important;}
+/* 24hr Reporting day tables (Plan/Actual/Variance) — bigger text/cells than the target tables. */
+.day-report-title{text-align:center;font-weight:700;font-size:15px;margin:4px 0 10px;color:#000;}
+#sb-root.dark-mode .day-report-title{color:#fff!important;}
+/* Dark mode: force white for all Shift Plan Targets panel headings/labels incl. inline-styled ones */
+#sb-root.dark-mode .targets-panel h4,#sb-root.dark-mode .targets-panel .day-report-title,#sb-root.dark-mode .dept-tgt h4,#sb-root.dark-mode .sort-tgt h4{color:#fff!important;}
+#sb-root.dark-mode .day-table td:first-child,#sb-root.dark-mode .day-table th{color:#fff!important;}
+.day-table{font-size:14px;}
+.day-table th{font-size:13px;padding:6px 10px;}
+.day-table td{padding:8px 10px;font-size:14px;text-align:right;}
+.day-table td:first-child,.day-table th:first-child{text-align:left;font-weight:700;}
+.day-table td:not(:first-child),.day-table th:not(:first-child){text-align:right;}
+.day-table tr.day-gap td{border:none;height:8px;padding:0;}
+#sb-root.dark-mode .day-table td,#sb-root.dark-mode .day-table th{color:#e0e0e0!important;border-color:#444!important;}
 .target-input::-webkit-outer-spin-button,.target-input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
 .goal-summary-col{display:flex;flex-direction:column;gap:8px;}
 .goal-card{background:#fff;border:2px solid #000;border-radius:4px;padding:10px 14px;display:flex;flex-direction:column;gap:4px;}
@@ -2165,6 +2706,24 @@ function buildCSS2(){return `
 #sb-root.dark-mode .flow-table td{border-color:#333!important;}
 #sb-root.dark-mode .flow-table tbody tr:nth-child(even){background:#123055!important;}
 #sb-root.dark-mode .flow-table td:nth-child(2){background:#1a3a2e!important;}
+/* Fast Start Tracker */
+.faststart-container{padding:4px 0;}
+.faststart-section{background:#fff;border:2px solid #000;border-radius:4px;padding:12px 16px;margin-bottom:10px;border-left:4px solid #146EB4;}
+.faststart-section h3{font-size:13px;font-weight:700;margin-bottom:8px;}
+.fs-summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:14px;}
+.fs-card{background:#fff;border:2px solid #e0e0e0;border-radius:8px;padding:14px 16px;}
+.fs-card-title{font-weight:700;color:#232F3E;border-bottom:2px solid #146EB4;padding-bottom:6px;margin-bottom:10px;font-size:14px;}
+.fs-metric{display:flex;justify-content:space-between;align-items:baseline;font-size:13px;margin-bottom:5px;}
+.fs-metric-label{color:#666;font-size:11px;text-transform:uppercase;letter-spacing:.03em;}
+.fs-metric-val{font-size:20px;font-weight:700;}
+.fs-detail-table{width:100%;border-collapse:collapse;font-size:13px;}
+.fs-detail-table th{background:#f0f0f0;padding:7px 8px;text-align:left;border-bottom:1px solid #ccc;}
+.fs-detail-table td{padding:7px 8px;border-bottom:1px solid #eee;}
+#sb-root.dark-mode .faststart-section{background:#0f3460!important;border-color:#444!important;color:#e0e0e0!important;}
+#sb-root.dark-mode .faststart-section h3{color:#e0e0e0!important;}
+#sb-root.dark-mode .fs-card{background:#16213e!important;border-color:#444!important;color:#e0e0e0!important;}
+#sb-root.dark-mode .fs-detail-table th{background:#1a1a3a!important;color:#e0e0e0!important;}
+#sb-root.dark-mode .fs-detail-table td{color:#000;}
 /* EOS Wash */
 .eoswash-container{padding:4px 0;}
 .eoswash-section{background:#fff;border:2px solid #000;border-radius:4px;padding:12px 16px;margin-bottom:10px;}
@@ -2212,7 +2771,7 @@ function buildCSS2(){return `
 #sb-root.dark-mode{background:#1a1a2e!important;color:#e0e0e0!important;}
 #sb-root.dark-mode .topnav{background:#16213e!important;border-color:#333!important;}
 #sb-root.dark-mode .metrics-section,#sb-root.dark-mode .goal-card,#sb-root.dark-mode .site-cplh-panel,#sb-root.dark-mode .icqa-panel,#sb-root.dark-mode .targets-panel,#sb-root.dark-mode .chart-card,#sb-root.dark-mode .hourly-section,#sb-root.dark-mode #bb-24hr-panel,#sb-root.dark-mode #vret-panel{background:#0f3460!important;border-color:#444!important;color:#e0e0e0!important;}
-#sb-root.dark-mode .metrics-table th,#sb-root.dark-mode .metrics-table td,#sb-root.dark-mode .target-table td,#sb-root.dark-mode .actions-table th,#sb-root.dark-mode .actions-table td{color:#e0e0e0!important;border-color:#444!important;}
+#sb-root.dark-mode .metrics-table th,#sb-root.dark-mode .metrics-table td,#sb-root.dark-mode .target-table td,#sb-root.dark-mode .target-table th,#sb-root.dark-mode .day-table th,#sb-root.dark-mode .dept-table th,#sb-root.dark-mode .actions-table th,#sb-root.dark-mode .actions-table td{color:#e0e0e0!important;border-color:#444!important;}
 #sb-root.dark-mode .metrics-table td{border-bottom-color:#333!important;}
 #sb-root.dark-mode .section-header h2,#sb-root.dark-mode .bold,#sb-root.dark-mode h3,#sb-root.dark-mode h4,#sb-root.dark-mode .panel-title,#sb-root.dark-mode .site-title{color:#e0e0e0!important;}
 #sb-root.dark-mode .target-input,#sb-root.dark-mode .actions-table input,#sb-root.dark-mode .actions-table textarea,#sb-root.dark-mode .actions-table select,#sb-root.dark-mode .select-input{background:#1a1a2e!important;color:#e0e0e0!important;border-color:#555!important;}
@@ -2479,7 +3038,7 @@ function renderHourlyTables(hourlyData,totalHours){
         const seed=obRec?obRec.cages:0;
         // Walk cages on dock (picked adds, loaded clears).
         if(density>0)walkCages(hourlyData.map(h=>h.ob),'pickUnits','loadedUnits',seed,density,'cages');
-        const cols=['Hour','Cartons Pick','Loaded Cartons','Difference','Cages on Dock','Cartons Pick HC','Cartons Pick Rate','Loaded Cartons HC','Wall Builder HC','Loaded Cartons Rate','Flow Balance','Flow Deviation','Status'];
+        const cols=['Hour','Cartons Pick','Loaded Cartons','Difference','Cages on Dock','Cartons Pick HC','Cartons Pick Rate','Loaded Cartons HC','Loaded Cartons Rate','Flow Balance','Flow Deviation','Status'];
         const head='<tr>'+cols.map(c=>`<th>${c}</th>`).join('')+'</tr>';
         const rows=hourlyData.map(h=>{
             const o=h.ob;
@@ -2505,7 +3064,6 @@ function renderHourlyTables(hourlyData,totalHours){
                 <td>${o.pickHC>0?fv(o.pickHC,2):'\u2014'}</td>
                 <td>${o.pickRate>0?fv(o.pickRate,1):'\u2014'}</td>
                 <td>${o.loadedHC>0?fv(o.loadedHC,2):'\u2014'}</td>
-                <td>${o.wallBuilderHC>0?fv(o.wallBuilderHC,2):'\u2014'}</td>
                 <td>${o.loadedRate>0?fv(o.loadedRate,1):'\u2014'}</td>
                 <td style="color:${balColor}!important;font-weight:700;">${balance>0?balance.toFixed(1)+'%':'\u2014'}</td>
                 <td style="color:${balColor}!important;font-weight:600;">${balance>0?deviation.toFixed(1)+'%':'\u2014'}</td>
@@ -3310,7 +3868,7 @@ function clearBoard(){
     // Clear site CPLH
     ['site-cplh-value','site-throughput-vol','site-throughput-hrs'].forEach(id=>{const el=document.getElementById(id);if(el){el.textContent='\u2014';el.style.color='';}});
     // Clear ICQA (both are site-dependent; re-fetched on next Get Data / interval tick)
-    ['icqa-ro-shift-actual','icqa-ro-shift-pct','icqa-ro-week-actual','icqa-ro-week-pct'].forEach(id=>{const el=document.getElementById(id);if(el){el.textContent='\u2014';el.classList.remove('pct-good','pct-warn','pct-bad');}});
+    ['icqa-ro-shift-actual','icqa-ro-shift-pct','icqa-ro-week-actual','icqa-ro-week-pct','atlas-binc-value','atlas-binc-threshold','atlas-binc-count','atlas-shipfm-value','atlas-shipfm-threshold','atlas-shipfm-count'].forEach(id=>{const el=document.getElementById(id);if(el){el.textContent='\u2014';el.style.color='';el.classList.remove('pct-good','pct-warn','pct-bad');}});
     setEl('icqa-gca-value','\u2014');
     const gcaBanner=document.getElementById('icqa-gca-banner');if(gcaBanner)gcaBanner.style.background='#757575';
     // Clear TOT
@@ -3336,13 +3894,16 @@ function initBoard(){
     document.getElementById('shift-select').value=config.shiftType;
     // Load targets
     const t=config.targets||{};
-    ['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','site-cplh-target'].forEach(id=>{const el=document.getElementById(id);if(el&&t[id])el.value=t[id];});
+    ['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','site-cplh-target','dept-ib-units','dept-ib-cases','dept-ib-days-units','dept-ib-days-cases','dept-ib-ipt','dept-da-units','dept-da-cases','dept-da-days-units','dept-da-days-cases','dept-da-ipt'].forEach(id=>{const el=document.getElementById(id);if(el&&t[id])el.value=t[id];});
     // Load settings
     const ds=config.days,ns=config.nights;
     ['ds-full-sh','ds-full-sm','ds-full-eh','ds-full-em','ds-p1-sh','ds-p1-sm','ds-p1-eh','ds-p1-em','ds-p2-sh','ds-p2-sm','ds-p2-eh','ds-p2-em','ds-p3-sh','ds-p3-sm','ds-p3-eh','ds-p3-em'].forEach((id,i)=>{const vals=[ds.full.sh,ds.full.sm,ds.full.eh,ds.full.em,ds.p1.sh,ds.p1.sm,ds.p1.eh,ds.p1.em,ds.p2.sh,ds.p2.sm,ds.p2.eh,ds.p2.em,ds.p3.sh,ds.p3.sm,ds.p3.eh,ds.p3.em];const el=document.getElementById(id);if(el)el.value=vals[i];});
     ['ns-full-sh','ns-full-sm','ns-full-eh','ns-full-em','ns-p1-sh','ns-p1-sm','ns-p1-eh','ns-p1-em','ns-p2-sh','ns-p2-sm','ns-p2-eh','ns-p2-em','ns-p3-sh','ns-p3-sm','ns-p3-eh','ns-p3-em'].forEach((id,i)=>{const vals=[ns.full.sh,ns.full.sm,ns.full.eh,ns.full.em,ns.p1.sh,ns.p1.sm,ns.p1.eh,ns.p1.em,ns.p2.sh,ns.p2.sm,ns.p2.eh,ns.p2.em,ns.p3.sh,ns.p3.sm,ns.p3.eh,ns.p3.em];const el=document.getElementById(id);if(el)el.value=vals[i];});
     document.getElementById('settings-sched-type').value=config.schedType||'3P';
     updateTargetRows();
+    // Seed the Shift Plan Targets panel's LP rows from cached LP values so they show on load
+    // (before a fresh Get Data). renderLPPercents refreshes them once metrics come in.
+    seedShiftPlanLPRows();
     // Events
     document.getElementById('btn-fetch').onclick=doFetch;
     document.getElementById('btn-exit').onclick=exitBoard;
@@ -3358,6 +3919,7 @@ function initBoard(){
     if(localStorage.getItem('syncboard_dark')==='1'){document.getElementById('sb-root').classList.add('dark-mode');document.getElementById('btn-dark').textContent='\u2600';}
     document.getElementById('btn-fetch-hourly')?.addEventListener('click',fetchHourlyData);
     document.getElementById('btn-fetch-eoswash')?.addEventListener('click',fetchEOSWashData);
+    document.getElementById('btn-fetch-faststart')?.addEventListener('click',fetchFastStartData);
     document.getElementById('btn-email-eoswash')?.addEventListener('click',emailEOSWash);
     document.getElementById('btn-fetch-vrets')?.addEventListener('click',fetchVRETsData);
     // Populate the VRETs week selector and default goal input on init.
@@ -3368,8 +3930,11 @@ function initBoard(){
     initSosControls();
     document.getElementById('btn-save-sos-ib')?.addEventListener('click',()=>saveSosFromUi('IB'));
     document.getElementById('btn-save-sos-ob')?.addEventListener('click',()=>saveSosFromUi('OB'));
+    document.getElementById('btn-view-targets')?.addEventListener('click',()=>setDayView('targets'));
+    document.getElementById('btn-view-current')?.addEventListener('click',()=>setDayView('current'));
+    document.getElementById('btn-view-prior')?.addEventListener('click',()=>setDayView('prior'));
     document.getElementById('btn-clear-targets')?.addEventListener('click',()=>{
-        ['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-density-target','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-density-target','sort-goal','sort-rate-target'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
+        ['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-density-target','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-density-target','sort-goal','sort-rate-target','dept-ib-units','dept-ib-cases','dept-ib-days-units','dept-ib-days-cases','dept-ib-ipt','dept-da-units','dept-da-cases','dept-da-days-units','dept-da-days-cases','dept-da-ipt'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
         saveTargetsUI();updateTargetRows();
         // Clear the % column displays
         ['ib-goal-pct','ib-rate-pct','ib-cplh-pct','ib-density-pct','ob-goal-pct','ob-rate-pct','ob-cplh-pct','ob-density-pct','sort-goal-pct','sort-rate-pct'].forEach(id=>{const el=document.getElementById(id);if(el){el.textContent='\u2014';el.classList.remove('pct-good','pct-warn','pct-bad');}});
@@ -3389,6 +3954,8 @@ function initBoard(){
     sel.onchange=e=>{config.site=e.target.value;if(SITE_SCHEDULES[config.site]){config.days=SITE_SCHEDULES[config.site].days;config.nights=SITE_SCHEDULES[config.site].nights;}saveConfig(config);refreshSettingsInputs();currentMetrics=null;clearBoard();updatePeriodDots();};
     document.getElementById('shift-select').onchange=e=>{config.shiftType=e.target.value;saveConfig(config);currentMetrics=null;clearBoard();updatePeriodDots();doFetch();};
     document.querySelectorAll('.target-input').forEach(inp=>{inp.addEventListener('input',updateTargetRows);inp.addEventListener('change',()=>{saveTargetsUI();if(currentMetrics)renderTargets(currentMetrics);});});
+    // Dept Backlog inputs are manual-only; just persist them on change (no metric re-render).
+    document.querySelectorAll('.dept-input').forEach(inp=>inp.addEventListener('change',saveTargetsUI));
     document.querySelectorAll('.nav-tab').forEach(tab=>tab.onclick=()=>{
         document.querySelectorAll('.nav-tab').forEach(t=>t.classList.remove('active'));
         // Clear any leftover inline display (an older build set style.display inline, which
@@ -3408,6 +3975,11 @@ function initBoard(){
         if(tab.dataset.tab==='eoswash'){
             const et=document.getElementById('eoswash-content');
             if(et&&et.innerHTML.trim()===''){fetchEOSWashData();}
+        }
+        // Prime the Fast Start tab controls the first time it's opened (no auto-fetch:
+        // Fast Start is a heavy, on-demand query, so the user clicks Run themselves).
+        if(tab.dataset.tab==='faststart'){
+            initFastStartControls();
         }
         // Auto-load the VRETs tab the first time it's opened.
         if(tab.dataset.tab==='vrets'){
@@ -3532,6 +4104,12 @@ function reauthFclmAndRetry(){
 
 async function doFetch(isRetry){
     config=loadConfig();config.site=document.getElementById('site-select').value;config.shiftType=document.getElementById('shift-select').value;saveConfig(config);
+    // Invalidate the day caches so they re-fetch for the (possibly new) site/day. Note which day
+    // view is currently showing so we can refresh it after this fetch.
+    const curDayVisible=document.getElementById('spt-current-view')?.style.display!=='none';
+    const priDayVisible=document.getElementById('spt-prior-view')?.style.display!=='none';
+    dayData[0]=null;dayData[1]=null;
+    priorBBGoals.ib=0;priorBBGoals.ob=0;   // yesterday's BB goals re-fetch on next Prior Day render
     const btn=document.getElementById('btn-fetch');btn.disabled=true;btn.textContent=isRetry?'\u23F3 Retrying...':'\u23F3 Fetching...';
     try{
         const raw=await fetchAllData(config);
@@ -3604,6 +4182,8 @@ async function doFetch(isRetry){
         fetchIcqaGCA(config);
         fetchIcqaRO(config,raw);
         fetchIcqaDC(config);
+        fetchIcqaAtlas(config);
+        fetchOsCounts(config);
         // Render TOT (Time Off Task) from separate PPR fetch (30min before SOS to 15min after EOS)
         const totHrs=raw.totPpr?.totHrs||0;
         if(totHrs>0){const hrs=Math.floor(totHrs);const mins=Math.round((totHrs-hrs)*60);setEl('tot-value',hrs+'h '+mins+'m');}else{setEl('tot-value','\u2014');}
@@ -3650,11 +4230,19 @@ async function doFetch(isRetry){
                     const banner=document.getElementById('sb-reminder-banner')||document.createElement('div');
                     banner.id='sb-reminder-banner';
                     banner.style.cssText='position:fixed;top:0;left:0;right:0;z-index:999999;padding:10px 20px;display:flex;align-items:center;justify-content:space-between;font:bold 13px sans-serif;box-shadow:0 2px 8px rgba(0,0,0,0.3);background:#e65100;color:#fff;';
-                    banner.innerHTML='<span>\u26A0\uFE0F LP data unavailable — please visit <a href="https://galaxybi.aka.corp.amazon.com" target="_blank" style="color:#fff;text-decoration:underline;">GalaxyBI</a> once to authenticate, then refresh and try again.</span><button onclick="this.parentElement.style.display=\'none\'" style="background:rgba(255,255,255,0.2);border:none;color:#fff;padding:4px 10px;border-radius:4px;cursor:pointer;font-weight:bold;">Dismiss</button>';
+                    banner.innerHTML='<span>\u26A0\uFE0F LP data unavailable — auto re-auth didn\'t work. Open <a href="https://galaxybi.aka.corp.amazon.com" target="_blank" style="color:#fff;text-decoration:underline;">GalaxyBI</a> in a tab, sign in (Midway), then click Get Data again.</span><button onclick="this.parentElement.style.display=\'none\'" style="background:rgba(255,255,255,0.2);border:none;color:#fff;padding:4px 10px;border-radius:4px;cursor:pointer;font-weight:bold;">Dismiss</button>';
                     document.body.appendChild(banner);
                 }
             }
             renderLPPercents(currentMetrics);
+            // LP values just refreshed (and were saved). Re-seed the Shift Plan Targets panel's LP
+            // rows and re-render whichever day view is open so their Plan column reflects the new plan.
+            seedShiftPlanLPRows();
+            priorBBGoals.ib=0;priorBBGoals.ob=0;   // prior-day BB goals were plan-specific; refetch
+            const curVis=document.getElementById('spt-current-view')?.style.display!=='none';
+            const priVis=document.getElementById('spt-prior-view')?.style.display!=='none';
+            if(curVis&&dayData[0])renderDayView(0,dayData[0]);
+            if(priVis&&dayData[1])renderDayView(1,dayData[1]);
         });
         // Retry charts if Chart.js wasn't ready yet
         if(typeof Chart==='undefined'){setTimeout(()=>{if(typeof Chart!=='undefined'&&currentMetrics)renderCharts(currentMetrics);},2000);}
@@ -3662,12 +4250,15 @@ async function doFetch(isRetry){
         // panel on the Sync tab fills in without the user having to open the VRETs tab first.
         // fetchVRETsData updates both the tab and the panel when it resolves.
         fetchVRETsData();
+        // If a day view is open, re-fetch it now (LP plan values just refreshed too).
+        if(curDayVisible&&!dayLoading[0])ensureDay(0);
+        if(priDayVisible&&!dayLoading[1])ensureDay(1);
     }catch(err){console.error(err);setStatus('\u26A0\uFE0F '+err.message);alert('Fetch failed: '+err.message+'\n\nMake sure you are on Amazon network and authenticated to Midway.');}
     finally{btn.disabled=false;btn.textContent='\u25B6 Get Data';}
 }
 
 function saveTargetsUI(){
-    const t={};['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','site-cplh-target'].forEach(id=>{t[id]=document.getElementById(id)?.value||'';});
+    const t={};['ib-bb-goal','ib-goal-input','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','site-cplh-target','dept-ib-units','dept-ib-cases','dept-ib-days-units','dept-ib-days-cases','dept-ib-ipt','dept-da-units','dept-da-cases','dept-da-days-units','dept-da-days-cases','dept-da-ipt'].forEach(id=>{t[id]=document.getElementById(id)?.value||'';});
     config.targets=t;saveConfig(config);
     // Save LP values separately
     const lp={ibCplh:document.getElementById('lp-ib-cplh')?.value||'',obCplh:document.getElementById('lp-ob-cplh')?.value||'',siteCplh:document.getElementById('lp-site-cplh')?.value||''};
@@ -3744,6 +4335,284 @@ function showReminderBanner(title,body,severity){
     banner.innerHTML=`<span>${title} \u2014 ${body}</span><button onclick="this.parentElement.style.display='none'" style="background:rgba(255,255,255,0.2);border:none;color:#fff;padding:4px 10px;border-radius:4px;cursor:pointer;font-weight:bold;">Dismiss</button>`;
     banner.style.display='flex';
     setTimeout(()=>{if(banner)banner.style.display='none';},60000);
+}
+
+// ============================ FAST START TRACKER (SDC) ============================
+// Ported from the "Fast Start Tracker (DC Sites)" userscript by dalwalla, trimmed to the
+// SDC single-site flow this board's sites use. Measures each associate's time-to-first-
+// activity from clock-in, per process (CaseStow / PalletTransIn / Pick), and reports TP90,
+// Average, count, Over-Goal and Minutes-Lost. Runs same-origin on FCLM via credentialed
+// fetch (no GM_xmlhttpRequest needed) and persists inputs in localStorage.
+const FS_GOAL_KEY='syncboard_fs_goal';
+const FS_DT_KEY='syncboard_fs_datetime';
+const FS_NONFC_KEY='syncboard_fs_nonfc';
+// Window shape: search opens FS_LOOKBACK_MIN before shift start and runs FS_FORWARD_MIN after.
+// Per-associate cap: minutes-to-first over FS_CAP_MIN means the AA isn't part of fast start.
+const FS_LOOKBACK_MIN=40, FS_FORWARD_MIN=60, FS_CAP_MIN=60;
+// SDC process IDs and the job-action -> process map (same as the source's SDC config).
+const FS_PROCESSES={CaseStow:'1003035',PalletTransIn:'1003041',Pick:'1003065',NonFCControllable:'1003047'};
+const FS_ACTION_MAP={CaseStowed:'CaseStow',PalletTransferred:'PalletTransIn',ItemPicked:'Pick'};
+// Tie-break when two processes share the identical first-scan timestamp.
+const FS_TIE_BREAK=['CaseStow','Pick'];
+let fsLastResults=[];   // kept so a target/goal change can re-render without re-fetching
+
+function fsShowStatus(msg,type){
+    const el=document.getElementById('faststart-status');
+    if(!el){console.log('[SB-FastStart] '+msg);return;}
+    el.textContent=msg;
+    el.style.color=type==='error'?'#c62828':type==='success'?'#2e7d32':'#666';
+}
+function fsIsAnonymous(name,empId){
+    const n=String(name||'').toLowerCase();
+    const e=String(empId||'').trim();
+    return n.includes('anonymous')||e===''||e.replace(/0/g,'')==='';
+}
+// Build an FCLM CSV report URL (same-origin). params is a flat object.
+function fsBuildURL(base,params){
+    const q=Object.entries(params).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');
+    return base+'?'+q;
+}
+// Fetch a CSV report same-origin (credentialed). Throws on HTTP error or an HTML login
+// redirect (expired FCLM session), so the caller can surface a clear message.
+async function fsFetchCSV(url){
+    const r=await fetch(url,{credentials:'include'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const body=await r.text();
+    if(/^\s*<(!doctype|html)/i.test(body))throw new Error('Session expired \u2014 reload FCLM (F5)');
+    return fsParseCSV(body);
+}
+// Minimal CSV parser (handles quoted fields with embedded commas).
+function fsParseCSV(text){
+    const lines=text.trim().split('\n');
+    if(!lines.length)return [];
+    const parseLine=(line)=>{
+        const out=[];let cur='',inQ=false;
+        for(let i=0;i<line.length;i++){const c=line[i];
+            if(c==='"')inQ=!inQ;
+            else if(c===','&&!inQ){out.push(cur.trim());cur='';}
+            else cur+=c;}
+        out.push(cur.trim());return out;
+    };
+    const headers=parseLine(lines[0]);
+    const rows=[];
+    for(let i=1;i<lines.length;i++){
+        if(!lines[i].trim())continue;
+        const vals=parseLine(lines[i]);const row={};
+        headers.forEach((h,idx)=>{row[h]=vals[idx]||'';});
+        rows.push(row);
+    }
+    return rows;
+}
+function fsFetchAttendance(site,startDate,endDate){
+    const url=fsBuildURL('https://fclm-portal.amazon.com/reports/employeeAttendance',{
+        reportFormat:'CSV',warehouseId:site,startDateDay:fmtDate(startDate),maxIntradayDays:'30',spanType:'Intraday',
+        startDateIntraday:fmtDate(startDate),startHourIntraday:startDate.getHours(),startMinuteIntraday:startDate.getMinutes(),
+        endDateIntraday:fmtDate(endDate),endHourIntraday:endDate.getHours(),endMinuteIntraday:endDate.getMinutes()});
+    return fsFetchCSV(url);
+}
+function fsFetchProcess(site,processId,startDate,endDate,processName){
+    const url=fsBuildURL('https://fclm-portal.amazon.com/reports/functionRollup',{
+        reportFormat:'CSV',warehouseId:site,processId,maxIntradayDays:'1',spanType:'Intraday',
+        startDateIntraday:fmtDate(startDate),startHourIntraday:startDate.getHours(),startMinuteIntraday:startDate.getMinutes(),
+        endDateIntraday:fmtDate(endDate),endHourIntraday:endDate.getHours(),endMinuteIntraday:endDate.getMinutes()});
+    return fsFetchCSV(url).then(data=>({processName,data}));
+}
+function fsFetchActivity(site,employeeId,startDate,endDate){
+    const url=fsBuildURL('https://fclm-portal.amazon.com/employee/activityDetails',{
+        reportFormat:'CSV',employeeId,warehouseId:site,startDateDay:fmtDate(startDate),maxIntradayDays:'1',spanType:'Intraday',
+        startDateIntraday:fmtDate(startDate),startHourIntraday:startDate.getHours(),startMinuteIntraday:startDate.getMinutes(),
+        endDateIntraday:fmtDate(endDate),endHourIntraday:endDate.getHours(),endMinuteIntraday:endDate.getMinutes()});
+    return fsFetchCSV(url);
+}
+// Earliest qualifying scan per process, as { process: {time} }.
+function fsFirstActivityByProcess(activityData){
+    const earliest={};
+    activityData.forEach(row=>{
+        const action=row['Job Action']||row['Action']||row['action'];
+        const time=row['Event Date/Time']||row['Action Time']||row['ActionTime']||row['Time'];
+        if(FS_ACTION_MAP[action]&&time){
+            const p=FS_ACTION_MAP[action];
+            if(!earliest[p]||new Date(time)<new Date(earliest[p].time))earliest[p]={time,process:p};
+        }
+    });
+    return earliest;
+}
+// TP90 / Avg / Over-Goal / Minutes-Lost from a list of minutes-to-first values.
+function fsComputeMetrics(times,goal){
+    const n=times.length;
+    if(!n)return{count:0,avg:null,tp90:null,overGoal:0,minutesLost:0};
+    const avg=times.reduce((a,b)=>a+b,0)/n;
+    const overGoal=times.filter(t=>t>goal).length;
+    const sorted=[...times].sort((a,b)=>a-b);
+    const pos=(sorted.length-1)*0.9,lo=Math.floor(pos),hi=Math.ceil(pos),fr=pos-lo;
+    const tp90=sorted[lo]+(sorted[hi]-sorted[lo])*fr;
+    const minutesLost=times.filter(t=>t>goal).reduce((s,t)=>s+(t-goal),0);
+    return{count:n,avg,tp90,overGoal,minutesLost};
+}
+// Resolve all associates: roster -> punch-in -> first activity -> minutes-to-first row.
+async function fsProcessEmployees(attendance,processDataArray,site,startDate,endDate,attStartDate,removeNonFC){
+    const employees=new Map();
+    const nonFC=new Set();
+    if(removeNonFC){
+        const nf=processDataArray.find(p=>p.processName==='NonFCControllable');
+        if(nf)nf.data.forEach(row=>{
+            const id=row['Employee Id']||row['Employee ID']||row['EmployeeID'];
+            const nm=row['Name']||row['Employee Name']||'';
+            if(id&&!fsIsAnonymous(nm,id))nonFC.add(id.trim());
+        });
+    }
+    processDataArray.forEach(({processName,data})=>{
+        if(processName==='NonFCControllable')return;
+        data.forEach(row=>{
+            const id=row['Employee Id']||row['Employee ID']||row['EmployeeID'];
+            const nm=row['Name']||row['Employee Name']||row['EmployeeName'];
+            if(!id||!nm||fsIsAnonymous(nm,id))return;
+            const key=id.trim();
+            if(!employees.has(key))employees.set(key,{employeeId:key,name:nm.trim(),punchIn:null,nonFC:nonFC.has(key)});
+        });
+    });
+    // First "In" punch per associate, matched on Employee Id.
+    attendance.forEach(row=>{
+        const id=row['Employee Id']||row['Employee ID']||row['EmployeeID'];
+        const nm=row['Employee Name']||row['EmployeeName']||row['Employee']||row['Name'];
+        const type=row['Punch Type']||row['PunchType']||row['Type'];
+        const time=row['Punch Time']||row['PunchTime']||row['Time'];
+        if(type!=='In'||!time||fsIsAnonymous(nm,id))return;
+        const key=id?String(id).trim():'';
+        const emp=key&&employees.get(key);
+        if(!emp||emp.punchIn)return;
+        emp.punchIn=time;
+    });
+    const rows=[];
+    let processed=0,total=employees.size;
+    for(const [empId,emp] of employees){
+        if(emp.nonFC||!emp.punchIn){processed++;continue;}
+        let activity;
+        try{activity=await fsFetchActivity(site,empId,attStartDate,endDate);}
+        catch(e){processed++;continue;}
+        const byProcess=fsFirstActivityByProcess(activity);
+        let winner=null;
+        Object.keys(byProcess).forEach(p=>{
+            const rank=FS_TIE_BREAK.indexOf(p)===-1?FS_TIE_BREAK.length:FS_TIE_BREAK.indexOf(p);
+            const t=new Date(byProcess[p].time).getTime();
+            if(winner===null||t<winner.t||(t===winner.t&&rank<winner.rank))winner={process:p,t,rank,time:byProcess[p].time};
+        });
+        if(winner){
+            const clean=(s)=>s.replace(/\s+(EST|EDT|PST|PDT|CST|CDT|MST|MDT)$/i,'');
+            const punch=new Date(clean(emp.punchIn));
+            const act=new Date(clean(winner.time));
+            const minutesToFirst=Math.round((act-punch)/60000);
+            rows.push({employeeId:empId,name:emp.name,punchIn:emp.punchIn,firstActivity:winner.time,process:winner.process,minutesToFirst});
+        }
+        processed++;
+        if(processed%10===0||processed===total)fsShowStatus('Processing associates '+processed+'/'+total+'\u2026','info');
+        await new Promise(r=>setTimeout(r,40));
+    }
+    // Keep 0..CAP minute band only; 0 (scan same minute as punch) is the fastest valid start.
+    return rows.filter(r=>r.minutesToFirst!==null&&r.minutesToFirst>=0&&r.minutesToFirst<=FS_CAP_MIN)
+               .sort((a,b)=>(b.minutesToFirst||0)-(a.minutesToFirst||0));
+}
+async function fetchFastStartData(){
+    const site=document.getElementById('fs-site').value;
+    const dt=document.getElementById('fs-start-datetime').value;
+    const goal=parseInt(document.getElementById('fs-goal-time').value,10)||20;
+    const removeNonFC=document.getElementById('fs-remove-nonfc').checked;
+    const btn=document.getElementById('btn-fetch-faststart');
+    const content=document.getElementById('faststart-content');
+    if(!site){fsShowStatus('Select a site','error');return;}
+    if(!dt){fsShowStatus('Enter a shift start date/time','error');return;}
+    // Persist inputs
+    try{localStorage.setItem(FS_GOAL_KEY,String(goal));localStorage.setItem(FS_DT_KEY,dt);localStorage.setItem(FS_NONFC_KEY,removeNonFC?'1':'0');}catch(e){}
+    const startDate=new Date(dt);
+    const endDate=new Date(startDate.getTime()+FS_FORWARD_MIN*60*1000);
+    const attStartDate=new Date(startDate.getTime()-FS_LOOKBACK_MIN*60*1000);
+    const hhmm=(d)=>String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
+    const note=document.getElementById('fs-window-note');
+    if(note)note.innerHTML='<b>'+site+'</b> \u00b7 shift start <b>'+hhmm(startDate)+'</b> \u00b7 searching <b>'+hhmm(attStartDate)+' \u2013 '+hhmm(endDate)+'</b> ('+FS_LOOKBACK_MIN+' min before \u2192 '+FS_FORWARD_MIN+' min after) \u00b7 goal '+goal+' min';
+    if(btn){btn.disabled=true;btn.textContent='\u23F3 Running...';}
+    if(content)content.innerHTML='<div style="padding:20px;font-size:14px;">\u23F3 Querying Fast Start data\u2026 this can take a minute.</div>';
+    fsShowStatus('Querying data\u2026','info');
+    try{
+        const uniqueProcesses={};
+        Object.entries(FS_PROCESSES).forEach(([name,id])=>{if(!uniqueProcesses[id])uniqueProcesses[id]=name;});
+        const [attendance,...processData]=await Promise.all([
+            fsFetchAttendance(site,attStartDate,endDate),
+            ...Object.entries(uniqueProcesses).map(([id,name])=>fsFetchProcess(site,id,attStartDate,endDate,name))
+        ]);
+        const results=await fsProcessEmployees(attendance,processData,site,startDate,endDate,attStartDate,removeNonFC);
+        fsLastResults=results;
+        renderFastStart(results,goal);
+        fsShowStatus('\u2713 Complete \u2014 '+results.length+' associates \u00b7 '+new Date().toLocaleTimeString(),'success');
+    }catch(err){
+        console.error('[SB-FastStart] error:',err);
+        if(content)content.innerHTML='<div style="padding:20px;font-size:14px;color:#c62828;">\u26A0 Fast Start failed: '+(err&&err.message?err.message:err)+'</div>';
+        fsShowStatus('\u26A0 '+(err&&err.message?err.message:err),'error');
+    }finally{if(btn){btn.disabled=false;btn.textContent='\u25B6 Run Fast Start';}}
+}
+function renderFastStart(results,goal){
+    const content=document.getElementById('faststart-content');
+    if(!content)return;
+    if(!results.length){content.innerHTML='<div style="padding:14px;background:#fff3e0;border-radius:6px;">No qualifying activity returned for this window.</div>';return;}
+    const byProcess={};
+    results.forEach(r=>{(byProcess[r.process]=byProcess[r.process]||[]).push(r);});
+    const order=['Pick','CaseStow','PalletTransIn'];
+    const procs=order.filter(p=>byProcess[p]).concat(Object.keys(byProcess).filter(p=>!order.includes(p)));
+    const tp90Color=(v)=>v===null?'#999':(v>goal?'#c62828':'#2e7d32');
+    // Summary cards
+    let cards='<div class="fs-summary-grid">';
+    procs.forEach(p=>{
+        const m=fsComputeMetrics(byProcess[p].map(r=>r.minutesToFirst),goal);
+        cards+='<div class="fs-card"><div class="fs-card-title">'+p+'</div>'+
+            '<div class="fs-metric"><span class="fs-metric-label">TP90</span><span class="fs-metric-val" style="color:'+tp90Color(m.tp90)+';">'+(m.tp90==null?'\u2014':m.tp90.toFixed(1))+' min</span></div>'+
+            '<div class="fs-metric"><span class="fs-metric-label">Average</span><span>'+(m.avg==null?'\u2014':m.avg.toFixed(1))+' min</span></div>'+
+            '<div class="fs-metric"><span class="fs-metric-label">Total AAs</span><span>'+m.count+'</span></div>'+
+            '<div class="fs-metric"><span class="fs-metric-label">Over Goal</span><span style="color:'+(m.overGoal>0?'#c62828':'#2e7d32')+';">'+m.overGoal+'</span></div>'+
+            '<div class="fs-metric"><span class="fs-metric-label">Min Lost</span><span style="color:#c62828;">'+m.minutesLost.toFixed(1)+'</span></div>'+
+            '</div>';
+    });
+    cards+='</div>';
+    // Per-process detail tables
+    let tables='';
+    procs.forEach(p=>{
+        const emps=byProcess[p];
+        const rows=emps.map(e=>'<tr style="background:'+(e.minutesToFirst>goal?'#ffebee':'#e8f5e9')+';">'+
+            '<td>'+e.employeeId+'</td><td>'+e.name+'</td><td title="'+e.punchIn+'">'+fsFmtTime(e.punchIn)+'</td>'+
+            '<td title="'+e.firstActivity+'">'+fsFmtTime(e.firstActivity)+'</td><td style="font-weight:700;">'+e.minutesToFirst+'</td></tr>').join('');
+        tables+='<section class="faststart-section"><h3>'+p+' ('+emps.length+' associates)</h3>'+
+            '<table class="metrics-table fs-detail-table"><thead><tr><th>Employee ID</th><th>Name</th><th>Punch In</th><th>First Activity</th><th>Minutes</th></tr></thead><tbody>'+rows+'</tbody></table></section>';
+    });
+    content.innerHTML=cards+tables;
+}
+function fsFmtTime(timeStr){
+    if(!timeStr)return '';
+    const cleaned=timeStr.replace(/\s+(EST|EDT|PST|PDT|CST|CDT|MST|MDT)$/i,'');
+    const d=new Date(cleaned);
+    if(isNaN(d.getTime()))return timeStr;
+    return d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',hour12:true});
+}
+// Populate the Fast Start controls from saved values / current config. Idempotent.
+function initFastStartControls(){
+    const siteSel=document.getElementById('fs-site');
+    if(siteSel&&!siteSel.options.length){
+        SITES.forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=s;siteSel.appendChild(o);});
+        siteSel.value=(loadConfig().site)||SITES[0];
+    }
+    const goal=document.getElementById('fs-goal-time');
+    if(goal){const g=localStorage.getItem(FS_GOAL_KEY);if(g)goal.value=g;}
+    const nonfc=document.getElementById('fs-remove-nonfc');
+    if(nonfc){const n=localStorage.getItem(FS_NONFC_KEY);if(n!=null)nonfc.checked=n==='1';}
+    const dt=document.getElementById('fs-start-datetime');
+    if(dt&&!dt.value){
+        const saved=localStorage.getItem(FS_DT_KEY);
+        if(saved){dt.value=saved;}
+        else{
+            // Default to today at this site's P1 (SOS) start time.
+            const c=loadConfig();const sched=c.shiftType==='Nights'?c.nights:c.days;const p1=sched.p1;
+            const d=new Date();d.setHours(p1.sh,p1.sm,0,0);
+            const pad=(x)=>String(x).padStart(2,'0');
+            dt.value=d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'T'+pad(d.getHours())+':'+pad(d.getMinutes());
+        }
+    }
 }
 
 addLaunchBtn();
