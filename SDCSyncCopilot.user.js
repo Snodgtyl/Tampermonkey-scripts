@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      14.1.0
+// @version      14.2.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @match        https://fclm-portal.amazon.com/*
@@ -39,7 +39,11 @@ const SITE_SCHEDULES = {
     QXX6: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:18,sm:30,eh:6,em:15},p1:{sh:19,sm:0,eh:22,em:30},p2:{sh:22,sm:31,eh:2,em:0},p3:{sh:2,sm:0,eh:5,em:30}} },
     SAV7: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:18,sm:30,eh:6,em:15},p1:{sh:19,sm:0,eh:22,em:30},p2:{sh:22,sm:31,eh:2,em:0},p3:{sh:2,sm:0,eh:5,em:30}} },
 };
-const PROCESS_IDS = { stow:'1003035', palletStow:'1003041', pick:'1003065', sort:'1003009', obDock:'1003021', icqa:'1003030', vretPack:'1003056', vretPick:'1003034', rsr:'01003012' };
+const PROCESS_IDS = { stow:'1003035', palletStow:'1003041', pick:'1003065', sort:'1003009', obDock:'1003021', icqa:'1003030', vretPack:'1003056', vretPick:'1003034', rsr:'01003012',
+    // TO (Transfer Out) loaded volume was split into two separate reports (line-item / process-id
+    // changes). Fluid-load totes+cases now live under "TO Fluid Load" (toFluidLoad); pallet-loaded
+    // cases live under "Transfer Out Dock" (toDock). loadedUnits = fluid-load jobs + dock pallet cases.
+    toFluidLoad:'01785143661476', toDock:'01003022' };
 // ICQA DC% (Direct Count %):
 //   numerator   = "Library Deep" (Direct Count) functions: SBC - Library Deep + Other Library Deep
 //   denominator = report GRAND TOTAL paid hours (all functions), read from summary tfoot total row
@@ -372,6 +376,43 @@ function parseFnRollup(html){
     }
     return{totalUnits:units,directHours:hours,rate,headcount:hc,palletCases,eachUnits,caseUnits,fluidLoadJobs,fluidCaseJPH,fluidCaseJobs,transshipPalletCases,palletizeToteJobs,palletizeToteCases,wallBuilderHC};
 }
+
+// Helper: pull the numeric cells from a fn-rollup report's grand-total (tfoot) row.
+function fnRollupTotalNums(html){
+    const doc=new DOMParser().parseFromString(html,'text/html');
+    const tr=doc.querySelector('tfoot tr.total.empl-all')||doc.querySelector('tr.total.empl-all')||doc.querySelector('tfoot tr.total')||doc.querySelector('tfoot tr');
+    const nums=[];
+    if(tr){tr.querySelectorAll('td.numeric').forEach(c=>{const v=parseFloat(c.textContent.replace(/,/g,''));if(!isNaN(v))nums.push(v);});}
+    // Headcount: unique employeeIds across the whole report.
+    const ids=new Set();doc.querySelectorAll('a[href*="employeeId="]').forEach(l=>{const m=l.href.match(/employeeId=([^&]+)/);if(m)ids.add(m[1]);});
+    return{nums,headcount:ids.size,doc};
+}
+// "TO Fluid Load" report (processId 01785143661476). Totes + cases for TO loaded volume.
+// tfoot Total numerics are [paidHours, Jobs, JPH, EACH-UNIT, EACH-UPH, Case-UNIT, Case-UPH]
+// e.g. [18.00, 6011, 333.95, 52224, 2901.38, 6011, 333.95] -> jobs=6011, cases=6011.
+// We keep the original "Total jobs" basis (index 1) as the loaded-volume driver.
+function parseToFluidLoad(html){
+    const {nums,headcount}=fnRollupTotalNums(html);
+    const paidHours=nums.length>=1?nums[0]:0;
+    const jobs=nums.length>=2?Math.round(nums[1]):0;
+    const jph=nums.length>=3?nums[2]:0;
+    const eachUnits=nums.length>=4?Math.round(nums[3]):0;
+    const caseUnits=nums.length>=6?Math.round(nums[5]):0;
+    if(jobs>0||caseUnits>0)console.log('[SB-TO fluid] jobs='+jobs+' cases='+caseUnits+' each='+eachUnits+' jph='+jph+' hrs='+paidHours+' hc='+headcount);
+    return{jobs,caseUnits,eachUnits,jph,directHours:paidHours,headcount};
+}
+// "Transfer Out Dock" report (processId 01003022). Pallet-loaded cases for TO loaded volume.
+// tfoot Total numerics are [paidHours, Jobs, JPH, Case-UNIT, Case-UPH, Pallet-UNIT, Pallet-UPH]
+// e.g. [0.04, 10, 285.71, 389, 11114.29, 10, 285.71] -> cases=389, pallets=10.
+function parseToDock(html){
+    const {nums,headcount}=fnRollupTotalNums(html);
+    const paidHours=nums.length>=1?nums[0]:0;
+    const jobs=nums.length>=2?Math.round(nums[1]):0;
+    const caseUnits=nums.length>=4?Math.round(nums[3]):0;
+    const palletUnits=nums.length>=6?Math.round(nums[5]):0;
+    if(caseUnits>0||palletUnits>0)console.log('[SB-TO dock] pallets='+palletUnits+' cases='+caseUnits+' jobs='+jobs+' hrs='+paidHours+' hc='+headcount);
+    return{caseUnits,palletUnits,jobs,directHours:paidHours,headcount};
+}
 // Wall Builder report (process 4300006861): total paid hours = tfoot total row's
 function parsePPR(html){
     const doc=new DOMParser().parseFromString(html,'text/html');
@@ -427,9 +468,13 @@ async function fetchPeriod(site,startDate,sched){
     let sDate=new Date(startDate);
     if(sh<12&&startDate.getHours()>=12){sDate.setDate(sDate.getDate()+1);}
     let eDate=new Date(sDate);if(eh<sh)eDate.setDate(eDate.getDate()+1);
-    const urls={ppr:buildPPRUrl(site,sDate,sh,sm,eDate,eh,em),stow:buildFnUrl(site,PROCESS_IDS.stow,sDate,sh,sm,eDate,eh,em),palletStow:buildFnUrl(site,PROCESS_IDS.palletStow,sDate,sh,sm,eDate,eh,em),pick:buildFnUrl(site,PROCESS_IDS.pick,sDate,sh,sm,eDate,eh,em),sort:buildFnUrl(site,PROCESS_IDS.sort,sDate,sh,sm,eDate,eh,em),obDock:buildFnUrl(site,PROCESS_IDS.obDock,sDate,sh,sm,eDate,eh,em),rsr:buildFnUrl(site,PROCESS_IDS.rsr,sDate,sh,sm,eDate,eh,em)};
+    const urls={ppr:buildPPRUrl(site,sDate,sh,sm,eDate,eh,em),stow:buildFnUrl(site,PROCESS_IDS.stow,sDate,sh,sm,eDate,eh,em),palletStow:buildFnUrl(site,PROCESS_IDS.palletStow,sDate,sh,sm,eDate,eh,em),pick:buildFnUrl(site,PROCESS_IDS.pick,sDate,sh,sm,eDate,eh,em),sort:buildFnUrl(site,PROCESS_IDS.sort,sDate,sh,sm,eDate,eh,em),obDock:buildFnUrl(site,PROCESS_IDS.obDock,sDate,sh,sm,eDate,eh,em),toFluidLoad:buildFnUrl(site,PROCESS_IDS.toFluidLoad,sDate,sh,sm,eDate,eh,em),toDock:buildFnUrl(site,PROCESS_IDS.toDock,sDate,sh,sm,eDate,eh,em),rsr:buildFnUrl(site,PROCESS_IDS.rsr,sDate,sh,sm,eDate,eh,em)};
     const res={};
-    await Promise.all(Object.entries(urls).map(async([k,u])=>{try{const h=await fetchHTML(u);res[k]=k==='ppr'?parsePPR(h):parseFnRollup(h);}catch(e){console.warn('[SB]',k,e.message);res[k]=k==='ppr'?{ibPlannedHrs:0,ibActualHrs:0,obPlannedHrs:0,obActualHrs:0,daTransferHrs:0,daTransferPlan:0,caseStowReserveHrs:0,throughputVol:0,throughputHrs:0,totHrs:0}:{totalUnits:0,directHours:0,rate:0,headcount:0};}}));
+    // Dispatch each report to its parser. PPR uses parsePPR; the split TO reports use their own
+    // parsers; everything else uses the generic fn-rollup parser.
+    const parseFor=(k,h)=>{if(k==='ppr')return parsePPR(h);if(k==='toFluidLoad')return parseToFluidLoad(h);if(k==='toDock')return parseToDock(h);return parseFnRollup(h);};
+    const emptyFor=(k)=>{if(k==='ppr')return{ibPlannedHrs:0,ibActualHrs:0,obPlannedHrs:0,obActualHrs:0,daTransferHrs:0,daTransferPlan:0,caseStowReserveHrs:0,throughputVol:0,throughputHrs:0,totHrs:0};if(k==='toFluidLoad')return{jobs:0,caseUnits:0,eachUnits:0,jph:0,directHours:0,headcount:0};if(k==='toDock')return{caseUnits:0,palletUnits:0,jobs:0,directHours:0,headcount:0};return{totalUnits:0,directHours:0,rate:0,headcount:0};};
+    await Promise.all(Object.entries(urls).map(async([k,u])=>{try{const h=await fetchHTML(u);res[k]=parseFor(k,h);}catch(e){console.warn('[SB]',k,e.message);res[k]=emptyFor(k);}}));
     return res;
 }
 
@@ -782,59 +827,81 @@ function fetchIcqaGCA(config,isRetry){
             headers:{'Content-Type':'application/json;charset=utf-8','Accept':'application/json'},
             data:body,
             onload:function(resp){
-                try{
-                    const data=JSON.parse(resp.responseText);
+                // A real auth failure looks like an HTML login redirect or a 401/403 — the body
+                // won't parse as JSON. Only THAT should prompt re-auth. A 200 with valid JSON is a
+                // success; anything else transient (5xx, odd body) is a soft failure, NOT auth.
+                const status=resp.status||0;
+                let data=null;
+                try{data=JSON.parse(resp.responseText);}catch(e){data=null;}
+                if(data&&(data.coachingInstances!==undefined||data.additionalCoachingInstances!==undefined)){
                     const count=(data.coachingInstances?.length||0)+(data.additionalCoachingInstances||0);
                     setEl('icqa-gca-value',String(count));
                     const banner=document.getElementById('icqa-gca-banner');
                     if(banner)banner.style.background=count>0?'#c62828':'#2e7d32';
                     setEl('icqa-gca-updated','\u2713 Updated '+new Date().toLocaleTimeString());
-                }catch(e){
-                    // Likely got redirected to a login page's HTML instead of JSON (expired session)
-                    if(!isRetry)refreshGcaSessionAndRetry(config);
-                    else setEl('icqa-gca-updated','\u26A0\uFE0F Parse error');
+                    return;
                 }
+                // Didn't get valid JSON. If it's an auth status (401/403) or a login-page redirect,
+                // the session is expired -> show a clickable prompt (does NOT auto-open a popup).
+                const looksLikeLogin=status===401||status===403||status===0&&/<html|sign in|midway|login/i.test(resp.responseText||'');
+                if(looksLikeLogin){promptGcaLogin(config);}
+                else setEl('icqa-gca-updated','\u26A0\uFE0F GCA unavailable (retrying)');
             },
             onerror:function(){
-                if(!isRetry){refreshGcaSessionAndRetry(config);return;}
-                setEl('icqa-gca-value','\u2014');
-                const b=document.getElementById('icqa-gca-banner');if(b)b.style.background='#757575';
-                setEl('icqa-gca-updated','\u26A0\uFE0F Fetch failed (log in to Guided Coaching once)');
+                // Network error (not necessarily auth). Show a soft status; do NOT open a popup.
+                setEl('icqa-gca-updated','\u26A0\uFE0F GCA fetch failed (retrying)');
             },
             ontimeout:function(){
-                if(!isRetry){refreshGcaSessionAndRetry(config);return;}
-                setEl('icqa-gca-value','\u2014');
-                const b=document.getElementById('icqa-gca-banner');if(b)b.style.background='#757575';
-                setEl('icqa-gca-updated','\u26A0\uFE0F Timed out');
+                // Timeout is transient, not an auth failure. Soft status; do NOT open a popup.
+                setEl('icqa-gca-updated','\u26A0\uFE0F GCA timed out (retrying)');
             }
         });
     }catch(e){console.warn('[SB] ICQA GCA fetch error:',e.message);}
 }
-// Guided Coaching's SSO login page sends X-Frame-Options: deny, so it can never be
-// loaded in a hidden iframe. Opens a small popup window (same pattern as Oculus
-// transship dashboard) for the user to badge in — the popup auto-closes after auth.
-function refreshGcaSessionAndRetry(config){
-    console.log('[SB-GCA] Auth failed, opening Guided Coaching login popup...');
+// Session expired: show a CLICKABLE prompt in the GCA banner instead of auto-opening a
+// popup. The popup only opens when the user clicks it (a real user gesture), so it no longer
+// pops on its own from the 30s interval or a transient blip. Idempotent — safe to call repeatedly.
+function promptGcaLogin(config){
+    setEl('icqa-gca-value','\u2014');
+    const banner=document.getElementById('icqa-gca-banner');
+    if(banner)banner.style.background='#757575';
+    const upd=document.getElementById('icqa-gca-updated');
+    if(upd){
+        // Only (re)wire the prompt once; don't stack listeners on repeated calls.
+        if(upd.dataset.gcaPrompt!=='1'){
+            upd.dataset.gcaPrompt='1';
+            upd.innerHTML='\u26A0\uFE0F <a href="#" id="gca-login-link" style="color:#90caf9;text-decoration:underline;cursor:pointer;">Log in to Guided Coaching</a>';
+            const link=document.getElementById('gca-login-link');
+            if(link)link.addEventListener('click',(e)=>{e.preventDefault();openGcaLoginPopup(config);});
+        }
+    }
+}
+// Actually open the SSO login popup. Called ONLY from the user's click on the prompt above
+// (Guided Coaching's login page sends X-Frame-Options: deny, so a hidden iframe won't work).
+// Guarded so a second click while one is open doesn't spawn another window.
+let gcaPopupOpen=false;
+function openGcaLoginPopup(config){
+    if(gcaPopupOpen)return;
+    console.log('[SB-GCA] User requested login, opening Guided Coaching popup...');
     try{
         const popup=window.open('https://guided-coaching.corp.amazon.com/','gca_auth','width=500,height=400,left=200,top=200');
         if(popup){
-            setEl('icqa-gca-updated','\u26A0\uFE0F Badge in to Guided Coaching popup...');
+            gcaPopupOpen=true;
+            setEl('icqa-gca-updated','\u26A0\uFE0F Badge in to the Guided Coaching popup...');
+            const finish=()=>{gcaPopupOpen=false;const upd=document.getElementById('icqa-gca-updated');if(upd)upd.dataset.gcaPrompt='';fetchIcqaGCA(config,true);};
             // Poll until the popup closes (user badges in and closes, or auto-close after timeout)
             const poll=setInterval(()=>{
                 try{
-                    if(popup.closed){
-                        clearInterval(poll);
-                        console.log('[SB-GCA] Popup closed, retrying GCA fetch...');
-                        fetchIcqaGCA(config,true);
-                    }
+                    if(popup.closed){clearInterval(poll);console.log('[SB-GCA] Popup closed, retrying GCA fetch...');finish();}
                 }catch(e){}
             },1000);
             // Safety timeout: stop polling after 60s and close popup
-            setTimeout(()=>{clearInterval(poll);try{popup.close();}catch(e){}},60000);
+            setTimeout(()=>{clearInterval(poll);try{if(!popup.closed)popup.close();}catch(e){}if(gcaPopupOpen)finish();},60000);
         }else{
             setEl('icqa-gca-updated','\u26A0\uFE0F Popup blocked \u2014 allow popups for FCLM');
         }
     }catch(e){
+        gcaPopupOpen=false;
         console.warn('[SB-GCA] Could not open popup:',e.message);
         setEl('icqa-gca-updated','\u26A0\uFE0F Log in to Guided Coaching manually');
     }
@@ -862,19 +929,24 @@ async function fetch24hrData(site){
         const today=new Date();
         const startDate=new Date(today);startDate.setHours(0,0,0,0);
         const endDate=new Date(today);
-        // Stow (Case Transfer In), Pallet Stow, and OB Dock function rollups for full day
+        // Stow (Case Transfer In), Pallet Stow, and the two split TO reports (TO Fluid Load +
+        // Transfer Out Dock) function rollups for the full day.
         const stowUrl=buildFnUrl(site,PROCESS_IDS.stow,startDate,0,0,endDate,23,59);
         const palletStowUrl=buildFnUrl(site,PROCESS_IDS.palletStow,startDate,0,0,endDate,23,59);
-        const obDockUrl=buildFnUrl(site,PROCESS_IDS.obDock,startDate,0,0,endDate,23,59);
-        const [stowHtml,palletStowHtml,obDockHtml]=await Promise.all([fetchHTML(stowUrl),fetchHTML(palletStowUrl),fetchHTML(obDockUrl)]);
+        const toFluidUrl=buildFnUrl(site,PROCESS_IDS.toFluidLoad,startDate,0,0,endDate,23,59);
+        const toDockUrl=buildFnUrl(site,PROCESS_IDS.toDock,startDate,0,0,endDate,23,59);
+        const [stowHtml,palletStowHtml,toFluidHtml,toDockHtml]=await Promise.all([fetchHTML(stowUrl),fetchHTML(palletStowUrl),fetchHTML(toFluidUrl),fetchHTML(toDockUrl)]);
         const stow=parseFnRollup(stowHtml);
         const pStow=parseFnRollup(palletStowHtml);
-        const obDock=parseFnRollup(obDockHtml);
+        const toFluid=parseToFluidLoad(toFluidHtml);
+        const toDock=parseToDock(toDockHtml);
         const palletCases=pStow.palletCases||0;
         const ibVol24=(stow.totalUnits||0)+palletCases;
         const ibDensity24=(stow.caseUnits||0)>0?(stow.eachUnits||0)/(stow.caseUnits||1):0;
-        const obDensity24=(obDock.caseUnits||0)>0?(obDock.eachUnits||0)/(obDock.caseUnits||1):0;
-        return{ibVol24,obVol24:obDock.fluidLoadJobs||0,ibDensity24,obDensity24};
+        const obDensity24=(toFluid.caseUnits||0)>0?(toFluid.eachUnits||0)/(toFluid.caseUnits||1):0;
+        // OB loaded volume (cases) = TO Fluid Load jobs + Transfer Out Dock pallet cases.
+        const obVol24=(toFluid.jobs||0)+(toDock.caseUnits||0);
+        return{ibVol24,obVol24,ibDensity24,obDensity24};
     }catch(e){console.warn('[SB] 24hr data fetch error:',e.message);return{ibVol24:0,obVol24:0,ibDensity24:0,obDensity24:0};}
 }
 
@@ -1296,7 +1368,7 @@ function processData(raw){
 
     ['full','p1','p2','p3'].forEach(p=>{
         const d=raw[p];if(!d)return;
-        const stow=d.stow||{},pStow=d.palletStow||{},pick=d.pick||{},obDock=d.obDock||{},sort=d.sort||{},ppr=d.ppr||{},rsr=d.rsr||{};
+        const stow=d.stow||{},pStow=d.palletStow||{},pick=d.pick||{},obDock=d.obDock||{},sort=d.sort||{},ppr=d.ppr||{},rsr=d.rsr||{},toFluid=d.toFluidLoad||{},toDock=d.toDock||{};
         // IB: total stow = case transfer in (stow units) + pallet transfer in CASE count
         const palletCases=pStow.palletCases||0;
         const ibU=(stow.totalUnits||0)+palletCases;
@@ -1328,17 +1400,22 @@ function processData(raw){
         const obTotalHrs=daHrs;
         const obIndirect=Math.max(obTotalHrs-obPickDH,0);
         const daPlan=ppr.daTransferPlan||0;
-        // Loaded = Fluid Load Case jobs + Fluid Load Tote jobs
-        const loadedUnits=obDock.fluidLoadJobs||0;
+        // Loaded per Period = TO Fluid Load jobs (totes+cases, processId 01785143661476)
+        //                     + Transfer Out Dock pallet-loaded cases (processId 01003022).
+        // The TO loaded volume was split into two reports; sum them here. Fall back to the legacy
+        // single obDock.fluidLoadJobs only if neither new report returned anything.
+        const toLoaded=(toFluid.jobs||0)+(toDock.caseUnits||0);
+        const loadedUnits=toLoaded>0?toLoaded:(obDock.fluidLoadJobs||0);
         m.ob[p]={pickUnits:pick.totalUnits||0,loadedUnits:loadedUnits,
             // periodPick / periodLoaded stay per-period (that time window only). syncLoaded is the
             // cumulative running total used ONLY by the OB Sync Metrics row.
             periodPick:pick.totalUnits||0,periodLoaded:loadedUnits,syncLoaded:loadedUnits,
             directHours:obPickDH,indirectHours:obIndirect,totalHours:obTotalHrs,
             directPct:obTotalHrs>0?(obPickDH/obTotalHrs)*100:0,indirectPct:obTotalHrs>0?(obIndirect/obTotalHrs)*100:0,
-            pickRate:pick.rate||0,pickHC:pick.headcount||0,dockHC:obDock.headcount||0,
+            pickRate:pick.rate||0,pickHC:pick.headcount||0,dockHC:(toFluid.headcount||0)+(toDock.headcount||0)||obDock.headcount||0,
             cplh:obTotalHrs>0?loadedUnits/obTotalHrs:0,
-            density:(obDock.caseUnits||0)>0?(obDock.eachUnits||0)/(obDock.caseUnits||1):0,
+            // Density (units/case): prefer the new TO Fluid Load report's each/case; fall back to legacy obDock.
+            density:(toFluid.caseUnits||0)>0?(toFluid.eachUnits||0)/(toFluid.caseUnits||1):((obDock.caseUnits||0)>0?(obDock.eachUnits||0)/(obDock.caseUnits||1):0),
             directHC:dur>0?obPickDH/dur:0,indirectHC:dur>0?obIndirect/dur:0,
             pprPlannedHrs:daPlan,pprActualHrs:daHrs,
             pctToOP:daPlan>0?(daHrs/daPlan)*100:0};
@@ -1350,12 +1427,12 @@ function processData(raw){
     // are never overwritten here.
     if(m.ib.p1&&m.ib.p2&&(raw.p2?.stow?.totalUnits>0||raw.p2?.palletStow?.palletCases>0)){
         m.ib.p2.totalStow=(m.ib.p1.totalStow||0)+((raw.p2?.stow?.totalUnits||0)+(raw.p2?.palletStow?.palletCases||0));
-        m.ob.p2.syncLoaded=(m.ob.p1.syncLoaded||0)+(raw.p2?.obDock?.fluidLoadJobs||0);
+        m.ob.p2.syncLoaded=(m.ob.p1.syncLoaded||0)+(m.ob.p2.periodLoaded||0);
         m.sort.p2.totalUnits=(m.sort.p1.totalUnits||0)+(raw.p2?.sort?.totalUnits||0);
     }
     if(m.ib.p2&&m.ib.p3&&(raw.p3?.stow?.totalUnits>0||raw.p3?.palletStow?.palletCases>0||raw.p3?.pick?.totalUnits>0)){
         m.ib.p3.totalStow=m.ib.full?.totalStow||(m.ib.p2.totalStow||0)+((raw.p3?.stow?.totalUnits||0)+(raw.p3?.palletStow?.palletCases||0));
-        m.ob.p3.syncLoaded=(m.ob.full?.loadedUnits)||((m.ob.p2.syncLoaded||0)+(raw.p3?.obDock?.fluidLoadJobs||0));
+        m.ob.p3.syncLoaded=(m.ob.full?.loadedUnits)||((m.ob.p2.syncLoaded||0)+(m.ob.p3.periodLoaded||0));
         m.sort.p3.totalUnits=m.sort.full?.totalUnits||(m.sort.p2.totalUnits||0)+(raw.p3?.sort?.totalUnits||0);
     }
     return m;
@@ -2276,7 +2353,12 @@ async function fetchHourlyData(){
     try{
         const results=await Promise.all(hours.map(hr=>fetchPeriod(site,startDate,hr)));
         const hourlyData=results.map((raw,i)=>{
-            const stow=raw.stow||{},pStow=raw.palletStow||{},pick=raw.pick||{},obDock=raw.obDock||{},sort=raw.sort||{},ppr=raw.ppr||{},rsr=raw.rsr||{};
+            const stow=raw.stow||{},pStow=raw.palletStow||{},pick=raw.pick||{},obDock=raw.obDock||{},sort=raw.sort||{},ppr=raw.ppr||{},rsr=raw.rsr||{},toFluid=raw.toFluidLoad||{},toDock=raw.toDock||{};
+            // OB loaded volume (cases) = TO Fluid Load jobs + Transfer Out Dock pallet cases (split
+            // reports). Fall back to the legacy single obDock report if neither returned anything.
+            const obLoaded=((toFluid.jobs||0)+(toDock.caseUnits||0))||(obDock.fluidLoadJobs||0);
+            const obLoadedRate=toFluid.jph||obDock.fluidCaseJPH||0;
+            const obLoadedHC=((toFluid.headcount||0)+(toDock.headcount||0))||obDock.headcount||0;
             const palletCases=pStow.palletCases||0;
             const ibU=(stow.totalUnits||0)+palletCases;
             const caseStowReserve=ppr.caseStowReserveHrs||0;
@@ -2297,12 +2379,12 @@ async function fetchHourlyData(){
                     rsrHC:rsr.headcount||0,            // Receive HC (active AAs receiving)
                     stowHC:stow.headcount||0,          // Stow HC (active AAs stowing)
                     directHours:ibDH,indirectHours:ibIndirect,totalHours:ibTotalHrs,directPct:ibTotalHrs>0?(ibDH/ibTotalHrs)*100:0,indirectPct:ibTotalHrs>0?(ibIndirect/ibTotalHrs)*100:0,cplh:cplhHrs>0?ibU/cplhHrs:0,pctToOP:(ppr.ibPlannedHrs||0)>0?(ibTotalHrs/ppr.ibPlannedHrs)*100:0},
-                ob:{pickUnits:pick.totalUnits||0,loadedUnits:obDock.fluidLoadJobs||0,pickRate:pick.rate||0,directHours:obPickDH,indirectHours:obIndirect,totalHours:daHrs,directPct:daHrs>0?(obPickDH/daHrs)*100:0,indirectPct:daHrs>0?(obIndirect/daHrs)*100:0,cplh:daHrs>0?(obDock.fluidLoadJobs||0)/daHrs:0,pctToOP:(ppr.daTransferPlan||0)>0?(daHrs/ppr.daTransferPlan)*100:0,
+                ob:{pickUnits:pick.totalUnits||0,loadedUnits:obLoaded,pickRate:pick.rate||0,directHours:obPickDH,indirectHours:obIndirect,totalHours:daHrs,directPct:daHrs>0?(obPickDH/daHrs)*100:0,indirectPct:daHrs>0?(obIndirect/daHrs)*100:0,cplh:daHrs>0?obLoaded/daHrs:0,pctToOP:(ppr.daTransferPlan||0)>0?(daHrs/ppr.daTransferPlan)*100:0,
                     // Flow view fields (new OB hourly style)
                     pickHC:pick.headcount||0,               // active AAs in Transfer Out Pick this hour
-                    loadedHC:obDock.headcount||0,            // active AAs on the dock this hour
+                    loadedHC:obLoadedHC,                     // active AAs on the dock this hour (TO Fluid Load + Dock)
                     wallBuilderHC:obDock.wallBuilderHC||0,   // Wall Builder HEADCOUNT (# AAs) from OB Dock report
-                    loadedRate:obDock.fluidCaseJPH||0},      // Loaded Cartons Rate = Fluid Load - Case JPH
+                    loadedRate:obLoadedRate},                // Loaded Cartons Rate = TO Fluid Load JPH
                 sort:{totalUnits:sort.totalUnits||0,rate:sort.rate||0,directHours:sort.directHours||0,cplh:(sort.directHours||0)>0?sort.totalUnits/sort.directHours:0}
             };
         });
@@ -3501,7 +3583,11 @@ async function doFetch(isRetry){
         const cplhPpr=raw.cplhData?.ppr||{};
         const stowJobs=raw.cplhData?.stow?.totalUnits||0;
         const palletCases24=raw.cplhData?.palletStow?.palletCases||0;
-        const obDockFluid=raw.cplhData?.obDock?.fluidLoadJobs||0;
+        // OB loaded piece: TO Fluid Load jobs + Transfer Out Dock pallet cases (split reports).
+        // Fall back to the legacy single obDock report if neither new report returned anything.
+        const cplhToFluid=raw.cplhData?.toFluidLoad||{};
+        const cplhToDock=raw.cplhData?.toDock||{};
+        const obDockFluid=((cplhToFluid.jobs||0)+(cplhToDock.caseUnits||0))||(raw.cplhData?.obDock?.fluidLoadJobs||0);
         const tHrs=cplhPpr.throughputHrs||0;
         const siteThroughputVol=obDockFluid+stowJobs+palletCases24;
         const siteCplh=tHrs>0?siteThroughputVol/tHrs:0;
