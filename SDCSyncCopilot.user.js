@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      14.13.2
+// @version      14.13.5
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
+// @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SyncBoard.user.js
+// @downloadURL  https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SyncBoard.user.js
 // @match        https://fclm-portal.amazon.com/*
 // @grant        GM_xmlhttpRequest
 // @connect      fc-benchmarking.amazon.com
@@ -1408,29 +1410,38 @@ function attemptLPFetch(site,resolve,isRetry){
                     const data=JSON.parse(text);
                     const reports=data.reports||data||[];
                     const withPlan=(Array.isArray(reports)?reports:[]).filter(r=>r&&r.planId);
-                    // Read a report's PUBLISHED-AT time. The site publishes two "Prelim" reports a
-                    // week (Wed and the FINAL Fri); they share the same name/reportDate, so we MUST
-                    // pick the one published LATEST (Friday), not the newest reportDate. Try the
-                    // common published-at field names; fall back to 0.
+                    // Published-at time: the site publishes TWO reports per week (Wed prelim + Fri
+                    // final), so among the CURRENT week's reports we want the latest-published (Fri).
                     const pubOf=(r)=>{
                         const cand=r.publishedAt||r.publishedTime||r.publishTime||r.publishedDate||r.publishDate||
                                    r.createdAt||r.createdTime||r.creationTime||r.lastModified||r.updatedAt||r.timestamp;
                         const t=cand?new Date(cand).getTime():0;
                         return isNaN(t)?0:t;
                     };
-                    // Diagnostic: dump each report with its name/planId/publishedAt so we can confirm
-                    // the selection picks the LATEST-published (Friday) plan, not the Wednesday one.
+                    // A report's WEEK (its plan week's Sunday, YYYY-MM-DD). The report list can
+                    // include NEXT week's plan once it's published (e.g. on a Wed/Thu), and that
+                    // future plan has NO rows for the current week -> everything comes back 0/wrong.
+                    // So we MUST restrict to the current week (sundayStr) before choosing by pub time.
+                    const weekOf=(r)=>{
+                        const cand=r.reportDate||r.startReportDate||r.weekStartDate||r.planWeek||r.weekStart||r.date||'';
+                        return cand?String(cand).slice(0,10):'';
+                    };
                     console.log('[SB-LP] reports returned:',withPlan.length,
-                        withPlan.map(r=>({name:r.reportName,planId:r.planId,pub:pubOf(r),pubRaw:(r.publishedAt||r.publishedTime||r.publishTime||r.createdAt||'?'),keys:Object.keys(r)})));
-                    // Choose the report with the LATEST published-at time. (If none expose a pub time,
-                    // this falls back to the last report in the list.)
-                    let finalReport=null;
-                    if(withPlan.length){
-                        finalReport=withPlan.slice().sort((a,b)=>pubOf(b)-pubOf(a))[0];
+                        withPlan.map(r=>({name:r.reportName,planId:r.planId,week:weekOf(r),pub:new Date(pubOf(r)).toISOString(),keys:Object.keys(r)})));
+                    // 1) Prefer reports whose week == this week's Sunday. 2) If the week field doesn't
+                    // match our format, fall back to reports published ON/BEFORE now (exclude future).
+                    // 3) Among the chosen set, take the LATEST-published (the Fri final over Wed prelim).
+                    const nowMs=Date.now();
+                    let pool=withPlan.filter(r=>weekOf(r)===sundayStr);
+                    if(!pool.length){
+                        console.warn('[SB-LP] No report matched current week ('+sundayStr+') by date field; excluding future-published reports instead.');
+                        pool=withPlan.filter(r=>pubOf(r)<=nowMs+60000); // allow 1 min clock skew
                     }
+                    if(!pool.length)pool=withPlan;   // last resort: anything
+                    let finalReport=pool.slice().sort((a,b)=>pubOf(b)-pubOf(a))[0];
                     if(!finalReport||!finalReport.planId){console.warn('[SB-LP] No usable report found (0 with a planId)');resolve(null);return;}
                     const planId=finalReport.planId;
-                    console.log('[SB-LP] Using LATEST-published report:',finalReport.reportName,'planId=',planId,'publishedAt=',new Date(pubOf(finalReport)).toISOString());
+                    console.log('[SB-LP] Using report:',finalReport.reportName,'planId=',planId,'week=',weekOf(finalReport),'publishedAt=',new Date(pubOf(finalReport)).toISOString());
                     let done=0;const results={ibCplh:0,obCplh:0,siteCplh:0,ctiRate:0,topRate:0,ibDensityLP:0,obDensityLP:0,ibBBGoal:0,obBBGoal:0,_planId:planId,_sundayStr:sundayStr};
                     const checkDone=()=>{if(done>=9){saveLPValues(results);resolve(results);}};
                     fetchLPPageAuto(planId,'IB',sundayStr,'key','IB Total CPLH',(v)=>{results.ibCplh=v;done++;checkDone();});
@@ -4096,6 +4107,21 @@ function downloadBlob(blob){
 // Silently refresh an expired FCLM/Midway session by loading the portal in a hidden iframe
 // (same pattern used for ALPS/GalaxyBI re-auth), then re-run the fetch WITHOUT a page reload
 // so the board stays open. Called when a fetch returns a total blackout after the quick retry.
+// Non-destructive session-expiry banner. Keeps the board open (no page reload) and tells the
+// user to re-auth in a new tab, then click Get Data again. Fixes the "Get Data closes the tool"
+// report, where a full Midway expiry used to trigger location.reload() and wipe the board.
+function showFclmReauthBanner(){
+    let banner=document.getElementById('sb-fclm-reauth-banner');
+    if(!banner){
+        banner=document.createElement('div');
+        banner.id='sb-fclm-reauth-banner';
+        banner.style.cssText='position:fixed;top:0;left:0;right:0;z-index:999999;padding:10px 20px;display:flex;align-items:center;justify-content:space-between;font:bold 13px sans-serif;box-shadow:0 2px 8px rgba(0,0,0,0.3);background:#c62828;color:#fff;';
+        document.body.appendChild(banner);
+    }
+    banner.innerHTML='<span>\u26A0\uFE0F FCLM session expired. Open <a href="https://fclm-portal.amazon.com/" target="_blank" style="color:#fff;text-decoration:underline;">FCLM Portal</a> in a new tab, sign in (Midway/badge tap), then come back and click <b>Get Data</b> again. The board stays open.</span><button onclick="this.parentElement.style.display=\'none\'" style="background:rgba(255,255,255,0.2);border:none;color:#fff;padding:4px 10px;border-radius:4px;cursor:pointer;font-weight:bold;">Dismiss</button>';
+    banner.style.display='flex';
+}
+
 function reauthFclmAndRetry(){
     console.log('[SB] FCLM session appears expired \u2014 refreshing via hidden iframe...');
     let done=false;
@@ -4155,9 +4181,13 @@ async function doFetch(isRetry){
                 return reauthFclmAndRetry();
             }
             // isRetry==='reauth' - the silent re-auth didn't take (Midway fully expired, needs a
-            // badge tap). Reload the page to force the interactive Midway handshake.
-            setStatus('\u26A0\uFE0F Session expired \u2014 reloading to re-authenticate\u2026');
-            setTimeout(()=>{location.reload();},1200);
+            // badge tap). DO NOT reload the page: a reload tears down the whole board (resets
+            // boardActive, wipes #sb-root) and dumps the user back to just the launch button -
+            // which is exactly the "Get Data closes the tool" bug. Instead keep the board open
+            // and surface a non-destructive banner asking the user to re-auth and retry, the same
+            // pattern used for GalaxyBI / ATLAS / OpenSearch session expiry.
+            setStatus('\u26A0\uFE0F Session expired \u2014 re-authenticate, then click Get Data');
+            showFclmReauthBanner();
             btn.disabled=false;btn.textContent='\u25B6 Get Data';return;
         }
         currentMetrics=processData(raw);
