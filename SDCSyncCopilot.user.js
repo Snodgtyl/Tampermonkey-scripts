@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      14.18.0
+// @version      14.19.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SyncBoard.user.js
@@ -4726,11 +4726,13 @@ function renderEOSWash(data){
     const accuracyHTML=`<section class="eoswash-section">
         <h3>Shift Accuracy</h3>
         <table class="metrics-table eos-accuracy-table"><thead><tr><th>Metric</th><th>Plan</th><th>Actual</th><th>% to Plan</th></tr></thead><tbody>
-        ${accRow('IB BB',ibBB,ibActVol)}
+        ${accRow('IB 24hr BB',ibBB,ibActVol)}
+        ${accRow('IB Shift LP BB',eosLpTargetIB,ibActVol)}
         ${accRow('IB Shift Plan',ibPlan,ibActVol)}
         ${accRow('IB CPLH',ibCplh,ibActCplh,2)}
         <tr><td colspan="4" style="height:6px;background:#888;"></td></tr>
-        ${accRow('DA BB',daBB,daActVol)}
+        ${accRow('OB 24hr BB',daBB,daActVol)}
+        ${accRow('OB Shift LP BB',eosLpTargetDA,daActVol)}
         ${accRow('DA Shift Plan',daPlan,daActVol)}
         ${accRow('DA CPLH',daCplh,daActCplh,2)}
         </tbody></table>
