@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      14.19.0
+// @version      14.19.1
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SyncBoard.user.js
@@ -4798,6 +4798,10 @@ function renderEOSWash(data){
               <textarea class="support-input eos-manual" id="eos-q-piles-ibps-note" placeholder="Explain why piles are over threshold\u2026" rows="2" style="width:100%;box-sizing:border-box;background:#ffffcc;color:#000;border:1px solid #999;border-radius:3px;resize:vertical;"></textarea>
             </td></tr>
             <tr><td style="text-align:left;">Damages</td><td>${inp('eos-q-piles-dmg')}</td></tr>
+            <tr id="eos-pile-dmg-note-row" style="display:none;"><td colspan="2" style="text-align:left;">
+              <label style="display:block;font-size:10px;color:#842029;margin:0 0 2px;">Reason (over threshold):</label>
+              <textarea class="support-input eos-manual" id="eos-q-piles-dmg-note" placeholder="Explain why damages are over threshold\u2026" rows="2" style="width:100%;box-sizing:border-box;background:#ffffcc;color:#000;border:1px solid #999;border-radius:3px;resize:vertical;"></textarea>
+            </td></tr>
             <tr><td style="text-align:left;">DA Problem Solve</td><td>${inp('eos-q-piles-daps')}</td></tr>
             <tr id="eos-pile-daps-note-row" style="display:none;"><td colspan="2" style="text-align:left;">
               <label style="display:block;font-size:10px;color:#842029;margin:0 0 2px;">Reason (over threshold):</label>
@@ -4845,21 +4849,23 @@ function renderEOSWash(data){
         }
     });
 
-    // --- Piles thresholds: red cell + reveal a reason note when value > 0 ---
-    // Threshold for IB PS / DA PS / Sort PS is 0 (any value > 0 is "over"). Damages is excluded.
+    // --- Piles thresholds: red cell + reveal a reason note when value is OVER the threshold ---
+    // Per-row threshold (value STRICTLY over it is "over"): IB PS / DA PS / Sort PS = 0 (any value
+    // > 0 is over); Damages = 5 (only > 5 is over).
     const PILE_OK_BG='#ffffcc';   // normal eos-manual yellow
     function updatePilesThreshold(){
         const specs=[
-            {inp:'eos-q-piles-ibps',  note:'eos-pile-ibps-note-row'},
-            {inp:'eos-q-piles-daps',  note:'eos-pile-daps-note-row'},
-            {inp:'eos-q-piles-sortps',note:'eos-pile-sortps-note-row'}
+            {inp:'eos-q-piles-ibps',  note:'eos-pile-ibps-note-row',  thresh:0},
+            {inp:'eos-q-piles-dmg',   note:'eos-pile-dmg-note-row',   thresh:5},
+            {inp:'eos-q-piles-daps',  note:'eos-pile-daps-note-row',  thresh:0},
+            {inp:'eos-q-piles-sortps',note:'eos-pile-sortps-note-row',thresh:0}
         ];
         specs.forEach(s=>{
             const el=document.getElementById(s.inp);
             const noteRow=document.getElementById(s.note);
             if(!el)return;
             const n=parseFloat((el.value||'').toString().replace(/,/g,''));
-            const over=Number.isFinite(n)&&n>0;
+            const over=Number.isFinite(n)&&n>s.thresh;
             if(over){
                 el.style.background='#f8d7da';
                 el.style.color='#842029';
@@ -4873,7 +4879,7 @@ function renderEOSWash(data){
         });
     }
     // Additional live-update 'input' listeners (persistence 'change' listeners above are untouched).
-    ['eos-q-piles-ibps','eos-q-piles-daps','eos-q-piles-sortps'].forEach(id=>{
+    ['eos-q-piles-ibps','eos-q-piles-dmg','eos-q-piles-daps','eos-q-piles-sortps'].forEach(id=>{
         const el=document.getElementById(id);
         if(el)el.addEventListener('input',updatePilesThreshold);
     });
