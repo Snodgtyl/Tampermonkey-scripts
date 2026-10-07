@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.0.0
+// @version      15.1.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
-// @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSync.user.js
-// @downloadURL  https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSync.user.js
+// @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
+// @downloadURL  https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
 // @match        https://fclm-portal.amazon.com/*
 // @grant        GM_xmlhttpRequest
 // @connect      fc-benchmarking.amazon.com
@@ -5002,6 +5002,12 @@ let currentVRETs=null;
 let currentFastStart=null;
 
 function addLaunchBtn(){
+    // RESILIENCE: never throw out of this function. If <body>/<head> isn't ready yet (can happen
+    // on some userscript managers / Firefox timing even at document-idle), bail quietly and let
+    // the retry loop in ensureLaunchBtn() call us again. If the button is already present, do
+    // nothing (idempotent, so repeated retries can't stack duplicate buttons).
+    if(!document.body||!document.head)return false;
+    if(document.getElementById('sb-launch'))return true;
     // Inject the launch button's animation/style once (keyframes can't live in inline cssText).
     if(!document.getElementById('sb-launch-style')){
         const st=document.createElement('style');st.id='sb-launch-style';
@@ -5043,13 +5049,50 @@ function addLaunchBtn(){
     b.innerHTML='<span class="sb-launch-grip" title="Drag to move">\u2630</span><span class="sb-launch-icon">\u{1F3ED}</span><span class="sb-launch-text">Sync Board</span>';
     document.body.appendChild(b);
     // Restore a saved position (if the user dragged it before). Stored as {left,top} px.
+    // CLAMP it back on-screen: a position saved on a larger/other monitor (or a stale value)
+    // could otherwise park the button entirely off the viewport, which reads as "no button".
     try{
         const pos=JSON.parse(localStorage.getItem('syncboard_launch_pos')||'null');
         if(pos&&typeof pos.left==='number'&&typeof pos.top==='number'){
-            b.style.left=pos.left+'px';b.style.top=pos.top+'px';b.style.transform='none';
+            const bw=b.offsetWidth||220, bh=b.offsetHeight||64;
+            const maxL=Math.max(4,window.innerWidth-bw-4), maxT=Math.max(4,window.innerHeight-bh-4);
+            const L=Math.min(Math.max(4,pos.left),maxL), T=Math.min(Math.max(4,pos.top),maxT);
+            b.style.left=L+'px';b.style.top=T+'px';b.style.transform='none';
         }
     }catch(e){}
     makeLaunchDraggable(b);
+    return true;
+}
+
+// RESILIENCE WRAPPER: guarantees the launch button appears even when the page/body isn't ready
+// at script time, or when a SIBLING userscript throws an uncaught error and disrupts the shared
+// injection cycle. Strategy: try now, on DOMContentLoaded, on window.load, and on a short retry
+// timer; also watch the DOM so if FCLM (or another script) wipes/replaces <body> the button is
+// re-added. Fully self-contained and idempotent (addLaunchBtn no-ops once the button exists).
+function ensureLaunchBtn(){
+    let tries=0;
+    const tryAdd=()=>{
+        // While the board is open the button is intentionally hidden/removed - don't re-add it.
+        if(boardActive)return true;
+        try{return addLaunchBtn()===true;}catch(e){try{console.warn('[SB] launch inject retry:',e&&e.message);}catch(_){}return false;}
+    };
+    // Fire on the common readiness milestones.
+    if(document.readyState==='loading'){
+        document.addEventListener('DOMContentLoaded',tryAdd,{once:true});
+    }
+    window.addEventListener('load',tryAdd,{once:true});
+    // Short retry burst to cover managers that inject before <body> exists, or a sibling script
+    // that throws during idle. ~10s of coverage, then stop.
+    const iv=setInterval(()=>{tries++;if(tryAdd()||tries>=40)clearInterval(iv);},250);
+    // Re-add if the page later swaps out <body> and drops the button (keeps it resilient to
+    // FCLM re-renders / other scripts). Guarded so we never touch it while the board is open.
+    try{
+        const mo=new MutationObserver(()=>{if(!boardActive&&document.body&&!document.getElementById('sb-launch'))tryAdd();});
+        if(document.body)mo.observe(document.body,{childList:true});
+        else document.addEventListener('DOMContentLoaded',()=>{if(document.body)mo.observe(document.body,{childList:true});},{once:true});
+    }catch(e){}
+    // Immediate attempt too.
+    tryAdd();
 }
 
 // Drag-to-move for the launch button. Distinguishes a click (launch the board) from a drag
@@ -5097,7 +5140,7 @@ function makeLaunchDraggable(b){
 
 function launch(){
     if(boardActive)return;boardActive=true;
-    document.getElementById('sb-launch').style.display='none';
+    {const lb=document.getElementById('sb-launch');if(lb)lb.style.display='none';}
     originalBody=document.body.innerHTML;
     const style=document.createElement('style');style.textContent=buildCSS()+buildCSS2();document.head.appendChild(style);
     document.body.innerHTML='<div id="sb-root">'+buildHTML()+'</div>';
@@ -5896,5 +5939,5 @@ function initFastStartControls(){
     }
 }
 
-addLaunchBtn();
+ensureLaunchBtn();
 })();
