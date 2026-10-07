@@ -4,8 +4,8 @@
 // @version      14.19.2
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
-// @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SyncBoard.user.js
-// @downloadURL  https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SyncBoard.user.js
+// @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncCopilot.user.js
+// @downloadURL  https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncCopilot.user.js
 // @match        https://fclm-portal.amazon.com/*
 // @grant        GM_xmlhttpRequest
 // @connect      fc-benchmarking.amazon.com
