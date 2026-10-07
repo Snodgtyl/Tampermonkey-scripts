@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      14.20.0
+// @version      14.21.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncCopilot.user.js
@@ -5313,7 +5313,13 @@ function doSnip(){
         ta.parentNode.replaceChild(div,ta);
     });
     setTimeout(()=>{
-        html2canvas(root,{backgroundColor:isDark?'#1a1a2e':'#ffffff',scale:1.5,useCORS:true,logging:false,windowHeight:root.scrollHeight,height:root.scrollHeight}).then(canvas=>{
+        // Capture the FULL board: lock BOTH width and height to the forced 1400px layout's full
+        // scroll size (and pin scrollX/Y to 0). Previously only the height was passed, so
+        // html2canvas used the live window WIDTH as its viewport — if the browser window was
+        // narrower than the forced 1400px board, the right column (ICQA / Site CPLH) got clipped.
+        const snipW=Math.max(root.scrollWidth,1400);
+        const snipH=root.scrollHeight;
+        html2canvas(root,{backgroundColor:isDark?'#1a1a2e':'#ffffff',scale:1.5,useCORS:true,logging:false,scrollX:0,scrollY:0,windowWidth:snipW,windowHeight:snipH,width:snipW,height:snipH}).then(canvas=>{
             clearTimeout(snipSafety);
             // Restore textareas
             textareaBackups.forEach(b=>{const div=b.parent.querySelector('div');if(div&&!div.querySelector){}b.next?b.parent.insertBefore(b.ta,b.next):b.parent.appendChild(b.ta);if(div&&div.parentNode)div.parentNode.removeChild(div);});
