@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.1.0
+// @version      15.2.1
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -4307,6 +4307,33 @@ async function fetchEOSWashData(){
         const ppr=parsePPRDetail(pprHtml);
         const stow=parseFnRollup(stowH),pallet=parseFnRollup(palletH),pick=parseFnRollup(pickH);
         const toFluid=parseToFluidLoad(toFluidH),toDock=parseToDock(toDockH);
+        // SYNC-CONSISTENT CPLH: compute IB/DA CPLH here the SAME way the Sync tab's processData
+        // does, from the wash's OWN fetched reports (same shift window), so the EOS Wash TOTAL
+        // rows never disagree with the Sync tab. The old code copied the Sync tab's rendered
+        // #ib-cplh-total/#ob-cplh-total DOM text, which went WRONG on nights when the EOS Wash was
+        // fetched without a matching Sync fetch (empty/stale cell -> fell back to picked/hours,
+        // a different number). We parse the SAME pprHtml with parsePPR (the parser that reliably
+        // yields ibActualHrs / daTransferHrs) to get the exact Sync hours basis.
+        //   Sync IB CPLH = (Case Transfer In + Pallet Transfer In cases) / ibActualHrs
+        //   Sync DA CPLH = loadedUnits (TO Fluid Load jobs + TO Dock cases) / daTransferHrs
+        // Replicate processData EXACTLY (not approximately) so the wash equals the refined Sync
+        // tool, including both fallbacks:
+        //   IB vol   = stow.totalUnits + pallet.palletCases  (Case Transfer In + Pallet Transfer In cases)
+        //   IB hours = ibActualHrs if >0 ELSE direct hours (stow.directHours + caseStowReserveHrs + pallet.directHours)
+        //   DA vol   = toFluid.jobs + toDock.caseUnits, ELSE legacy obDock.fluidLoadJobs (0 here; wash doesn't fetch obDock)
+        //   DA hours = daTransferHrs
+        const pprSync=parsePPR(pprHtml);
+        const ibVolSync=(stow.totalUnits||0)+(pallet.palletCases||0);
+        const ibPPRHrsSync=pprSync.ibActualHrs||0;
+        const caseStowReserveSync=pprSync.caseStowReserveHrs||0;
+        const ibDHSync=(stow.directHours||0)+caseStowReserveSync+(pallet.directHours||0);
+        const ibHrsSync=ibPPRHrsSync>0?ibPPRHrsSync:ibDHSync;   // same fallback as processData
+        const ibCplhSync=ibHrsSync>0?ibVolSync/ibHrsSync:0;
+        const toLoadedSync=((toFluid.jobs||0)+(toDock.caseUnits||0));
+        const loadedUnitsSync=toLoadedSync>0?toLoadedSync:0;    // mirrors Sync's toLoaded>0?toLoaded:(obDock...) — obDock not fetched here
+        const daHrsSync=pprSync.daTransferHrs||0;
+        const daCplhSync=daHrsSync>0?loadedUnitsSync/daHrsSync:0;
+        dbg('[SB-EOS CPLH] ibVol='+ibVolSync+' ibHrs='+ibHrsSync.toFixed(2)+' (pprHrs='+ibPPRHrsSync.toFixed(2)+' dh='+ibDHSync.toFixed(2)+') ibCPLH='+ibCplhSync.toFixed(2)+' | loaded='+loadedUnitsSync+' daHrs='+daHrsSync.toFixed(2)+' daCPLH='+daCplhSync.toFixed(2));
         // Case volumes keyed by PPR line-item name (used to override PPR eaches with real cases).
         const caseVols={
             'Case Transfer In':stow.totalUnits||0,
@@ -4336,7 +4363,9 @@ async function fetchEOSWashData(){
         // persist via loadEosPlanTargets()/the input's localStorage wiring. renderEOSWash reads the
         // same inputs live, so this just seeds currentEOSWash for the theme-toggle re-render path.
         const alpsTarget=readEosPlanTargets();
-        currentEOSWash={ppr,caseVols,caseHrs,alpsTarget};
+        // syncCplh carries the Sync-consistent IB/DA CPLH so the TOTAL rows match the Sync tab
+        // exactly, independent of whether the Sync tab was rendered (fixes the nights mismatch).
+        currentEOSWash={ppr,caseVols,caseHrs,alpsTarget,syncCplh:{ib:ibCplhSync,da:daCplhSync}};
         renderEOSWash(currentEOSWash);
         if(statusEl)statusEl.textContent='\u2713 Updated '+new Date().toLocaleTimeString();
     }catch(err){
@@ -4350,6 +4379,11 @@ function renderEOSWash(data){
     const content=document.getElementById('eoswash-content');if(!content)return;
     const ppr=(data&&data.ppr)||{};
     const caseVols=(data&&data.caseVols)||{};
+    // Sync-consistent IB/DA CPLH (computed in fetchEOSWashData from the SAME reports/window as
+    // the Sync tab). totalRow uses these directly so the TOTAL rows always match the Sync tab,
+    // even on nights when the Sync DOM cell wasn't populated. Null when fetched before this field
+    // existed (theme-toggle re-render of an old cache) -> totalRow falls back to the DOM/vol-hrs.
+    const syncCplh=(data&&data.syncCplh)||null;
     // Real HOURS override (keyed by PPR line-item name) for the two OUTBOUND rows whose hours
     // come from the split Transfer Out reports, not the PPR. Declared before procRow so it is
     // captured in procRow's closure. Only the two TO rows have an entry here.
@@ -4588,10 +4622,19 @@ function renderEOSWash(data){
         // Transfer Out Pick rows). Read the Sync tab's already-rendered CPLH total so the two
         // tabs agree (the wash's own sumHrs covers only this section's rows, which gave a
         // different hours denominator and a mismatched rate like 30.03 vs the Sync 19.20).
-        // IB TOTAL -> #ib-cplh-total, DA TOTAL -> #ob-cplh-total; fall back to vol/hrs if absent.
-        const cplhElId=(label.indexOf('IB')===0)?'ib-cplh-total':(label.indexOf('DA')===0?'ob-cplh-total':null);
+        // PRIMARY: use the Sync-consistent CPLH computed in fetchEOSWashData (same reports/window
+        // as the Sync tab). This is the fix for the nights mismatch: the DA TOTAL CPLH is now
+        // loadedUnits/daTransferHrs exactly like the Sync tab, NOT picked-vol/summed-hrs, and it
+        // does not depend on the Sync tab having been rendered.
         let rate=(hrs&&hrs>0&&vol!=null)?vol/hrs:0;
-        if(cplhElId){const syncCplh=parseFloat((document.getElementById(cplhElId)?.textContent||'').replace(/,/g,''));if(syncCplh>0)rate=syncCplh;}
+        const syncRate=(label.indexOf('IB')===0)?(syncCplh&&syncCplh.ib):(label.indexOf('DA')===0?(syncCplh&&syncCplh.da):0);
+        if(syncRate>0){rate=syncRate;}
+        else{
+            // FALLBACK (only if syncCplh unavailable, e.g. re-render of a pre-fix cache): read the
+            // Sync tab's rendered CPLH total, as before.
+            const cplhElId=(label.indexOf('IB')===0)?'ib-cplh-total':(label.indexOf('DA')===0?'ob-cplh-total':null);
+            if(cplhElId){const domCplh=parseFloat((document.getElementById(cplhElId)?.textContent||'').replace(/,/g,''));if(domCplh>0)rate=domCplh;}
+        }
         // Hours Variance = SUM over member rows of (vol/planRate - hrs) (Excel column M total),
         // using each PPR line item's OWN raw volume and plan rate.
         let tvar=0, tvarHas=false;
@@ -4718,7 +4761,12 @@ function renderEOSWash(data){
     const ibActCplh=ibActHrs>0?ibActVol/ibActHrs:0;
     const daActVol=sumVol(DA_VOL_ROWS)||0;
     const daActHrs=sumHrs(DA_ROWS.map(r=>r[1]))||0;
-    const daActCplh=daActHrs>0?daActVol/daActHrs:0;
+    // DA CPLH actual = Sync-consistent value (loadedUnits/daTransferHrs) when available, so the
+    // Shift Accuracy DA CPLH matches the Sync tab and the DA TOTAL row. Fall back to the local
+    // picked-vol/summed-hrs only if syncCplh wasn't captured (pre-fix cache re-render).
+    const daActCplh=(syncCplh&&syncCplh.da>0)?syncCplh.da:(daActHrs>0?daActVol/daActHrs:0);
+    // IB CPLH actual: same treatment for consistency with the Sync tab.
+    const ibActCplhSync=(syncCplh&&syncCplh.ib>0)?syncCplh.ib:ibActCplh;
     const accRow=(label,plan,act,dec=0,pctHigh=true)=>{
         const varc=(plan&&act)?((pctHigh?act/plan:plan/act)*100):0;
         return `<tr><td>${label}</td><td>${plan?fv(plan,dec):'\u2014'}</td><td>${act?fv(act,dec):'\u2014'}</td><td style="${bg(varc)}">${varc>0?varc.toFixed(1)+'%':'\u2014'}</td></tr>`;
@@ -4729,7 +4777,7 @@ function renderEOSWash(data){
         ${accRow('IB 24hr BB',ibBB,ibActVol)}
         ${accRow('IB Shift LP BB',eosLpTargetIB,ibActVol)}
         ${accRow('IB Shift Plan',ibPlan,ibActVol)}
-        ${accRow('IB CPLH',ibCplh,ibActCplh,2)}
+        ${accRow('IB CPLH',ibCplh,ibActCplhSync,2)}
         <tr><td colspan="4" style="height:6px;background:#888;"></td></tr>
         ${accRow('OB 24hr BB',daBB,daActVol)}
         ${accRow('OB Shift LP BB',eosLpTargetDA,daActVol)}
