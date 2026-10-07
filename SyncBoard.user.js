@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         SyncBoard
+// @name         SDC Sync Copilot
 // @namespace    https://fclm-portal.amazon.com
-// @version      14.19.1
+// @version      14.19.2
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SyncBoard.user.js
