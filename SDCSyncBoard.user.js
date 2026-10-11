@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.9.0
+// @version      15.11.3
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -1783,12 +1783,40 @@ function renderDayView(off,d){
     const obBB=(off===1&&priorBBGoals.ob>0)?priorBBGoals.ob:(parseFloat(lp.obBBGoal)||0);
     // VRET plan is day-of-week keyed like the BB goals: prior day uses yesterday's fetched value.
     const vretGoal=(off===1&&priorBBGoals.vret>0)?priorBBGoals.vret:(parseFloat(lp.vretGoal)||0);
-    setRow('ib-bb',ibBB,d.ibVol,null);
+    // Day-elapsed fraction for the Expected (linear ramp) calc. Current day (off 0) = clock hours
+    // into the calendar day / 24; prior day (off 1) = full day (1.0). Expected = Plan * fraction.
+    const now=new Date();
+    const dayFrac=(off===1)?1:Math.min(1,Math.max(0,(now.getHours()*60+now.getMinutes())/1440));
+    // BB-row setter: fills Plan | Actual | Expected | Status | % to Goal | Variance for the 3 BB
+    // rows. Expected = plan*dayFrac; Status = RISK if actual<expected else On Track; % to Goal =
+    // actual/expected; Variance = actual-expected (per the user's reference).
+    const setBBRow=(base,plan,act)=>{
+        const g=(s)=>document.getElementById(prefix+'-'+base+'-'+s);
+        const planEl=g('plan'),actEl=g('act'),expEl=g('exp'),stEl=g('status'),pctEl=g('pct'),varEl=g('var');
+        const p=Number(plan)||0,a=Number(act)||0;
+        if(planEl)planEl.textContent=fmtNum(plan,null);
+        if(actEl)actEl.textContent=fmtNum(act,null);
+        const exp=p>0?p*dayFrac:0;
+        if(expEl)expEl.textContent=exp>0?Math.round(exp).toLocaleString():'\u2014';
+        if(p<=0){ // no plan -> blank the comparison cells
+            if(stEl){stEl.textContent='\u2014';stEl.style.color='';}
+            if(pctEl){pctEl.textContent='\u2014';pctEl.style.color='';}
+            if(varEl){varEl.textContent='\u2014';varEl.style.color='';}
+            return;
+        }
+        const atRisk=a<exp;
+        if(stEl){stEl.innerHTML=atRisk?'\uD83D\uDEA8 RISK!!':'\u2713 On Track';stEl.style.color=atRisk?'#c62828':'#2e7d32';stEl.style.fontWeight='700';}
+        if(pctEl){const pct=exp>0?(a/exp)*100:0;pctEl.textContent=pct>0?pct.toFixed(1)+'%':'\u2014';pctEl.style.color=atRisk?'#c62828':'#2e7d32';}
+        if(varEl){const diff=a-exp;const diffStr=(diff>=0?'+':'')+Math.round(diff).toLocaleString();varEl.textContent=diffStr;varEl.style.color=diff>=0?'#2e7d32':'#c62828';}
+    };
+    setBBRow('ib-bb',ibBB,d.ibVol);
     setRow('ib-den',parseFloat(lp.ibDensityLP)||0,d.ibDensity,2);
     setRow('ib-cplh',parseFloat(lp.ibCplh)||0,d.ibCplh,2);
-    setRow('da-bb',obBB,d.obVol,null);
+    setBBRow('da-bb',obBB,d.obVol);
     setRow('da-den',parseFloat(lp.obDensityLP)||0,d.obDensity,2);
     setRow('da-cplh',parseFloat(lp.obCplh)||0,d.obCplh,2);
+    // Combined 24hr BB = IB + DA (plan + actual summed), same Expected/Status/%/Variance logic.
+    setBBRow('cb-bb',(ibBB||0)+(obBB||0),(d.ibVol||0)+(d.obVol||0));
     setRow('tp-cplh',parseFloat(lp.siteCplh)||0,d.siteCplh,2);
     // VRET's: plan = GalaxyBI Vendor Returns Week Capacity (day-of-week); actual = Vendor Return
     // Pack EACH-Total for the day (d.vretVol).
@@ -3060,13 +3088,111 @@ function updatePeriodDots(){
 
 // === HTML ===
 function buildHTML(){return `
-<nav class="topnav"><div class="topnav-left"><span class="logo"><svg width="28" height="28" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="46" fill="#333A44" stroke="#4a9eff" stroke-width="4"/><path d="M25 65 L25 40 L50 28 L75 40 L75 65 Z" fill="none" stroke="#E8EAED" stroke-width="3" stroke-linejoin="round"/><line x1="25" y1="65" x2="75" y2="65" stroke="#E8EAED" stroke-width="3"/><rect x="30" y="45" width="16" height="20" fill="none" stroke="#E8EAED" stroke-width="2"/><line x1="30" y1="50" x2="46" y2="50" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="55" x2="46" y2="55" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="60" x2="46" y2="60" stroke="#E8EAED" stroke-width="1.5"/><rect x="54" y="48" width="14" height="17" fill="none" stroke="#E8EAED" stroke-width="2"/><rect x="57" y="52" width="4" height="5" fill="#E8EAED"/><rect x="62" y="55" width="3" height="4" fill="#E8EAED"/></svg></span><h1 class="site-title">FC Sync Board<span style="display:block;font-size:10px;font-weight:400;color:#aaa;margin-top:-2px;">by snodgtyl</span></h1>
+<nav class="topnav"><div class="topnav-left"><span class="logo"><svg width="28" height="28" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="46" fill="#333A44" stroke="#4a9eff" stroke-width="4"/><path d="M25 65 L25 40 L50 28 L75 40 L75 65 Z" fill="none" stroke="#E8EAED" stroke-width="3" stroke-linejoin="round"/><line x1="25" y1="65" x2="75" y2="65" stroke="#E8EAED" stroke-width="3"/><rect x="30" y="45" width="16" height="20" fill="none" stroke="#E8EAED" stroke-width="2"/><line x1="30" y1="50" x2="46" y2="50" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="55" x2="46" y2="55" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="60" x2="46" y2="60" stroke="#E8EAED" stroke-width="1.5"/><rect x="54" y="48" width="14" height="17" fill="none" stroke="#E8EAED" stroke-width="2"/><rect x="57" y="52" width="4" height="5" fill="#E8EAED"/><rect x="62" y="55" width="3" height="4" fill="#E8EAED"/></svg></span><h1 class="site-title">FC Sync Board<span style="display:block;font-size:11px;font-weight:800;color:#146EB4;letter-spacing:.3px;margin-top:-1px;">by snodgtyl</span></h1>
 <div class="nav-tabs"><button class="nav-tab active" data-tab="sync">Sync IB-OB</button><button class="nav-tab" data-tab="hourly">Hourly</button><button class="nav-tab" data-tab="faststart">Fast Start</button><button class="nav-tab" data-tab="vrets">VRETs</button><button class="nav-tab" data-tab="eoswash">EOS Wash</button><button class="nav-tab" data-tab="settings">Settings</button></div></div>
+<div id="sb-truck-road" title="rolling"><div class="sb-truck"><svg width="46" height="22" viewBox="0 0 92 44" xmlns="http://www.w3.org/2000/svg"><g fill="none" stroke="#232F3E" stroke-width="3" stroke-linejoin="round"><rect x="2" y="6" width="54" height="26" rx="2" fill="#dbe7f6"/><path d="M56 14 h16 l10 10 v8 h-26 z" fill="#146EB4" stroke="#232F3E"/><rect x="60" y="16" width="10" height="8" rx="1" fill="#bfe0ff"/></g><g fill="#232F3E"><circle cx="18" cy="36" r="6"/><circle cx="40" cy="36" r="6"/><circle cx="74" cy="36" r="6"/></g><g fill="#9aa7b8"><circle cx="18" cy="36" r="2.4"/><circle cx="40" cy="36" r="2.4"/><circle cx="74" cy="36" r="2.4"/></g></svg></div></div>
 <div class="topnav-right"><select id="site-select" class="select-input"></select><select id="shift-select" class="select-input"><option value="Days">Days</option><option value="Nights">Nights</option></select>
 <div class="period-indicator"><span class="period-dot" id="dot-p1">P1</span><span class="period-dot" id="dot-p2">P2</span><span class="period-dot" id="dot-p3">P3</span></div>
 <button id="btn-fetch" class="btn btn-primary">\u25B6 Get Data</button><button id="btn-snip" class="btn btn-snip">\uD83D\uDCF7 Snip</button><button id="btn-dark" class="btn" style="background:#333;color:#fff;border-color:#333;">\u263D</button><button id="btn-exit" class="btn btn-danger">\u2715 Exit</button><span id="last-update" class="meta-text">Ready</span></div></nav>
 
-<main id="tab-sync" class="tab-content active"><div class="sync-layout">
+<main id="tab-sync" class="tab-content active">
+<div class="targets-panel targets-panel-top"><h3 class="panel-title" style="display:flex;justify-content:space-between;align-items:center;">
+<span style="display:inline-flex;gap:0;"><button id="btn-view-targets" class="btn btn-small day-toggle active" style="border-radius:4px 0 0 4px;">Shift Plan Targets</button><button id="btn-view-current" class="btn btn-small day-toggle" style="border-radius:0;">Current Day</button><button id="btn-view-prior" class="btn btn-small day-toggle" style="border-radius:0 4px 4px 0;">Prior Day</button></span>
+<button id="btn-clear-targets" class="btn btn-small btn-danger">Clear</button></h3>
+<div id="spt-targets-view">
+<div class="target-groups-row">
+<div class="tg-compact"><h4>INBOUND</h4><table class="target-table"><thead><tr><th></th><th>Target</th><th>%</th></tr></thead><tbody>
+<tr><td>24 HR BB GOAL</td><td><span id="ib-bb-goal" style="font-weight:bold;">\u2014</span></td><td></td></tr>
+<tr><td>IB GOAL</td><td><input type="number" id="ib-goal-input" class="target-input"></td><td><span id="ib-goal-pct">\u2014</span></td></tr>
+<tr><td>IB LP SHIFT PLAN</td><td><input type="number" id="ib-lp-plan-vol" class="target-input"></td><td></td></tr>
+<tr><td>STOW RATE</td><td><input type="number" id="ib-rate-target" class="target-input"></td><td><span id="ib-rate-pct">\u2014</span></td></tr>
+<tr><td>IB CPLH</td><td><input type="number" id="ib-cplh-target" class="target-input"></td><td><span id="ib-cplh-pct">\u2014</span></td></tr>
+<tr class="lp-row"><td>IB LP CPLH</td><td><span id="spt-ib-lp-cplh" class="lp-val">\u2014</span></td><td></td></tr>
+<tr><td>PLANNED DENSITY</td><td><input type="number" id="ib-density-target" class="target-input" step="0.01"></td><td><span id="ib-density-pct">\u2014</span></td></tr>
+<tr class="lp-row"><td>IB LP DENSITY</td><td><span id="spt-ib-lp-density" class="lp-val">\u2014</span></td><td></td></tr>
+<tr><td>SOS FAST START</td><td><input type="number" id="ib-fast-sos" class="target-input" value="13" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ib-fast-sos-pct">\u2014</span></td></tr>
+<tr><td>EOL FAST START</td><td><input type="number" id="ib-fast-eol" class="target-input" value="18" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ib-fast-eol-pct">\u2014</span></td></tr>
+</tbody></table></div>
+<div class="tg-compact"><h4>OUTBOUND</h4><table class="target-table"><thead><tr><th></th><th>Target</th><th>%</th></tr></thead><tbody>
+<tr><td>24 HR BB GOAL</td><td><span id="ob-bb-goal" style="font-weight:bold;">\u2014</span></td><td></td></tr>
+<tr><td>DA GOAL</td><td><input type="number" id="ob-goal-input" class="target-input"></td><td><span id="ob-goal-pct">\u2014</span></td></tr>
+<tr><td>OB LP SHIFT PLAN</td><td><input type="number" id="ob-lp-plan-vol" class="target-input"></td><td></td></tr>
+<tr><td>PICK RATE</td><td><input type="number" id="ob-rate-target" class="target-input"></td><td><span id="ob-rate-pct">\u2014</span></td></tr>
+<tr><td>DA CPLH</td><td><input type="number" id="ob-cplh-target" class="target-input"></td><td><span id="ob-cplh-pct">\u2014</span></td></tr>
+<tr class="lp-row"><td>DA LP CPLH</td><td><span id="spt-ob-lp-cplh" class="lp-val">\u2014</span></td><td></td></tr>
+<tr><td>PLANNED DENSITY</td><td><input type="number" id="ob-density-target" class="target-input" step="0.01"></td><td><span id="ob-density-pct">\u2014</span></td></tr>
+<tr class="lp-row"><td>DA LP DENSITY</td><td><span id="spt-ob-lp-density" class="lp-val">\u2014</span></td><td></td></tr>
+<tr><td>SOS FAST START</td><td><input type="number" id="ob-fast-sos" class="target-input" value="13" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ob-fast-sos-pct">\u2014</span></td></tr>
+<tr><td>EOL FAST START</td><td><input type="number" id="ob-fast-eol" class="target-input" value="18" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ob-fast-eol-pct">\u2014</span></td></tr>
+</tbody></table></div>
+</div>
+<div id="sort-targets-right" class="sort-tgt"><h4>SORT</h4><table class="target-table"><tbody>
+<tr><td>SORT PRIMARY GOAL</td><td><input type="number" id="sort-goal" class="target-input"></td><td><span id="sort-goal-pct">\u2014</span></td></tr>
+<tr><td>SORT RATE (UPH)</td><td><input type="number" id="sort-rate-target" class="target-input"></td><td></td></tr>
+</tbody></table></div>
+<div class="sort-tgt" style="margin-top:6px;padding-top:6px;border-top:2px solid #000;"><h4 style="color:#333;">SITE</h4><table class="target-table"><tbody>
+<tr><td>SITE CPLH TARGET</td><td><input type="number" id="site-cplh-target" class="target-input" step="0.01"></td><td><span id="site-cplh-pct">\u2014</span></td></tr>
+<tr class="lp-row"><td>THROUGHPUT LP CPLH</td><td><span id="spt-site-lp-cplh" class="lp-val">\u2014</span></td><td></td></tr>
+</tbody></table></div>
+</div><!-- /spt-targets-view -->
+
+<div id="spt-current-view" style="display:none;">
+<div class="day-report-title">24hr Reporting \u2014 <span id="spt-current-date">Current Day</span></div>
+<table class="target-table day-table"><thead><tr><th></th><th>Plan</th><th>Actual</th><th>Expected</th><th>Status</th><th>% to Goal</th><th>Variance</th></tr></thead><tbody>
+<tr><td>IB 24hr BB</td><td id="cd-ib-bb-plan">\u2014</td><td id="cd-ib-bb-act">\u2014</td><td id="cd-ib-bb-exp">\u2014</td><td id="cd-ib-bb-status">\u2014</td><td id="cd-ib-bb-pct">\u2014</td><td id="cd-ib-bb-var">\u2014</td></tr>
+<tr><td>IB LP Density</td><td id="cd-ib-den-plan">\u2014</td><td id="cd-ib-den-act">\u2014</td><td></td><td></td><td></td><td id="cd-ib-den-var">\u2014</td></tr>
+<tr><td>IB LP CPLH</td><td id="cd-ib-cplh-plan">\u2014</td><td id="cd-ib-cplh-act">\u2014</td><td></td><td></td><td></td><td id="cd-ib-cplh-var">\u2014</td></tr>
+<tr class="day-gap"><td colspan="7"></td></tr>
+<tr><td>DA 24hr BB</td><td id="cd-da-bb-plan">\u2014</td><td id="cd-da-bb-act">\u2014</td><td id="cd-da-bb-exp">\u2014</td><td id="cd-da-bb-status">\u2014</td><td id="cd-da-bb-pct">\u2014</td><td id="cd-da-bb-var">\u2014</td></tr>
+<tr><td>DA LP Density</td><td id="cd-da-den-plan">\u2014</td><td id="cd-da-den-act">\u2014</td><td></td><td></td><td></td><td id="cd-da-den-var">\u2014</td></tr>
+<tr><td>DA LP CPLH</td><td id="cd-da-cplh-plan">\u2014</td><td id="cd-da-cplh-act">\u2014</td><td></td><td></td><td></td><td id="cd-da-cplh-var">\u2014</td></tr>
+<tr class="row-combined-bb"><td>Combined 24hr BB</td><td id="cd-cb-bb-plan">\u2014</td><td id="cd-cb-bb-act">\u2014</td><td id="cd-cb-bb-exp">\u2014</td><td id="cd-cb-bb-status">\u2014</td><td id="cd-cb-bb-pct">\u2014</td><td id="cd-cb-bb-var">\u2014</td></tr>
+<tr class="day-gap"><td colspan="7"></td></tr>
+<tr><td>Throughput LP CPLH</td><td id="cd-tp-cplh-plan">\u2014</td><td id="cd-tp-cplh-act">\u2014</td><td></td><td></td><td></td><td id="cd-tp-cplh-var">\u2014</td></tr>
+<tr class="day-gap"><td colspan="7"></td></tr>
+<tr><td>VRET's</td><td id="cd-vret-plan">\u2014</td><td id="cd-vret-act">\u2014</td><td></td><td></td><td></td><td id="cd-vret-var">\u2014</td></tr>
+</tbody></table>
+<div id="spt-current-status" style="font-size:10px;color:#888;text-align:right;margin-top:6px;"></div>
+</div>
+
+<div id="spt-prior-view" style="display:none;">
+<div class="day-report-title">24hr Reporting \u2014 <span id="spt-prior-date">Prior Day</span></div>
+<table class="target-table day-table"><thead><tr><th></th><th>Plan</th><th>Actual</th><th>Expected</th><th>Status</th><th>% to Goal</th><th>Variance</th></tr></thead><tbody>
+<tr><td>IB 24hr BB</td><td id="pd-ib-bb-plan">\u2014</td><td id="pd-ib-bb-act">\u2014</td><td id="pd-ib-bb-exp">\u2014</td><td id="pd-ib-bb-status">\u2014</td><td id="pd-ib-bb-pct">\u2014</td><td id="pd-ib-bb-var">\u2014</td></tr>
+<tr><td>IB LP Density</td><td id="pd-ib-den-plan">\u2014</td><td id="pd-ib-den-act">\u2014</td><td></td><td></td><td></td><td id="pd-ib-den-var">\u2014</td></tr>
+<tr><td>IB LP CPLH</td><td id="pd-ib-cplh-plan">\u2014</td><td id="pd-ib-cplh-act">\u2014</td><td></td><td></td><td></td><td id="pd-ib-cplh-var">\u2014</td></tr>
+<tr class="day-gap"><td colspan="7"></td></tr>
+<tr><td>DA 24hr BB</td><td id="pd-da-bb-plan">\u2014</td><td id="pd-da-bb-act">\u2014</td><td id="pd-da-bb-exp">\u2014</td><td id="pd-da-bb-status">\u2014</td><td id="pd-da-bb-pct">\u2014</td><td id="pd-da-bb-var">\u2014</td></tr>
+<tr><td>DA LP Density</td><td id="pd-da-den-plan">\u2014</td><td id="pd-da-den-act">\u2014</td><td></td><td></td><td></td><td id="pd-da-den-var">\u2014</td></tr>
+<tr><td>DA LP CPLH</td><td id="pd-da-cplh-plan">\u2014</td><td id="pd-da-cplh-act">\u2014</td><td></td><td></td><td></td><td id="pd-da-cplh-var">\u2014</td></tr>
+<tr class="row-combined-bb"><td>Combined 24hr BB</td><td id="pd-cb-bb-plan">\u2014</td><td id="pd-cb-bb-act">\u2014</td><td id="pd-cb-bb-exp">\u2014</td><td id="pd-cb-bb-status">\u2014</td><td id="pd-cb-bb-pct">\u2014</td><td id="pd-cb-bb-var">\u2014</td></tr>
+<tr class="day-gap"><td colspan="7"></td></tr>
+<tr><td>Throughput LP CPLH</td><td id="pd-tp-cplh-plan">\u2014</td><td id="pd-tp-cplh-act">\u2014</td><td></td><td></td><td></td><td id="pd-tp-cplh-var">\u2014</td></tr>
+<tr class="day-gap"><td colspan="7"></td></tr>
+<tr><td>VRET's</td><td id="pd-vret-plan">\u2014</td><td id="pd-vret-act">\u2014</td><td></td><td></td><td></td><td id="pd-vret-var">\u2014</td></tr>
+</tbody></table>
+<div id="spt-prior-status" style="font-size:10px;color:#888;text-align:right;margin-top:6px;"></div>
+</div>
+
+<!-- DEPT BACKLOG: shown only for the Current Day / Prior Day views (hidden for Shift Plan Targets) -->
+<div id="spt-dept-backlog" class="sort-tgt dept-tgt" style="display:none;margin-top:6px;padding-top:6px;border-top:2px solid #000;"><h4 style="color:#333;">DEPT BACKLOG</h4>
+<table class="target-table dept-table"><thead><tr><th></th><th>Units</th><th>Cases</th><th>Days (Units)</th><th>Days (Cases)</th><th>IPT Backlog</th></tr></thead><tbody>
+<tr><td>Inbound Backlog</td>
+<td><input type="text" id="dept-ib-units" class="dept-input"></td>
+<td><input type="text" id="dept-ib-cases" class="dept-input"></td>
+<td><input type="text" id="dept-ib-days-units" class="dept-input"></td>
+<td><input type="text" id="dept-ib-days-cases" class="dept-input"></td>
+<td><input type="text" id="dept-ib-ipt" class="dept-input"></td></tr>
+<tr><td>DA Backlog</td>
+<td><input type="text" id="dept-da-units" class="dept-input"></td>
+<td><input type="text" id="dept-da-cases" class="dept-input"></td>
+<td><input type="text" id="dept-da-days-units" class="dept-input"></td>
+<td><input type="text" id="dept-da-days-cases" class="dept-input"></td>
+<td><input type="text" id="dept-da-ipt" class="dept-input"></td></tr>
+</tbody></table></div>
+</div><!-- /targets-panel-top -->
+
+<div class="sync-layout">
 <div class="sync-left">
 
 <section class="metrics-section actions-section"><div class="section-header"><h2>\u{1F4CB} SYNC Actions</h2><div><button id="btn-add-action" class="btn btn-small">+ Add</button> <button id="btn-clear-actions" class="btn btn-small btn-danger">Clear</button></div></div>
@@ -3129,12 +3255,6 @@ function buildHTML(){return `
 <tr class="row-cplh"><td class="bold">CPLH</td><td id="sort-cplh-p1">\u2014</td><td id="sort-cplh-p2">\u2014</td><td id="sort-cplh-p3">\u2014</td><td id="sort-cplh-total">\u2014</td></tr>
 </tbody></table></section>
 
-<div class="charts-panel">
-<div class="chart-card"><h3>Stow (Planned vs Actual) + Rate</h3><canvas id="chart-stow" height="170"></canvas></div>
-<div class="chart-card"><h3>CPLH + Direct vs Indirect</h3><canvas id="chart-cplh-ib" height="170"></canvas></div>
-<div class="chart-card"><h3>Picked (Plan vs Actual) + Rate</h3><canvas id="chart-pick" height="170"></canvas></div>
-<div class="chart-card"><h3>Picked vs Loaded</h3><canvas id="chart-loaded" height="170"></canvas></div>
-</div>
 
 </div><!-- sync-left -->
 
@@ -3234,99 +3354,6 @@ function buildHTML(){return `
 </div>
 <div style="text-align:right;font-size:10px;color:#555;margin-top:2px;">24hr Density: <strong id="bb24-ob-density">\u2014</strong></div>
 </div>
-</div>
-<div class="targets-panel"><h3 class="panel-title" style="display:flex;justify-content:space-between;align-items:center;">
-<span style="display:inline-flex;gap:0;"><button id="btn-view-targets" class="btn btn-small day-toggle active" style="border-radius:4px 0 0 4px;">Shift Plan Targets</button><button id="btn-view-current" class="btn btn-small day-toggle" style="border-radius:0;">Current Day</button><button id="btn-view-prior" class="btn btn-small day-toggle" style="border-radius:0 4px 4px 0;">Prior Day</button></span>
-<button id="btn-clear-targets" class="btn btn-small btn-danger">Clear</button></h3>
-<div id="spt-targets-view">
-<div class="target-groups-row">
-<div class="tg-compact"><h4>INBOUND</h4><table class="target-table"><thead><tr><th></th><th>Target</th><th>%</th></tr></thead><tbody>
-<tr><td>24 HR BB GOAL</td><td><span id="ib-bb-goal" style="font-weight:bold;">\u2014</span></td><td></td></tr>
-<tr><td>IB GOAL</td><td><input type="number" id="ib-goal-input" class="target-input"></td><td><span id="ib-goal-pct">\u2014</span></td></tr>
-<tr><td>IB LP SHIFT PLAN</td><td><input type="number" id="ib-lp-plan-vol" class="target-input"></td><td></td></tr>
-<tr><td>STOW RATE</td><td><input type="number" id="ib-rate-target" class="target-input"></td><td><span id="ib-rate-pct">\u2014</span></td></tr>
-<tr><td>IB CPLH</td><td><input type="number" id="ib-cplh-target" class="target-input"></td><td><span id="ib-cplh-pct">\u2014</span></td></tr>
-<tr class="lp-row"><td>IB LP CPLH</td><td><span id="spt-ib-lp-cplh" class="lp-val">\u2014</span></td><td></td></tr>
-<tr><td>PLANNED DENSITY</td><td><input type="number" id="ib-density-target" class="target-input" step="0.01"></td><td><span id="ib-density-pct">\u2014</span></td></tr>
-<tr class="lp-row"><td>IB LP DENSITY</td><td><span id="spt-ib-lp-density" class="lp-val">\u2014</span></td><td></td></tr>
-<tr><td>SOS FAST START</td><td><input type="number" id="ib-fast-sos" class="target-input" value="13" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ib-fast-sos-pct">\u2014</span></td></tr>
-<tr><td>EOL FAST START</td><td><input type="number" id="ib-fast-eol" class="target-input" value="18" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ib-fast-eol-pct">\u2014</span></td></tr>
-</tbody></table></div>
-<div class="tg-compact"><h4>OUTBOUND</h4><table class="target-table"><thead><tr><th></th><th>Target</th><th>%</th></tr></thead><tbody>
-<tr><td>24 HR BB GOAL</td><td><span id="ob-bb-goal" style="font-weight:bold;">\u2014</span></td><td></td></tr>
-<tr><td>DA GOAL</td><td><input type="number" id="ob-goal-input" class="target-input"></td><td><span id="ob-goal-pct">\u2014</span></td></tr>
-<tr><td>OB LP SHIFT PLAN</td><td><input type="number" id="ob-lp-plan-vol" class="target-input"></td><td></td></tr>
-<tr><td>PICK RATE</td><td><input type="number" id="ob-rate-target" class="target-input"></td><td><span id="ob-rate-pct">\u2014</span></td></tr>
-<tr><td>DA CPLH</td><td><input type="number" id="ob-cplh-target" class="target-input"></td><td><span id="ob-cplh-pct">\u2014</span></td></tr>
-<tr class="lp-row"><td>DA LP CPLH</td><td><span id="spt-ob-lp-cplh" class="lp-val">\u2014</span></td><td></td></tr>
-<tr><td>PLANNED DENSITY</td><td><input type="number" id="ob-density-target" class="target-input" step="0.01"></td><td><span id="ob-density-pct">\u2014</span></td></tr>
-<tr class="lp-row"><td>DA LP DENSITY</td><td><span id="spt-ob-lp-density" class="lp-val">\u2014</span></td><td></td></tr>
-<tr><td>SOS FAST START</td><td><input type="number" id="ob-fast-sos" class="target-input" value="13" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ob-fast-sos-pct">\u2014</span></td></tr>
-<tr><td>EOL FAST START</td><td><input type="number" id="ob-fast-eol" class="target-input" value="18" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ob-fast-eol-pct">\u2014</span></td></tr>
-</tbody></table></div>
-</div>
-<div id="sort-targets-right" class="sort-tgt"><h4>SORT</h4><table class="target-table"><tbody>
-<tr><td>SORT PRIMARY GOAL</td><td><input type="number" id="sort-goal" class="target-input"></td><td><span id="sort-goal-pct">\u2014</span></td></tr>
-<tr><td>SORT RATE (UPH)</td><td><input type="number" id="sort-rate-target" class="target-input"></td><td></td></tr>
-</tbody></table></div>
-<div class="sort-tgt" style="margin-top:6px;padding-top:6px;border-top:2px solid #000;"><h4 style="color:#333;">SITE</h4><table class="target-table"><tbody>
-<tr><td>SITE CPLH TARGET</td><td><input type="number" id="site-cplh-target" class="target-input" step="0.01"></td><td><span id="site-cplh-pct">\u2014</span></td></tr>
-<tr class="lp-row"><td>THROUGHPUT LP CPLH</td><td><span id="spt-site-lp-cplh" class="lp-val">\u2014</span></td><td></td></tr>
-</tbody></table></div>
-</div><!-- /spt-targets-view -->
-
-<div id="spt-current-view" style="display:none;">
-<div class="day-report-title">24hr Reporting \u2014 <span id="spt-current-date">Current Day</span></div>
-<table class="target-table day-table"><thead><tr><th></th><th>Plan</th><th>Actual</th><th>Variance</th></tr></thead><tbody>
-<tr><td>IB 24hr BB</td><td id="cd-ib-bb-plan">\u2014</td><td id="cd-ib-bb-act">\u2014</td><td id="cd-ib-bb-var">\u2014</td></tr>
-<tr><td>IB LP Density</td><td id="cd-ib-den-plan">\u2014</td><td id="cd-ib-den-act">\u2014</td><td id="cd-ib-den-var">\u2014</td></tr>
-<tr><td>IB LP CPLH</td><td id="cd-ib-cplh-plan">\u2014</td><td id="cd-ib-cplh-act">\u2014</td><td id="cd-ib-cplh-var">\u2014</td></tr>
-<tr class="day-gap"><td colspan="4"></td></tr>
-<tr><td>DA 24hr BB</td><td id="cd-da-bb-plan">\u2014</td><td id="cd-da-bb-act">\u2014</td><td id="cd-da-bb-var">\u2014</td></tr>
-<tr><td>DA LP Density</td><td id="cd-da-den-plan">\u2014</td><td id="cd-da-den-act">\u2014</td><td id="cd-da-den-var">\u2014</td></tr>
-<tr><td>DA LP CPLH</td><td id="cd-da-cplh-plan">\u2014</td><td id="cd-da-cplh-act">\u2014</td><td id="cd-da-cplh-var">\u2014</td></tr>
-<tr class="day-gap"><td colspan="4"></td></tr>
-<tr><td>Throughput LP CPLH</td><td id="cd-tp-cplh-plan">\u2014</td><td id="cd-tp-cplh-act">\u2014</td><td id="cd-tp-cplh-var">\u2014</td></tr>
-<tr class="day-gap"><td colspan="4"></td></tr>
-<tr><td>VRET's</td><td id="cd-vret-plan">\u2014</td><td id="cd-vret-act">\u2014</td><td id="cd-vret-var">\u2014</td></tr>
-</tbody></table>
-<div id="spt-current-status" style="font-size:10px;color:#888;text-align:right;margin-top:6px;"></div>
-</div>
-
-<div id="spt-prior-view" style="display:none;">
-<div class="day-report-title">24hr Reporting \u2014 <span id="spt-prior-date">Prior Day</span></div>
-<table class="target-table day-table"><thead><tr><th></th><th>Plan</th><th>Actual</th><th>Variance</th></tr></thead><tbody>
-<tr><td>IB 24hr BB</td><td id="pd-ib-bb-plan">\u2014</td><td id="pd-ib-bb-act">\u2014</td><td id="pd-ib-bb-var">\u2014</td></tr>
-<tr><td>IB LP Density</td><td id="pd-ib-den-plan">\u2014</td><td id="pd-ib-den-act">\u2014</td><td id="pd-ib-den-var">\u2014</td></tr>
-<tr><td>IB LP CPLH</td><td id="pd-ib-cplh-plan">\u2014</td><td id="pd-ib-cplh-act">\u2014</td><td id="pd-ib-cplh-var">\u2014</td></tr>
-<tr class="day-gap"><td colspan="4"></td></tr>
-<tr><td>DA 24hr BB</td><td id="pd-da-bb-plan">\u2014</td><td id="pd-da-bb-act">\u2014</td><td id="pd-da-bb-var">\u2014</td></tr>
-<tr><td>DA LP Density</td><td id="pd-da-den-plan">\u2014</td><td id="pd-da-den-act">\u2014</td><td id="pd-da-den-var">\u2014</td></tr>
-<tr><td>DA LP CPLH</td><td id="pd-da-cplh-plan">\u2014</td><td id="pd-da-cplh-act">\u2014</td><td id="pd-da-cplh-var">\u2014</td></tr>
-<tr class="day-gap"><td colspan="4"></td></tr>
-<tr><td>Throughput LP CPLH</td><td id="pd-tp-cplh-plan">\u2014</td><td id="pd-tp-cplh-act">\u2014</td><td id="pd-tp-cplh-var">\u2014</td></tr>
-<tr class="day-gap"><td colspan="4"></td></tr>
-<tr><td>VRET's</td><td id="pd-vret-plan">\u2014</td><td id="pd-vret-act">\u2014</td><td id="pd-vret-var">\u2014</td></tr>
-</tbody></table>
-<div id="spt-prior-status" style="font-size:10px;color:#888;text-align:right;margin-top:6px;"></div>
-</div>
-
-<!-- DEPT BACKLOG: shown only for the Current Day / Prior Day views (hidden for Shift Plan Targets) -->
-<div id="spt-dept-backlog" class="sort-tgt dept-tgt" style="display:none;margin-top:6px;padding-top:6px;border-top:2px solid #000;"><h4 style="color:#333;">DEPT BACKLOG</h4>
-<table class="target-table dept-table"><thead><tr><th></th><th>Units</th><th>Cases</th><th>Days (Units)</th><th>Days (Cases)</th><th>IPT Backlog</th></tr></thead><tbody>
-<tr><td>Inbound Backlog</td>
-<td><input type="text" id="dept-ib-units" class="dept-input"></td>
-<td><input type="text" id="dept-ib-cases" class="dept-input"></td>
-<td><input type="text" id="dept-ib-days-units" class="dept-input"></td>
-<td><input type="text" id="dept-ib-days-cases" class="dept-input"></td>
-<td><input type="text" id="dept-ib-ipt" class="dept-input"></td></tr>
-<tr><td>DA Backlog</td>
-<td><input type="text" id="dept-da-units" class="dept-input"></td>
-<td><input type="text" id="dept-da-cases" class="dept-input"></td>
-<td><input type="text" id="dept-da-days-units" class="dept-input"></td>
-<td><input type="text" id="dept-da-days-cases" class="dept-input"></td>
-<td><input type="text" id="dept-da-ipt" class="dept-input"></td></tr>
-</tbody></table></div>
 </div><!-- sync-right -->
 </div></main>
 
@@ -3425,9 +3452,46 @@ function buildCSS(){return `
 .topnav{display:flex;align-items:center;justify-content:space-between;padding:6px 16px;background:#f0f0f0;border-bottom:2px solid #000;position:sticky;top:0;z-index:100;}
 .topnav-left{display:flex;align-items:center;gap:14px;}.topnav-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
 .logo{font-size:20px;display:flex;align-items:center;}.site-title{font-size:15px;font-weight:700;margin:0;white-space:nowrap;color:#000;}
+/* Driving semi animation between the nav tabs (Settings) and the site selector. A little truck
+   drives left->right on repeat along a dashed road. Shown ONLY on the Sync tab (toggled in JS). */
+/* The road is a FLEX-GROW middle child of the top nav, so it fills the whole gap between the
+   Settings tab and the site selector and auto-resizes with the window / zoom. The truck starts
+   just after Settings (left:0) and drives all the way across to the site selector (left:100%),
+   using translateX(-100%) at the end so the truck fully exits before looping. */
+#sb-truck-road{position:relative;flex:1 1 auto;min-width:40px;height:26px;overflow:hidden;border-bottom:2px dashed #9aa7b8;margin:0 8px;align-self:center;}
+#sb-truck-road .sb-truck{position:absolute;bottom:1px;left:0;animation:sbTruckDrive 4s linear infinite;}
+#sb-truck-road .sb-truck svg{display:block;animation:sbTruckBounce .4s ease-in-out infinite;}
+@keyframes sbTruckDrive{0%{left:0;transform:translateX(-100%);}100%{left:100%;transform:translateX(0);}}
+@keyframes sbTruckBounce{0%,100%{transform:translateY(0);}50%{transform:translateY(-1px);}}
+@media(prefers-reduced-motion:reduce){#sb-truck-road .sb-truck{animation:none;left:50%;transform:translateX(-50%);}#sb-truck-road .sb-truck svg{animation:none;}}
+#sb-root.dark-mode #sb-truck-road{border-bottom-color:#55657a;}
+#sb-root.dark-mode #sb-truck-road .sb-truck svg g[stroke]{stroke:#cdd6e4;}
 .nav-tabs{display:flex;gap:4px;}.nav-tab{padding:5px 12px;border:1px solid #000;background:#fff;color:#333;border-radius:4px;cursor:pointer;font-size:12px;font-weight:500;transition:background .22s ease,color .22s ease,transform .15s ease,box-shadow .22s ease;}
 .nav-tab:hover{background:#e0e0e0;color:#000;transform:translateY(-1px);}
 .nav-tab.active{background:#2e7d32;color:#fff;border-color:#2e7d32;box-shadow:0 2px 8px rgba(46,125,50,.4);animation:tabPop .25s ease;}
+/* RESPONSIVE TOP NAV: the browser can't tell us the zoom level, so instead the nav shrinks based
+   on available WIDTH. At narrower effective widths (incl. zoomed-in / smaller windows) the tabs,
+   buttons, selects, title, gaps and the truck road all tighten so the bar stops feeling crowded
+   and fits on one line. Larger screens keep the roomier default sizing. */
+@media(max-width:1500px){
+  .topnav{padding:5px 10px;}
+  .topnav-left{gap:9px;}.topnav-right{gap:6px;}
+  .site-title{font-size:14px;}
+  .nav-tabs{gap:3px;}.nav-tab{padding:4px 9px;font-size:11px;}
+  .topnav .btn{padding:4px 8px;font-size:11px;}
+  .topnav .select-input{padding:3px 6px;font-size:11px;}
+  .period-dot{padding:2px 6px;font-size:9px;}
+  #sb-truck-road{margin:0 5px;min-width:30px;}
+}
+@media(max-width:1250px){
+  .topnav-left{gap:6px;}.topnav-right{gap:4px;}
+  .site-title{font-size:13px;}
+  .nav-tab{padding:3px 7px;font-size:10px;}
+  .topnav .btn{padding:3px 7px;font-size:10px;}
+  .topnav .select-input{padding:2px 5px;font-size:10px;}
+  #sb-truck-road{margin:0 3px;min-width:20px;}
+  .meta-text{display:none;}  /* hide the "Ready/Updated" text when very tight */
+}
 @keyframes tabPop{0%{transform:scale(.94);}60%{transform:scale(1.05);}100%{transform:scale(1);}}
 @media(prefers-reduced-motion:reduce){.nav-tab.active{animation:none;}.nav-tab:hover{transform:none;}}
 .select-input{padding:4px 8px;background:#fff;border:1px solid #000;color:#000;border-radius:4px;font-size:12px;}
@@ -3466,6 +3530,40 @@ function buildCSS(){return `
 #sb-root .metrics-section:hover{box-shadow:0 6px 20px rgba(20,40,80,.14);}
 .sync-right{position:sticky;top:52px;display:flex;flex-direction:column;gap:8px;max-height:calc(100vh - 60px);overflow-y:auto;overflow-x:hidden;padding-right:4px;}
 .targets-panel{background:#fff;border-radius:4px;border:2px solid #000;padding:8px 10px;}
+/* Shift Plan Targets pinned as a full-width banner at the top of the Sync tab (between the
+   header/Sync actions and the two scrolling columns). Lays the INBOUND/OUTBOUND/SORT/SITE
+   blocks out HORIZONTALLY so the banner stays short rather than tall. The day views
+   (Current/Prior) keep their own table layout and just span the full width. */
+.targets-panel-top{margin-bottom:10px;border-width:3px;}
+/* Spread the four blocks (INBOUND / OUTBOUND / SORT / SITE) evenly across the full banner
+   width as equal cards. Each block gets its own light-boxed card so the view reads as
+   polished as the Current/Prior Day tables instead of squished tables on the left. */
+/* Flex (not grid) so the cards spread to fill the FULL banner width no matter how many are
+   visible. SORT is hidden on non-sort shifts (JS sets display:none) — with flex the remaining
+   cards grow to absorb its space instead of leaving an empty 4th column of dead space.
+   IB/OB are the tall tables so they get more grow weight; SORT/SITE are short so they grow less. */
+.targets-panel-top #spt-targets-view{display:flex;flex-wrap:wrap;gap:16px;align-items:stretch;}
+.targets-panel-top #spt-targets-view > .target-groups-row{display:contents;}
+.targets-panel-top #spt-targets-view > .target-groups-row > .tg-compact{flex:3 1 300px;}
+.targets-panel-top #spt-targets-view > #sort-targets-right{flex:2 1 220px;}
+.targets-panel-top #spt-targets-view > .sort-tgt{flex:2 1 220px;}
+.targets-panel-top #spt-targets-view > .target-groups-row > .tg-compact,
+.targets-panel-top #spt-targets-view > #sort-targets-right,
+.targets-panel-top #spt-targets-view > .sort-tgt{margin:0;padding:10px 14px;border:1px solid #d4dbe3;border-top:1px solid #d4dbe3;border-radius:6px;background:#fafcff;}
+.targets-panel-top #spt-targets-view .tg-compact h4,
+.targets-panel-top #spt-targets-view #sort-targets-right h4,
+.targets-panel-top #spt-targets-view .sort-tgt h4{font-size:12px;margin-bottom:8px;padding-bottom:6px;border-bottom:2px solid currentColor;letter-spacing:.5px;}
+/* Give the sparse SORT/SITE cards a tinted accent so they don't look empty next to IB/OB. */
+.targets-panel-top #spt-targets-view > #sort-targets-right{border-left:4px solid #6a1b9a;}
+.targets-panel-top #spt-targets-view > .sort-tgt{border-left:4px solid #2e7d32;}
+.targets-panel-top #spt-targets-view > .target-groups-row > .tg-compact:first-child{border-left:4px solid #1565c0;}
+.targets-panel-top #spt-targets-view > .target-groups-row > .tg-compact:last-child{border-left:4px solid #e65100;}
+
+#sb-root.dark-mode .targets-panel-top #spt-targets-view > .target-groups-row > .tg-compact,
+#sb-root.dark-mode .targets-panel-top #spt-targets-view > #sort-targets-right,
+#sb-root.dark-mode .targets-panel-top #spt-targets-view > .sort-tgt{background:#13294a!important;border-color:#2a4668!important;}
+/* flex-wrap handles narrow widths automatically; the flex-basis values let IB/OB sit together
+   and SORT/SITE wrap beneath when the banner gets too tight. */
 .panel-title{font-size:10px;color:#333;margin:0 0 6px;font-weight:600;}
 .target-groups-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
 .tg-compact h4{font-size:11px;margin-bottom:4px;color:#1565c0;font-weight:700;}
@@ -3506,6 +3604,8 @@ function buildCSS(){return `
 .day-table td:first-child,.day-table th:first-child{text-align:left;font-weight:700;}
 .day-table td:not(:first-child),.day-table th:not(:first-child){text-align:right;}
 .day-table tr.day-gap td{border:none;height:8px;padding:0;}
+.day-table tr.row-combined-bb td{font-weight:800;border-top:2px solid #000;background:rgba(21,101,192,0.06);}
+#sb-root.dark-mode .day-table tr.row-combined-bb td{background:rgba(100,181,246,0.12)!important;border-top-color:#888!important;}
 #sb-root.dark-mode .day-table td,#sb-root.dark-mode .day-table th{color:#e0e0e0!important;border-color:#444!important;}
 .target-input::-webkit-outer-spin-button,.target-input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
 .goal-summary-col{display:flex;flex-direction:column;gap:8px;}
@@ -5716,6 +5816,8 @@ function initBoard(){
         tab.classList.add('active');
         const target=document.getElementById('tab-'+tab.dataset.tab);
         if(target){target.classList.add('active');target.style.display='block';}
+        // Driving truck shows ONLY on the Sync tab.
+        {const tr=document.getElementById('sb-truck-road');if(tr)tr.style.display=(tab.dataset.tab==='sync')?'':'none';}
         window.scrollTo(0,0);
         // Auto-load the Hourly tab the first time it's opened.
         if(tab.dataset.tab==='hourly'){
