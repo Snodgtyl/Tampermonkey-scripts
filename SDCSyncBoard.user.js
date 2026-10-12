@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.11.4
+// @version      15.12.2
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -3090,7 +3090,7 @@ function updatePeriodDots(){
 function buildHTML(){return `
 <nav class="topnav"><div class="topnav-left"><span class="logo"><svg width="28" height="28" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="46" fill="#333A44" stroke="#4a9eff" stroke-width="4"/><path d="M25 65 L25 40 L50 28 L75 40 L75 65 Z" fill="none" stroke="#E8EAED" stroke-width="3" stroke-linejoin="round"/><line x1="25" y1="65" x2="75" y2="65" stroke="#E8EAED" stroke-width="3"/><rect x="30" y="45" width="16" height="20" fill="none" stroke="#E8EAED" stroke-width="2"/><line x1="30" y1="50" x2="46" y2="50" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="55" x2="46" y2="55" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="60" x2="46" y2="60" stroke="#E8EAED" stroke-width="1.5"/><rect x="54" y="48" width="14" height="17" fill="none" stroke="#E8EAED" stroke-width="2"/><rect x="57" y="52" width="4" height="5" fill="#E8EAED"/><rect x="62" y="55" width="3" height="4" fill="#E8EAED"/></svg></span><h1 class="site-title">FC Sync Board<span style="display:block;font-size:11px;font-weight:800;color:#146EB4;letter-spacing:.3px;margin-top:-1px;">by snodgtyl</span></h1>
 <div class="nav-tabs"><button class="nav-tab active" data-tab="sync">Sync IB-OB</button><button class="nav-tab" data-tab="hourly">Hourly</button><button class="nav-tab" data-tab="faststart">Fast Start</button><button class="nav-tab" data-tab="vrets">VRETs</button><button class="nav-tab" data-tab="eoswash">EOS Wash</button><button class="nav-tab" data-tab="settings">Settings</button></div></div>
-<div id="sb-truck-road" title="rolling"><div class="sb-truck"><svg width="46" height="22" viewBox="0 0 92 44" xmlns="http://www.w3.org/2000/svg"><g fill="none" stroke="#232F3E" stroke-width="3" stroke-linejoin="round"><rect x="2" y="6" width="54" height="26" rx="2" fill="#dbe7f6"/><path d="M56 14 h16 l10 10 v8 h-26 z" fill="#146EB4" stroke="#232F3E"/><rect x="60" y="16" width="10" height="8" rx="1" fill="#bfe0ff"/></g><g fill="#232F3E"><circle cx="18" cy="36" r="6"/><circle cx="40" cy="36" r="6"/><circle cx="74" cy="36" r="6"/></g><g fill="#9aa7b8"><circle cx="18" cy="36" r="2.4"/><circle cx="40" cy="36" r="2.4"/><circle cx="74" cy="36" r="2.4"/></g></svg></div></div>
+<div id="sb-truck-road" title="Peccy run"><div class="sb-peccy"><svg width="30" height="30" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><g class="sb-peccy-feet" fill="#E8780A"><rect x="22" y="55" width="8" height="7" rx="2.5"/><rect x="34" y="55" width="8" height="7" rx="2.5"/></g><ellipse cx="9" cy="36" rx="6" ry="7.5" fill="#FF9D14"/><ellipse cx="55" cy="36" rx="6" ry="7.5" fill="#FF9D14"/><rect x="12" y="4" width="40" height="54" rx="19" fill="#FF9D14"/><g fill="#fff" stroke="#1a2733" stroke-width="1.6"><ellipse cx="25" cy="22" rx="7" ry="8.5"/><ellipse cx="39" cy="22" rx="7" ry="8.5"/></g><g fill="#1a2733"><circle cx="26.5" cy="23" r="4.2"/><circle cx="40.5" cy="23" r="4.2"/></g><path d="M20 33 Q32 44 44 33" fill="none" stroke="#1a2733" stroke-width="3" stroke-linecap="round"/><g><path d="M18 40 h28 v16 a2 2 0 0 1 -2 2 h-24 a2 2 0 0 1 -2 -2 z" fill="#F59C00"/><rect x="23" y="40" width="4.5" height="18" fill="#FFE000"/><rect x="36.5" y="40" width="4.5" height="18" fill="#FFE000"/><rect x="18" y="47" width="28" height="4" fill="#FFE000"/></g></svg></div><div class="sb-boxes"><span class="sb-box"></span><span class="sb-box sb-box-dbl"></span></div></div>
 <div class="topnav-right"><select id="site-select" class="select-input"></select><select id="shift-select" class="select-input"><option value="Days">Days</option><option value="Nights">Nights</option></select>
 <div class="period-indicator"><span class="period-dot" id="dot-p1">P1</span><span class="period-dot" id="dot-p2">P2</span><span class="period-dot" id="dot-p3">P3</span></div>
 <button id="btn-fetch" class="btn btn-primary">\u25B6 Get Data</button><button id="btn-snip" class="btn btn-snip">\uD83D\uDCF7 Snip</button><button id="btn-dark" class="btn" style="background:#333;color:#fff;border-color:#333;">\u263D</button><button id="btn-exit" class="btn btn-danger">\u2715 Exit</button><span id="last-update" class="meta-text">Ready</span></div></nav>
@@ -3452,20 +3452,38 @@ function buildCSS(){return `
 .topnav{display:flex;align-items:center;justify-content:space-between;padding:6px 16px;background:#f0f0f0;border-bottom:2px solid #000;position:sticky;top:0;z-index:100;}
 .topnav-left{display:flex;align-items:center;gap:14px;}.topnav-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
 .logo{font-size:20px;display:flex;align-items:center;}.site-title{font-size:15px;font-weight:700;margin:0;white-space:nowrap;color:#000;}
-/* Driving semi animation between the nav tabs (Settings) and the site selector. A little truck
-   drives left->right on repeat along a dashed road. Shown ONLY on the Sync tab (toggled in JS). */
-/* The road is a FLEX-GROW middle child of the top nav, so it fills the whole gap between the
-   Settings tab and the site selector and auto-resizes with the window / zoom. The truck starts
-   just after Settings (left:0) and drives all the way across to the site selector (left:100%),
-   using translateX(-100%) at the end so the truck fully exits before looping. */
+/* Chrome-dino-style endless runner, Amazon flavour: a fixed PECCY mascot jogs in place near the
+   left while brown boxes scroll in from the right, and Peccy HOPS to clear them — same loop as the
+   offline T-rex game. Shown ONLY on the Sync tab (toggled in JS). The road is a FLEX-GROW middle
+   child of the top nav, so it fills the gap between the Settings tab and the site selector and
+   auto-resizes with the window / zoom. The box-scroll and Peccy-hop cycles share the same 2.4s
+   period so Peccy is airborne exactly when a box reaches him. */
 #sb-truck-road{position:relative;flex:1 1 auto;min-width:40px;height:26px;overflow:hidden;border-bottom:2px dashed #9aa7b8;margin:0 8px;align-self:center;}
-#sb-truck-road .sb-truck{position:absolute;bottom:1px;left:0;animation:sbTruckDrive 4s linear infinite;}
-#sb-truck-road .sb-truck svg{display:block;animation:sbTruckBounce .4s ease-in-out infinite;}
-@keyframes sbTruckDrive{0%{left:0;transform:translateX(-100%);}100%{left:100%;transform:translateX(0);}}
-@keyframes sbTruckBounce{0%,100%{transform:translateY(0);}50%{transform:translateY(-1px);}}
-@media(prefers-reduced-motion:reduce){#sb-truck-road .sb-truck{animation:none;left:50%;transform:translateX(-50%);}#sb-truck-road .sb-truck svg{animation:none;}}
+/* SYNC MODEL (width-independent): both Peccy and the boxes are positioned with LEFT PERCENTAGES
+   of the same container, so "left:34%" is the identical screen point for both at ANY road width.
+   Peccy stands at left:34%. Each box travels left:104% -> left:-12% over 3.2s, so it sits at 34%
+   at phase (104-34)/(104+12)=0.60 of its cycle. Two boxes are spread half a period apart (delays
+   0, 1.6s) so one box reaches the 34% mark every 1.6s; Peccy's hop loop is 1.6s (negative delay
+   aligns the peak), so he is at the top of a calm, slow hop each time a box passes under him. */
+#sb-truck-road .sb-peccy{position:absolute;bottom:1px;left:34%;z-index:2;animation:sbPeccyHop 1.6s cubic-bezier(.33,0,.3,1) -.47s infinite;}
+#sb-truck-road .sb-peccy svg{display:block;}
+/* Feet shuffle while running. */
+#sb-truck-road .sb-peccy-feet rect{animation:sbPeccyFeet .18s steps(2) infinite;transform-origin:center bottom;}
+#sb-truck-road .sb-peccy-feet rect:nth-child(2){animation-delay:.09s;}
+/* Boxes scroll right -> left in pure % so the sync holds at every width. */
+#sb-truck-road .sb-boxes{position:absolute;inset:0;z-index:1;}
+#sb-truck-road .sb-box{position:absolute;bottom:1px;width:10px;height:10px;background:#C8873F;border:1px solid #7d4f22;border-radius:1px;
+  background-image:linear-gradient(#8a5a28 0 0),linear-gradient(#e4bd8c 0 0);background-size:2px 100%,100% 2px;background-repeat:no-repeat;background-position:center,center;
+  left:104%;animation:sbBoxScroll 3.2s linear infinite;}
+#sb-truck-road .sb-box.sb-box-dbl{height:15px;}
+#sb-truck-road .sb-box:nth-child(1){animation-delay:0s;}
+#sb-truck-road .sb-box:nth-child(2){animation-delay:1.6s;}
+/* Grounded, then a sharp hop that peaks at ~55-60% (when the box is under Peccy). */
+@keyframes sbPeccyHop{0%,20%{transform:translateY(0);}42%{transform:translateY(-16px) rotate(-4deg);}57%{transform:translateY(-16px) rotate(3deg);}80%,100%{transform:translateY(0);}}
+@keyframes sbPeccyFeet{0%{transform:translateY(0);}100%{transform:translateY(-2px);}}
+@keyframes sbBoxScroll{0%{left:104%;}100%{left:-12%;}}
+@media(prefers-reduced-motion:reduce){#sb-truck-road .sb-peccy,#sb-truck-road .sb-peccy-feet rect,#sb-truck-road .sb-box{animation:none;}#sb-truck-road .sb-box{display:none;}#sb-truck-road .sb-peccy{left:50%;transform:translateX(-50%);}}
 #sb-root.dark-mode #sb-truck-road{border-bottom-color:#55657a;}
-#sb-root.dark-mode #sb-truck-road .sb-truck svg g[stroke]{stroke:#cdd6e4;}
 .nav-tabs{display:flex;gap:4px;}.nav-tab{padding:5px 12px;border:1px solid #000;background:#fff;color:#333;border-radius:4px;cursor:pointer;font-size:12px;font-weight:500;transition:background .22s ease,color .22s ease,transform .15s ease,box-shadow .22s ease;}
 .nav-tab:hover{background:#e0e0e0;color:#000;transform:translateY(-1px);}
 .nav-tab.active{background:#2e7d32;color:#fff;border-color:#2e7d32;box-shadow:0 2px 8px rgba(46,125,50,.4);animation:tabPop .25s ease;}
