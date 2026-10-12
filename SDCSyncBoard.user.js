@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.11.3
+// @version      15.11.4
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -5577,7 +5577,7 @@ function addLaunchBtn(){
             // Default: right edge, vertically centered (clear of FCLM's top search box, the
             // bottom-left "Analyze Fast Starts" button, and the data table). Draggable; a saved
             // position overrides this via the inline style set below.
-            '#sb-launch{position:fixed;top:50%;right:20px;transform:translateY(-50%);z-index:99999;display:flex;align-items:center;gap:12px;'+
+            '#sb-launch{position:fixed;top:50%;left:20px;right:auto;width:max-content;max-width:90vw;transform:translateY(-50%);z-index:99999;display:flex;align-items:center;gap:12px;'+
             'padding:18px 34px;border-radius:60px;cursor:grab;color:#fff;overflow:hidden;isolation:isolate;'+
             "font:900 23px/1 'Segoe UI',sans-serif;letter-spacing:.5px;white-space:nowrap;text-shadow:0 2px 6px rgba(0,0,0,.35);"+
             'background:linear-gradient(135deg,#0d47a1 0%,#1565c0 35%,#4a9eff 65%,#00c6ff 100%);'+
@@ -5611,7 +5611,7 @@ function addLaunchBtn(){
             const bw=b.offsetWidth||220, bh=b.offsetHeight||64;
             const maxL=Math.max(4,window.innerWidth-bw-4), maxT=Math.max(4,window.innerHeight-bh-4);
             const L=Math.min(Math.max(4,pos.left),maxL), T=Math.min(Math.max(4,pos.top),maxT);
-            b.style.left=L+'px';b.style.top=T+'px';b.style.transform='none';
+            b.style.left=L+'px';b.style.top=T+'px';b.style.right='auto';b.style.transform='none';
         }
     }catch(e){}
     makeLaunchDraggable(b);
@@ -5658,8 +5658,9 @@ function makeLaunchDraggable(b){
         dragging=true;moved=false;
         const r=b.getBoundingClientRect();
         ox=r.left;oy=r.top;sx=pt.clientX;sy=pt.clientY;
-        // Switch to left/top positioning so dragging is 1:1 (drop the translateX centering).
-        b.style.left=ox+'px';b.style.top=oy+'px';b.style.transform='none';
+        // Switch to left/top positioning so dragging is 1:1 (drop the translateY centering).
+        // Clear `right` too: leaving both left+right set would stretch the button across the page.
+        b.style.left=ox+'px';b.style.top=oy+'px';b.style.right='auto';b.style.transform='none';
         b.classList.add('sb-dragging');
         document.addEventListener('mousemove',onMove);document.addEventListener('mouseup',onUp);
         document.addEventListener('touchmove',onMove,{passive:false});document.addEventListener('touchend',onUp);
