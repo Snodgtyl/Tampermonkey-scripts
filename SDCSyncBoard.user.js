@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.16.1
+// @version      15.19.1
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -70,6 +70,9 @@ const PROCESS_IDS = { stow:'1003035', palletStow:'1003041', pick:'1003065', sort
     // toDock '1003022' (no leading zero) matches the user's confirmed-working Dock Pallet Loader
     // report URL (processId=1003022), which provides the pallet-loaded Case-UNIT volume.
     toFluidLoad:'01785143661476', toDock:'1003022',
+    // Palletize - Tote (ScanToteToPallet): totes palletized + loaded = loaded freight. Jobs feed
+    // DA loaded volume + Site CPLH (together with the Fluid Load - Tote units). Sort sites.
+    palletizeTote:'01785143680335',
     // Transfer Out Support (its own FCLM functionRollup process). Provides the support hours shown
     // on the EOS Wash "Transfer Out Support" row + used in its Hours Variance. tfoot Total Paid
     // Hours is the value we read (e.g. 56.17 for the KRB3 10/8 night shift).
@@ -129,11 +132,17 @@ const SLACK_SOS_DEFAULT='https://hooks.slack.com/triggers/E015GUGD2V6/1175179441
 const SLACK_JOB_BALANCE_DEFAULT='https://hooks.slack.com/triggers/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';
 const SLACK_SOS_KEY='syncboard_slack_sos_url';
 const SLACK_JOB_BALANCE_KEY='syncboard_slack_jobbalance_url';
+// Fast Start snapshot Slack trigger. No hardcoded default yet (user will supply the webhook via
+// Settings); until then it posts nowhere (postToSlack no-ops on empty URL) but still saves locally.
+const SLACK_FASTSTART_DEFAULT='';
+const SLACK_FASTSTART_KEY='syncboard_slack_faststart_url';
 // Read the per-browser override if one was saved in Settings; otherwise use the hardcoded
 // default so the triggers always work. A saved empty string ('') intentionally disables it.
 function getSlackSosUrl(){try{const v=localStorage.getItem(SLACK_SOS_KEY);return v!=null?v:SLACK_SOS_DEFAULT;}catch(e){return SLACK_SOS_DEFAULT;}}
 function getSlackJobBalanceUrl(){try{const v=localStorage.getItem(SLACK_JOB_BALANCE_KEY);return v!=null?v:SLACK_JOB_BALANCE_DEFAULT;}catch(e){return SLACK_JOB_BALANCE_DEFAULT;}}
+function getSlackFastStartUrl(){try{const v=localStorage.getItem(SLACK_FASTSTART_KEY);return v!=null?v:SLACK_FASTSTART_DEFAULT;}catch(e){return SLACK_FASTSTART_DEFAULT;}}
 const SOS_LOG_KEY='syncboard_sosLog_v1';
+const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 
 function flowCageDensity(site,mode){
     const t=mode==='load'?SITE_CAGE_DENSITY_LOAD:SITE_CAGE_DENSITY_STOW;
@@ -182,6 +191,47 @@ function postSosToSlack(rec){
     const message='SOS Cages | '+dir+rec.site+' | '+Math.round(rec.cages)+' cages @ density '+rec.density+
         ' (~'+Math.round(cases)+' cases) | '+fmtSlackTime(rec.savedAt);
     postToSlack(getSlackSosUrl(),{message},'SOS Slack webhook');
+}
+// --- Fast Start snapshots (Option A): capture the computed Fast Start metrics at a moment
+// (SOS or after 1st break), save locally, and post a readable summary to the Fast Start Slack
+// trigger. Mirrors the SOS cage save: local log + Slack. `moment` is 'SOS' | '1st Break'. ---
+function loadFastStartLog(){try{const s=localStorage.getItem(FASTSTART_LOG_KEY);const a=s?JSON.parse(s):[];return Array.isArray(a)?a:[];}catch(e){return[];}}
+function saveFastStartLog(log){try{localStorage.setItem(FASTSTART_LOG_KEY,JSON.stringify(log));}catch(e){}}
+// Build the per-process metric summary from the last Fast Start run (fsLastResults).
+function fastStartSnapshot(moment,site,goal){
+    const byProc={};
+    (fsLastResults||[]).forEach(r=>{(byProc[r.process]=byProc[r.process]||[]).push(r.minutesToFirst);});
+    const procs={};
+    Object.keys(byProc).forEach(p=>{const m=fsComputeMetrics(byProc[p],goal);procs[p]={tp90:m.tp90,avg:m.avg,count:m.count,overGoal:m.overGoal,minutesLost:m.minutesLost};});
+    // Site-wide roll-up across all processes.
+    const allTimes=(fsLastResults||[]).map(r=>r.minutesToFirst);
+    const overall=fsComputeMetrics(allTimes,goal);
+    return{moment,site:String(site||'').toUpperCase(),goal:Number(goal)||0,savedAt:new Date().toISOString(),
+        overall:{tp90:overall.tp90,avg:overall.avg,count:overall.count,overGoal:overall.overGoal,minutesLost:overall.minutesLost},
+        procs};
+}
+// Save a Fast Start snapshot locally and post to Slack. Called by the two tab buttons.
+function saveFastStartSnapshot(moment){
+    const site=document.getElementById('fs-site')?.value||loadConfig().site;
+    const goal=parseInt(document.getElementById('fs-goal-time')?.value,10)||20;
+    if(!fsLastResults||!fsLastResults.length){
+        fsShowStatus('\u26A0 Run Fast Start first \u2014 nothing to save for '+moment,'error');
+        return;
+    }
+    const snap=fastStartSnapshot(moment,site,goal);
+    const log=loadFastStartLog();log.push(snap);saveFastStartLog(log);
+    postFastStartToSlack(snap);
+    const o=snap.overall;
+    fsShowStatus('\u2713 Saved '+moment+' Fast Start \u2014 TP90 '+(o.tp90==null?'\u2014':o.tp90.toFixed(1))+'m, '+o.count+' AAs ('+new Date().toLocaleTimeString()+')','success');
+}
+// Readable Slack summary: headline overall TP90 + over-goal, then a per-process TP90 breakdown.
+function postFastStartToSlack(snap){
+    const o=snap.overall;
+    const procStr=Object.keys(snap.procs).map(p=>{const m=snap.procs[p];return p+' '+(m.tp90==null?'\u2014':m.tp90.toFixed(1))+'m';}).join(' \u00b7 ');
+    const message='Fast Start | '+snap.moment+' | '+snap.site+' | TP90 '+(o.tp90==null?'\u2014':o.tp90.toFixed(1))+'m vs '+snap.goal+'m goal'+
+        ' | '+o.count+' AAs \u00b7 '+o.overGoal+' over goal \u00b7 '+o.minutesLost.toFixed(0)+' min lost'+
+        (procStr?' | '+procStr:'')+' | '+fmtSlackTime(snap.savedAt);
+    postToSlack(getSlackFastStartUrl(),{message},'Fast Start Slack webhook');
 }
 // Job-balance Slack message posted when a flow view is fetched.
 function postJobBalanceToSlack(s){
@@ -535,14 +585,45 @@ function fnRollupTotalNums(html){
 // e.g. [18.00, 6011, 333.95, 52224, 2901.38, 6011, 333.95] -> jobs=6011, cases=6011.
 // We keep the original "Total jobs" basis (index 1) as the loaded-volume driver.
 function parseToFluidLoad(html){
-    const {nums,headcount}=fnRollupTotalNums(html);
+    const {nums,headcount,doc}=fnRollupTotalNums(html);
     const paidHours=nums.length>=1?nums[0]:0;
     const jobs=nums.length>=2?Math.round(nums[1]):0;
     const jph=nums.length>=3?nums[2]:0;
     const eachUnits=nums.length>=4?Math.round(nums[3]):0;
     const caseUnits=nums.length>=6?Math.round(nums[5]):0;
-    if(jobs>0||caseUnits>0)dbg('[SB-TO fluid] jobs='+jobs+' cases='+caseUnits+' each='+eachUnits+' jph='+jph+' hrs='+paidHours+' hc='+headcount);
-    return{jobs,caseUnits,eachUnits,jph,directHours:paidHours,headcount};
+    // LOADED FLUID TOTES: the "Fluid Load - Tote" FUNCTION block's Total-row Tote-UNIT. These totes
+    // are loaded freight (counted as cases) and feed DA loaded volume + Site CPLH. The function's
+    // Total row numerics are [paidHours, caseJobs, caseJPH, toteEach-UNIT, toteEach-UPH, Tote-UNIT,
+    // Tote-UPH]; Tote-UNIT = index 5 (e.g. 57). Parsed from the function block (not tfoot) so it
+    // isn't conflated with the Fluid Load - Case group. 0 if the function is absent.
+    let fluidToteUnits=0;
+    if(doc){
+        const rows=doc.querySelectorAll('tr');let inTote=false;
+        for(const row of rows){
+            const link=row.querySelector('a');const name=link?link.textContent.trim():'';
+            if(name){inTote=/fluid\s*load.*tote/i.test(name);}  // enter/leave on each named function
+            if(!inTote)continue;
+            const tds=row.querySelectorAll('td');
+            if(Array.from(tds).some(td=>td.textContent.trim()==='Total')){
+                const n=[];tds.forEach(td=>{if(td.className.indexOf('numeric')!==-1){const v=parseFloat(td.textContent.replace(/,/g,''));if(!isNaN(v))n.push(v);}});
+                if(n.length>=6)fluidToteUnits=Math.round(n[5]);
+                break;
+            }
+        }
+    }
+    if(jobs>0||caseUnits>0)dbg('[SB-TO fluid] jobs='+jobs+' cases='+caseUnits+' each='+eachUnits+' jph='+jph+' fluidToteUnits='+fluidToteUnits+' hrs='+paidHours+' hc='+headcount);
+    return{jobs,caseUnits,eachUnits,jph,fluidToteUnits,directHours:paidHours,headcount};
+}
+// "Palletize - Tote" / ScanToteToPallet report (processId 01785143680335). Totes that were
+// palletized and loaded = loaded freight (counted as cases). We take the Jobs column (tfoot
+// index 1, e.g. 2209). Added to DA loaded volume + Site CPLH alongside the Fluid Load totes.
+// 0/absent on sites without this report.
+function parsePalletizeTote(html){
+    const {nums,headcount}=fnRollupTotalNums(html);
+    const paidHours=nums.length>=1?nums[0]:0;
+    const jobs=nums.length>=2?Math.round(nums[1]):0;
+    if(jobs>0)dbg('[SB-PalletizeTote] jobs='+jobs+' hrs='+paidHours+' hc='+headcount);
+    return{jobs,directHours:paidHours,headcount};
 }
 // "Transfer Out Dock" report (processId 1003022). Pallet-loaded cases for TO loaded volume.
 // tfoot Total numerics are [paidHours, Jobs, JPH, Case-UNIT, Case-UPH, Pallet-UNIT, Pallet-UPH]
@@ -642,13 +723,15 @@ async function fetchPeriod(site,startDate,sched){
     // Add the per-path RC-sort reports (each a FunctionRollup). Keyed sort_<path> so they share the
     // generic parser and the same fetch loop; aggregated into res.sort below.
     Object.entries(SORT_PATHS).forEach(([k,pid])=>{urls['sort_'+k]=buildFnUrl(site,pid,sDate,sh,sm,eDate,eh,em);});
+    // Palletize - Tote report (loaded palletized totes). Parsed by parsePalletizeTote below.
+    urls.palletizeTote=buildFnUrl(site,PROCESS_IDS.palletizeTote,sDate,sh,sm,eDate,eh,em);
     const res={};
     // Dispatch each report to its parser. PPR uses parsePPR; the split TO reports use their own
     // parsers; everything else (incl. each sort_* path) uses the generic fn-rollup parser.
-    const parseFor=(k,h)=>{if(k==='ppr')return parsePPR(h);if(k==='toFluidLoad')return parseToFluidLoad(h);if(k==='toDock')return parseToDock(h);
+    const parseFor=(k,h)=>{if(k==='ppr')return parsePPR(h);if(k==='toFluidLoad')return parseToFluidLoad(h);if(k==='toDock')return parseToDock(h);if(k==='palletizeTote')return parsePalletizeTote(h);
         if(k==='sort_rcSortSupport'){const base=parseFnRollup(h);base.totes=parseToteWrangled(h);return base;}
         return parseFnRollup(h);};
-    const emptyFor=(k)=>{if(k==='ppr')return{ibPlannedHrs:0,ibActualHrs:0,obPlannedHrs:0,obActualHrs:0,daTransferHrs:0,daTransferPlan:0,caseStowReserveHrs:0,throughputVol:0,throughputHrs:0,totHrs:0};if(k==='toFluidLoad')return{jobs:0,caseUnits:0,eachUnits:0,jph:0,directHours:0,headcount:0};if(k==='toDock')return{caseUnits:0,palletUnits:0,jobs:0,directHours:0,headcount:0};return{totalUnits:0,directHours:0,rate:0,headcount:0};};
+    const emptyFor=(k)=>{if(k==='ppr')return{ibPlannedHrs:0,ibActualHrs:0,obPlannedHrs:0,obActualHrs:0,daTransferHrs:0,daTransferPlan:0,caseStowReserveHrs:0,throughputVol:0,throughputHrs:0,totHrs:0};if(k==='toFluidLoad')return{jobs:0,caseUnits:0,eachUnits:0,jph:0,fluidToteUnits:0,directHours:0,headcount:0};if(k==='toDock')return{caseUnits:0,palletUnits:0,jobs:0,directHours:0,headcount:0};if(k==='palletizeTote')return{jobs:0,directHours:0,headcount:0};return{totalUnits:0,directHours:0,rate:0,headcount:0};};
     await Promise.all(Object.entries(urls).map(async([k,u])=>{try{const h=await fetchHTML(u);res[k]=parseFor(k,h);}catch(e){console.warn('[SB]',k,e.message);res[k]=emptyFor(k);}}));
     res.sort=aggregateSort(res);
     return res;
@@ -1782,21 +1865,23 @@ async function fetchDayData(site,dayOffset){
         const palletStowUrl=buildFnUrl(site,PROCESS_IDS.palletStow,start,0,0,end,eh,em);
         const toFluidUrl=buildFnUrl(site,PROCESS_IDS.toFluidLoad,start,0,0,end,eh,em);
         const toDockUrl=buildFnUrl(site,PROCESS_IDS.toDock,start,0,0,end,eh,em);
-        // RC Sort Support (tote-wrangle totes = loaded freight) for sort sites. 0 at non-sort sites.
-        const rcSupportUrl=buildFnUrl(site,SORT_PATHS.rcSortSupport,start,0,0,end,eh,em);
+        // Palletize - Tote (loaded palletized totes) for sort sites. 0 at non-sort sites. Combined
+        // with the Fluid Load - Tote units (parsed from the TO Fluid Load report below) = loaded totes.
+        const palletizeToteUrl=buildFnUrl(site,PROCESS_IDS.palletizeTote,start,0,0,end,eh,em);
         // PPR over the window for the hours (IB actual, DA transfer, throughput).
         const pprUrl=buildPPRUrl(site,start,0,0,end,eh,em);
         // VRET actual = Vendor Return PACK EACH-Total over the day window (same source + basis the
         // VRETs tab uses via vretFetchOne). Compared against the GalaxyBI Vendor Returns LP plan.
-        const [stowHtml,palletStowHtml,toFluidHtml,toDockHtml,rcSupportHtml,pprHtml,vretPackVol]=await Promise.all([
-            fetchHTML(stowUrl),fetchHTML(palletStowUrl),fetchHTML(toFluidUrl),fetchHTML(toDockUrl),fetchHTML(rcSupportUrl),fetchHTML(pprUrl),
+        const [stowHtml,palletStowHtml,toFluidHtml,toDockHtml,palletizeToteHtml,pprHtml,vretPackVol]=await Promise.all([
+            fetchHTML(stowUrl),fetchHTML(palletStowUrl),fetchHTML(toFluidUrl),fetchHTML(toDockUrl),fetchHTML(palletizeToteUrl),fetchHTML(pprUrl),
             vretFetchOne(site,PROCESS_IDS.vretPack,start,0,0,end,eh,em)
         ]);
         const stow=parseFnRollup(stowHtml);
         const pStow=parseFnRollup(palletStowHtml);
         const toFluid=parseToFluidLoad(toFluidHtml);
         const toDock=parseToDock(toDockHtml);
-        const sortTotesLoaded=(parseToteWrangled(rcSupportHtml)||{}).total||0;
+        // Loaded totes = Fluid Load - Tote units + Palletize - Tote jobs (loaded freight).
+        const sortTotesLoaded=(toFluid.fluidToteUnits||0)+((parsePalletizeTote(palletizeToteHtml)||{}).jobs||0);
         const ppr=parsePPR(pprHtml);
         const palletCases=pStow.palletCases||0;
         const ibVol=(stow.totalUnits||0)+palletCases;
@@ -2675,12 +2760,15 @@ function processData(raw){
         // The TO loaded volume was split into two reports; sum them here. Fall back to the legacy
         // single obDock.fluidLoadJobs only if neither new report returned anything.
         const toLoaded=(toFluid.jobs||0)+(toDock.caseUnits||0);
-        // SORT SITES: totes loaded via RC Sort Support *_ToteWrangle are loaded freight and count
-        // toward DA/OB loaded volume (as cartons). Additive — NOT already in TO Fluid Load or Dock.
-        // 0 on non-sort sites (no RC Sort Support). This flows into Site CPLH's loaded-volume numerator.
-        const sortTotesLoaded=sort.totesLoaded||0;
-        const loadedUnits=(toLoaded>0?toLoaded:(obDock.fluidLoadJobs||0))+sortTotesLoaded;
-        console.warn('[SB-DA loaded] toFluidJobs='+(toFluid.jobs||0)+' toDockCases='+(toDock.caseUnits||0)+' sortTotesLoaded='+sortTotesLoaded+' => loadedUnits='+loadedUnits);
+        // LOADED TOTES (sort sites) = Fluid Load - Tote units (toFluid.fluidToteUnits, e.g. 57) +
+        // Palletize - Tote jobs (palletizeTote.jobs, e.g. 2209). Both are loaded freight (cases) and
+        // are ADDITIVE to DA/OB loaded volume + the Site CPLH numerator. (Corrected: this is the
+        // Fluid Load/Palletized tote volume, NOT the RC Sort Support "tote wrangled" number.)
+        // 0 on sites without these reports. Denominator (throughput hrs) already includes their hours.
+        const palletizeTote=d.palletizeTote||{};
+        const loadedTotes=(toFluid.fluidToteUnits||0)+(palletizeTote.jobs||0);
+        const loadedUnits=(toLoaded>0?toLoaded:(obDock.fluidLoadJobs||0))+loadedTotes;
+        console.warn('[SB-DA loaded] toFluidJobs='+(toFluid.jobs||0)+' toDockCases='+(toDock.caseUnits||0)+' fluidToteUnits='+(toFluid.fluidToteUnits||0)+' palletizeToteJobs='+(palletizeTote.jobs||0)+' => loadedUnits='+loadedUnits);
         m.ob[p]={pickUnits:pick.totalUnits||0,loadedUnits:loadedUnits,
             // periodPick / periodLoaded stay per-period (that time window only). syncLoaded is the
             // cumulative running total used ONLY by the OB Sync Metrics row.
@@ -2695,9 +2783,10 @@ function processData(raw){
             // Density (units/case): prefer the new TO Fluid Load report's each/case; fall back to legacy obDock.
             density:(toFluid.caseUnits||0)>0?(toFluid.eachUnits||0)/(toFluid.caseUnits||1):((obDock.caseUnits||0)>0?(obDock.eachUnits||0)/(obDock.caseUnits||1):0),
             directHC:dur>0?obPickDH/dur:0,indirectHC:dur>0?obIndirect/dur:0,
-            // Totes loaded (sort sites) folded into loadedUnits above; also surfaced as its own
-            // DA display row. 0 on non-sort sites.
-            totesLoaded:sortTotesLoaded,periodTotesLoaded:sortTotesLoaded,
+            // Loaded totes (Fluid Load tote + Palletize tote) folded into loadedUnits above; also
+            // surfaced as its own DA display row. 0 on non-sort sites.
+            totesLoaded:loadedTotes,periodTotesLoaded:loadedTotes,
+            fluidToteUnits:(toFluid.fluidToteUnits||0),palletizeToteJobs:(palletizeTote.jobs||0),
             pprPlannedHrs:daPlan,pprActualHrs:daHrs,
             pctToOP:daPlan>0?(daHrs/daPlan)*100:0};
         // Sort now aggregates RC-sort paths (see aggregateSort): totalUnits = throughput units,
@@ -2923,6 +3012,15 @@ function renderSort(m){
         setEl('sort-totes-p1',fmt(p1.totesLoaded));setEl('sort-totes-p2',fmt(p2.totesLoaded));setEl('sort-totes-p3',fmt(p3.totesLoaded));setEl('sort-totes-total',fmt(f.totesLoaded));
     }
     setEl('sort-units-p1',fmt(p1.totalUnits));setEl('sort-units-p2',fmt(p2.totalUnits));setEl('sort-units-p3',fmt(p3.totalUnits));setEl('sort-units-total',fmt(f.totalUnits));
+    // Loaded totes (Fluid Load tote + Palletize tote) — the DA-freight value, pulled from m.ob
+    // (same number shown on the OUTBOUND "Totes Loaded" row). Shown here too for the sort crew.
+    const ob=m.ob||{},obF=ob.full||{},obP1=ob.p1||{},obP2=ob.p2||{},obP3=ob.p3||{};
+    const ltRow=document.getElementById('sort-loadedtotes-row');
+    if(ltRow)ltRow.style.display=(obF.totesLoaded||0)>0?'':'none';
+    if((obF.totesLoaded||0)>0){
+        const lt=(pp)=>pp.periodTotesLoaded!=null?pp.periodTotesLoaded:(pp.totesLoaded||0);
+        setEl('sort-ltotes-p1',fmt(lt(obP1)));setEl('sort-ltotes-p2',fmt(lt(obP2)));setEl('sort-ltotes-p3',fmt(lt(obP3)));setEl('sort-ltotes-total',fmt(obF.totesLoaded||0));
+    }
     setEl('sort-rate-p1',fmt(p1.rate,1));setEl('sort-rate-p2',fmt(p2.rate,1));setEl('sort-rate-p3',fmt(p3.rate,1));setEl('sort-rate-total',fmt(f.rate,1));
     setEl('sort-dhrs-p1',fmt(p1.directHours,2));setEl('sort-dhrs-p2',fmt(p2.directHours,2));setEl('sort-dhrs-p3',fmt(p3.directHours,2));setEl('sort-dhrs-total',fmt(f.directHours,2));
     setEl('sort-shrs-p1',fmt(p1.supportHours,2));setEl('sort-shrs-p2',fmt(p2.supportHours,2));setEl('sort-shrs-p3',fmt(p3.supportHours,2));setEl('sort-shrs-total',fmt(f.supportHours,2));
@@ -3258,7 +3356,8 @@ function updatePeriodDots(){
 function buildHTML(){return `
 <nav class="topnav"><div class="topnav-left"><span class="logo"><svg width="28" height="28" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="46" fill="#333A44" stroke="#4a9eff" stroke-width="4"/><path d="M25 65 L25 40 L50 28 L75 40 L75 65 Z" fill="none" stroke="#E8EAED" stroke-width="3" stroke-linejoin="round"/><line x1="25" y1="65" x2="75" y2="65" stroke="#E8EAED" stroke-width="3"/><rect x="30" y="45" width="16" height="20" fill="none" stroke="#E8EAED" stroke-width="2"/><line x1="30" y1="50" x2="46" y2="50" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="55" x2="46" y2="55" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="60" x2="46" y2="60" stroke="#E8EAED" stroke-width="1.5"/><rect x="54" y="48" width="14" height="17" fill="none" stroke="#E8EAED" stroke-width="2"/><rect x="57" y="52" width="4" height="5" fill="#E8EAED"/><rect x="62" y="55" width="3" height="4" fill="#E8EAED"/></svg></span><h1 class="site-title">FC Sync Board<span style="display:block;font-size:11px;font-weight:800;color:#146EB4;letter-spacing:.3px;margin-top:-1px;">by snodgtyl</span></h1>
 <div class="nav-tabs"><button class="nav-tab active" data-tab="sync">Sync IB-OB</button><button class="nav-tab" data-tab="hourly">Hourly</button><button class="nav-tab" data-tab="faststart">Fast Start</button><button class="nav-tab" data-tab="vrets">VRETs</button><button class="nav-tab" data-tab="eoswash" style="display:none;">EOS Wash</button><button class="nav-tab" data-tab="settings">Settings</button></div></div>
-<div id="sb-truck-road" title="Peccy run"><div class="sb-peccy"><svg width="30" height="30" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><g class="sb-peccy-feet" fill="#E8780A"><rect x="22" y="55" width="8" height="7" rx="2.5"/><rect x="34" y="55" width="8" height="7" rx="2.5"/></g><ellipse cx="9" cy="36" rx="6" ry="7.5" fill="#FF9D14"/><ellipse cx="55" cy="36" rx="6" ry="7.5" fill="#FF9D14"/><rect x="12" y="4" width="40" height="54" rx="19" fill="#FF9D14"/><g fill="#fff" stroke="#1a2733" stroke-width="1.6"><ellipse cx="25" cy="22" rx="7" ry="8.5"/><ellipse cx="39" cy="22" rx="7" ry="8.5"/></g><g fill="#1a2733"><circle cx="26.5" cy="23" r="4.2"/><circle cx="40.5" cy="23" r="4.2"/></g><path d="M20 33 Q32 44 44 33" fill="none" stroke="#1a2733" stroke-width="3" stroke-linecap="round"/><g><path d="M18 40 h28 v16 a2 2 0 0 1 -2 2 h-24 a2 2 0 0 1 -2 -2 z" fill="#F59C00"/><rect x="23" y="40" width="4.5" height="18" fill="#FFE000"/><rect x="36.5" y="40" width="4.5" height="18" fill="#FFE000"/><rect x="18" y="47" width="28" height="4" fill="#FFE000"/></g></svg></div><div class="sb-boxes"><span class="sb-box"></span><span class="sb-box sb-box-dbl"></span></div></div>
+<div id="sb-truck-road" title="SDC Sync Board"><div class="sb-banner"><span class="sb-banner-smile" aria-hidden="true"></span><span class="sb-banner-text">S D C &nbsp;&middot;&nbsp; S Y N C &nbsp;&middot;&nbsp; B O A R D</span><span class="sb-banner-smile" aria-hidden="true"></span></div></div>
+<div id="sb-truck-road-OLD" style="display:none;" title="Peccy at the beach"><svg class="sb-scene" viewBox="0 0 300 30" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="sbSky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#d8f1ff"/></linearGradient><linearGradient id="sbSea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2bb3c0"/><stop offset="1" stop-color="#1f8fb0"/></linearGradient><linearGradient id="sbSand" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f6e3b4"/><stop offset="1" stop-color="#eccf8c"/></linearGradient></defs><rect x="0" y="0" width="300" height="30" fill="url(#sbSky)"/><g class="sb-sun"><circle cx="252" cy="9" r="6" fill="#FFD34E"/><circle cx="252" cy="9" r="9" fill="#FFD34E" opacity=".25"/></g><g class="sb-cloud" opacity=".9"><ellipse cx="60" cy="7" rx="11" ry="3.4" fill="#fff"/><ellipse cx="70" cy="8" rx="8" ry="3" fill="#fff"/></g><g class="sb-cloud2" opacity=".8"><ellipse cx="150" cy="5" rx="9" ry="3" fill="#fff"/><ellipse cx="158" cy="6" rx="6" ry="2.4" fill="#fff"/></g><rect x="0" y="15" width="300" height="9" fill="url(#sbSea)"/><path class="sb-wave" d="M0 16 q10 2 20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0" fill="none" stroke="#bfeef4" stroke-width="1" opacity=".7"/><rect x="0" y="23" width="300" height="7" fill="url(#sbSand)"/><g transform="translate(214,2)"><rect x="9" y="3" width="2.5" height="18" rx="1.2" fill="#8a5a2b"/><g class="sb-palm"><path d="M10 4 q-11 -3 -17 2 q10 -1 17 1" fill="#2e9b4e"/><path d="M10 4 q11 -3 17 2 q-10 -1 -17 1" fill="#36b05c"/><path d="M10 4 q-5 -9 -13 -9 q7 4 13 10" fill="#2e9b4e"/><path d="M10 4 q5 -9 13 -9 q-7 4 -13 10" fill="#36b05c"/></g><circle cx="7" cy="7" r="1.3" fill="#6b4423"/><circle cx="13" cy="7" r="1.3" fill="#6b4423"/></g><g class="sb-peccy-g" transform="translate(16,6)"><ellipse cx="12" cy="20" rx="11" ry="2" fill="rgba(0,0,0,.12)"/><rect x="2" y="0" width="20" height="20" rx="9" fill="#FF9D14"/><g class="sb-peccy-arm"><rect x="20" y="4" width="4" height="8" rx="2" fill="#FF9D14"/></g><g fill="#1a2733"><rect x="5" y="6" width="6.5" height="3.4" rx="1.4"/><rect x="12.5" y="6" width="6.5" height="3.4" rx="1.4"/><rect x="11" y="7" width="2" height="1.2"/></g><path d="M8 13 Q12 16.5 16 13" fill="none" stroke="#1a2733" stroke-width="1.3" stroke-linecap="round"/></g></svg></div>
 <div class="topnav-right"><select id="site-select" class="select-input"></select><select id="shift-select" class="select-input"><option value="Days">Days</option><option value="Nights">Nights</option></select>
 <div class="period-indicator"><span class="period-dot" id="dot-p1">P1</span><span class="period-dot" id="dot-p2">P2</span><span class="period-dot" id="dot-p3">P3</span></div>
 <button id="btn-fetch" class="btn btn-primary">\u25B6 Get Data</button><button id="btn-snip" class="btn btn-snip">\uD83D\uDCF7 Snip</button><button id="btn-dark" class="btn" style="background:#333;color:#fff;border-color:#333;">\u263D</button><button id="btn-exit" class="btn btn-danger">\u2715 Exit</button><span id="last-update" class="meta-text">Ready</span></div></nav>
@@ -3405,7 +3504,7 @@ function buildHTML(){return `
 <tr><td>Density <span style="margin-left:20px;font-size:11px;background:#fff3e0;color:#e65100;padding:2px 8px;border-radius:4px;font-weight:700;">LP Target = <span id="lp-ob-density-display">\u2014</span></span></td><td id="ob-density-p1">\u2014</td><td id="ob-density-p2">\u2014</td><td id="ob-density-p3">\u2014</td><td id="ob-density-total">\u2014</td></tr>
 <tr><td>Loaded per Period</td><td id="ob-loadp-p1">0</td><td id="ob-loadp-p2">0</td><td id="ob-loadp-p3">0</td><td id="ob-loadp-total">0</td></tr>
 <tr><td>Palletized Cases Loaded</td><td id="ob-palletloaded-p1">0</td><td id="ob-palletloaded-p2">0</td><td id="ob-palletloaded-p3">0</td><td id="ob-palletloaded-total">0</td></tr>
-<tr id="ob-totesloaded-row" style="display:none;"><td>Totes Loaded <span style="font-size:9px;color:#888;">(RC Sort)</span></td><td id="ob-totesloaded-p1">0</td><td id="ob-totesloaded-p2">0</td><td id="ob-totesloaded-p3">0</td><td id="ob-totesloaded-total">0</td></tr>
+<tr id="ob-totesloaded-row" style="display:none;"><td>Totes Loaded <span style="font-size:9px;color:#888;">(Fluid + Palletize)</span></td><td id="ob-totesloaded-p1">0</td><td id="ob-totesloaded-p2">0</td><td id="ob-totesloaded-p3">0</td><td id="ob-totesloaded-total">0</td></tr>
 <tr><td>Direct Hours</td><td id="ob-dhrs-p1">0</td><td id="ob-dhrs-p2">0</td><td id="ob-dhrs-p3">0</td><td id="ob-dhrs-total">0</td></tr>
 <tr><td>&nbsp;&nbsp;Direct %</td><td id="ob-dpct-p1">\u2014</td><td id="ob-dpct-p2">\u2014</td><td id="ob-dpct-p3">\u2014</td><td id="ob-dpct-total">\u2014</td></tr>
 <tr><td>Indirect Hours</td><td id="ob-ihrs-p1">0</td><td id="ob-ihrs-p2">0</td><td id="ob-ihrs-p3">0</td><td id="ob-ihrs-total">0</td></tr>
@@ -3426,12 +3525,13 @@ function buildHTML(){return `
 <tr class="sort-path" data-sortpath="sortEuro"><td>&nbsp;&nbsp;Euro</td><td id="sort-u-sortEuro-p1">0</td><td id="sort-u-sortEuro-p2">0</td><td id="sort-u-sortEuro-p3">0</td><td id="sort-u-sortEuro-total">0</td></tr>
 <tr class="sort-path" data-sortpath="sortManual"><td>&nbsp;&nbsp;Manual</td><td id="sort-u-sortManual-p1">0</td><td id="sort-u-sortManual-p2">0</td><td id="sort-u-sortManual-p3">0</td><td id="sort-u-sortManual-total">0</td></tr>
 <tr class="row-total"><td>Total Units</td><td id="sort-units-p1">0</td><td id="sort-units-p2">0</td><td id="sort-units-p3">0</td><td id="sort-units-total">0</td></tr>
-<tr class="sort-grp sort-totes-grp"><td colspan="5">Totes Loaded (by path) <span style="font-weight:400;text-transform:none;">\u2192 counts toward DA loaded freight</span></td></tr>
+<tr id="sort-loadedtotes-row" class="row-rate" style="display:none;"><td>Totes Loaded <span style="font-size:9px;color:#888;">(Fluid + Palletize \u2192 DA freight)</span></td><td id="sort-ltotes-p1">0</td><td id="sort-ltotes-p2">0</td><td id="sort-ltotes-p3">0</td><td id="sort-ltotes-total">0</td></tr>
+<tr class="sort-grp sort-totes-grp"><td colspan="5">Totes Wrangled (by path) <span style="font-weight:400;text-transform:none;">\u2192 RC Sort Support (reference only)</span></td></tr>
 <tr class="sort-path sort-totes-row" data-sortpath="sort20lb"><td>&nbsp;&nbsp;20lb</td><td id="sort-t-sort20lb-p1">0</td><td id="sort-t-sort20lb-p2">0</td><td id="sort-t-sort20lb-p3">0</td><td id="sort-t-sort20lb-total">0</td></tr>
 <tr class="sort-path sort-totes-row" data-sortpath="sort5lb"><td>&nbsp;&nbsp;5lb</td><td id="sort-t-sort5lb-p1">0</td><td id="sort-t-sort5lb-p2">0</td><td id="sort-t-sort5lb-p3">0</td><td id="sort-t-sort5lb-total">0</td></tr>
 <tr class="sort-path sort-totes-row" data-sortpath="sortEuro"><td>&nbsp;&nbsp;Euro</td><td id="sort-t-sortEuro-p1">0</td><td id="sort-t-sortEuro-p2">0</td><td id="sort-t-sortEuro-p3">0</td><td id="sort-t-sortEuro-total">0</td></tr>
 <tr class="sort-path sort-totes-row" data-sortpath="sortManual"><td>&nbsp;&nbsp;Manual</td><td id="sort-t-sortManual-p1">0</td><td id="sort-t-sortManual-p2">0</td><td id="sort-t-sortManual-p3">0</td><td id="sort-t-sortManual-total">0</td></tr>
-<tr class="row-total sort-totes-row"><td>Total Totes Loaded</td><td id="sort-totes-p1">0</td><td id="sort-totes-p2">0</td><td id="sort-totes-p3">0</td><td id="sort-totes-total">0</td></tr>
+<tr class="row-total sort-totes-row"><td>Total Totes Wrangled</td><td id="sort-totes-p1">0</td><td id="sort-totes-p2">0</td><td id="sort-totes-p3">0</td><td id="sort-totes-total">0</td></tr>
 <tr class="sort-grp"><td colspan="5">Rate (UPH, by path)</td></tr>
 <tr class="sort-path row-rate" data-sortpath="sort20lb"><td>&nbsp;&nbsp;20lb <span class="sort-rate-tgt" id="sort-rate-tgt-sort20lb"></span></td><td id="sort-r-sort20lb-p1">\u2014</td><td id="sort-r-sort20lb-p2">\u2014</td><td id="sort-r-sort20lb-p3">\u2014</td><td id="sort-r-sort20lb-total">\u2014</td></tr>
 <tr class="sort-path row-rate" data-sortpath="sort5lb"><td>&nbsp;&nbsp;5lb <span class="sort-rate-tgt" id="sort-rate-tgt-sort5lb"></span></td><td id="sort-r-sort5lb-p1">\u2014</td><td id="sort-r-sort5lb-p2">\u2014</td><td id="sort-r-sort5lb-p3">\u2014</td><td id="sort-r-sort5lb-total">\u2014</td></tr>
@@ -3573,6 +3673,8 @@ function buildHTML(){return `
 <div><label style="display:block;font-size:11px;font-weight:700;margin-bottom:4px;">GOAL (MIN)</label><input type="number" id="fs-goal-time" class="target-input" value="20" min="1" max="60" style="width:80px;"></div>
 <div><label style="display:flex;align-items:center;gap:6px;font-size:12px;font-weight:600;cursor:pointer;margin-bottom:2px;"><input type="checkbox" id="fs-remove-nonfc" checked style="width:15px;height:15px;">Remove NonFC</label></div>
 <button id="btn-fetch-faststart" class="btn btn-primary">\u25B6 Run Fast Start</button>
+<button id="btn-save-fs-sos" class="btn" style="font-size:11px;padding:6px 12px;" title="Snapshot the current Fast Start numbers at Start of Shift (saves locally + posts to Slack)">\uD83D\uDCBE Save SOS Fast Start</button>
+<button id="btn-save-fs-break" class="btn" style="font-size:11px;padding:6px 12px;" title="Snapshot the current Fast Start numbers after 1st Break (saves locally + posts to Slack)">\uD83D\uDCBE Save 1st Break Fast Start</button>
 <span id="faststart-status" class="meta-text"></span>
 </div>
 <div id="fs-window-note" style="font-size:12px;color:#666;margin-bottom:10px;min-height:16px;"></div>
@@ -3631,6 +3733,7 @@ function buildHTML(){return `
 <p class="settings-note" style="margin-top:0;">Paste the Slack workflow trigger URLs once. Stored ONLY in this browser (never in the script file), so they aren't exposed if the code is shared or pushed to GitHub. Leave blank to disable Slack posts.</p>
 <div class="setting-row"><label>SOS cages</label><input type="text" id="slack-sos-url" class="select-input" placeholder="https://hooks.slack.com/triggers/\u2026" style="flex:1;min-width:280px;"></div>
 <div class="setting-row"><label>Job balance</label><input type="text" id="slack-jobbalance-url" class="select-input" placeholder="https://hooks.slack.com/triggers/\u2026" style="flex:1;min-width:280px;"></div>
+<div class="setting-row"><label>Fast Start</label><input type="text" id="slack-faststart-url" class="select-input" placeholder="https://hooks.slack.com/triggers/\u2026" style="flex:1;min-width:280px;"></div>
 <button id="btn-save-slack" class="btn btn-primary">\uD83D\uDCBE Save Slack URLs</button> <span id="slack-save-note" class="settings-note" style="margin-left:8px;"></span></div>
 </div></main>
 `;}
@@ -3641,38 +3744,28 @@ function buildCSS(){return `
 .topnav{display:flex;align-items:center;justify-content:space-between;padding:6px 16px;background:#f0f0f0;border-bottom:2px solid #000;position:sticky;top:0;z-index:100;}
 .topnav-left{display:flex;align-items:center;gap:14px;}.topnav-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
 .logo{font-size:20px;display:flex;align-items:center;}.site-title{font-size:15px;font-weight:700;margin:0;white-space:nowrap;color:#000;}
-/* Chrome-dino-style endless runner, Amazon flavour: a fixed PECCY mascot jogs in place near the
-   left while brown boxes scroll in from the right, and Peccy HOPS to clear them — same loop as the
-   offline T-rex game. Shown ONLY on the Sync tab (toggled in JS). The road is a FLEX-GROW middle
-   child of the top nav, so it fills the gap between the Settings tab and the site selector and
-   auto-resizes with the window / zoom. The box-scroll and Peccy-hop cycles share the same 2.4s
-   period so Peccy is airborne exactly when a box reaches him. */
-#sb-truck-road{position:relative;flex:1 1 auto;min-width:40px;height:26px;overflow:hidden;border-bottom:2px dashed #9aa7b8;margin:0 8px;align-self:center;}
-/* SYNC MODEL (width-independent): both Peccy and the boxes are positioned with LEFT PERCENTAGES
-   of the same container, so "left:34%" is the identical screen point for both at ANY road width.
-   Peccy stands at left:34%. Each box travels left:104% -> left:-12% over 3.2s, so it sits at 34%
-   at phase (104-34)/(104+12)=0.60 of its cycle. Two boxes are spread half a period apart (delays
-   0, 1.6s) so one box reaches the 34% mark every 1.6s; Peccy's hop loop is 1.6s (negative delay
-   aligns the peak), so he is at the top of a calm, slow hop each time a box passes under him. */
-#sb-truck-road .sb-peccy{position:absolute;bottom:1px;left:34%;z-index:2;animation:sbPeccyHop 1.6s cubic-bezier(.33,0,.3,1) -.47s infinite;}
-#sb-truck-road .sb-peccy svg{display:block;}
-/* Feet shuffle while running. */
-#sb-truck-road .sb-peccy-feet rect{animation:sbPeccyFeet .18s steps(2) infinite;transform-origin:center bottom;}
-#sb-truck-road .sb-peccy-feet rect:nth-child(2){animation-delay:.09s;}
-/* Boxes scroll right -> left in pure % so the sync holds at every width. */
-#sb-truck-road .sb-boxes{position:absolute;inset:0;z-index:1;}
-#sb-truck-road .sb-box{position:absolute;bottom:1px;width:10px;height:10px;background:#C8873F;border:1px solid #7d4f22;border-radius:1px;
-  background-image:linear-gradient(#8a5a28 0 0),linear-gradient(#e4bd8c 0 0);background-size:2px 100%,100% 2px;background-repeat:no-repeat;background-position:center,center;
-  left:104%;animation:sbBoxScroll 3.2s linear infinite;}
-#sb-truck-road .sb-box.sb-box-dbl{height:15px;}
-#sb-truck-road .sb-box:nth-child(1){animation-delay:0s;}
-#sb-truck-road .sb-box:nth-child(2){animation-delay:1.6s;}
-/* Grounded, then a sharp hop that peaks at ~55-60% (when the box is under Peccy). */
-@keyframes sbPeccyHop{0%,20%{transform:translateY(0);}42%{transform:translateY(-16px) rotate(-4deg);}57%{transform:translateY(-16px) rotate(3deg);}80%,100%{transform:translateY(0);}}
-@keyframes sbPeccyFeet{0%{transform:translateY(0);}100%{transform:translateY(-2px);}}
-@keyframes sbBoxScroll{0%{left:104%;}100%{left:-12%;}}
-@media(prefers-reduced-motion:reduce){#sb-truck-road .sb-peccy,#sb-truck-road .sb-peccy-feet rect,#sb-truck-road .sb-box{animation:none;}#sb-truck-road .sb-box{display:none;}#sb-truck-road .sb-peccy{left:50%;transform:translateX(-50%);}}
-#sb-root.dark-mode #sb-truck-road{border-bottom-color:#55657a;}
+/* Header scene container: fills the gap between the Settings tab and the site selector, scales
+   with the window/zoom. Shown ONLY on the Sync tab (toggled in JS). */
+#sb-truck-road{position:relative;flex:1 1 auto;min-width:40px;height:26px;overflow:hidden;margin:0 10px;align-self:center;display:flex;align-items:center;}
+#sb-root.dark-mode #sb-truck-road{opacity:1;}
+/* SLEEK BANNER — a premium animated-gradient bar that reads cleanly in a short, wide strip (where
+   a detailed scene always looked squished). A deep Amazon-blue gradient flows left<->right, a soft
+   diagonal sheen sweeps across, and the "SDC SYNC BOARD" wordmark sits centered between two little
+   Amazon smiles. All motion is cheap (background-position + one transform sweep). */
+#sb-truck-road .sb-banner{position:relative;width:100%;height:26px;border-radius:7px;display:flex;align-items:center;justify-content:center;gap:12px;overflow:hidden;
+  background:linear-gradient(100deg,#0a2a66,#1565c0,#0ea5c4,#1565c0,#0a2a66);background-size:300% 100%;animation:sbFlow 9s ease-in-out infinite;
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.18),0 1px 4px rgba(10,40,90,.3);}
+#sb-truck-road .sb-banner::after{content:"";position:absolute;top:0;left:-40%;width:30%;height:100%;pointer-events:none;
+  background:linear-gradient(100deg,transparent,rgba(255,255,255,.35),transparent);transform:skewX(-20deg);animation:sbSheen 6s ease-in-out infinite;}
+#sb-truck-road .sb-banner-text{position:relative;z-index:1;font:800 11px/1 'Segoe UI',sans-serif;letter-spacing:1px;color:#fff;white-space:nowrap;text-shadow:0 1px 3px rgba(0,0,0,.35);}
+/* Little Amazon smile drawn in CSS (orange arc + arrowhead) flanking the wordmark. */
+#sb-truck-road .sb-banner-smile{position:relative;z-index:1;width:22px;height:9px;flex:none;}
+#sb-truck-road .sb-banner-smile::before{content:"";position:absolute;inset:0;border-bottom:3px solid #FF9900;border-radius:0 0 22px 22px;}
+#sb-truck-road .sb-banner-smile::after{content:"";position:absolute;right:0;bottom:-1px;width:0;height:0;border-left:5px solid #FF9900;border-top:3px solid transparent;border-bottom:3px solid transparent;transform:rotate(32deg);}
+@keyframes sbFlow{0%,100%{background-position:0% 50%;}50%{background-position:100% 50%;}}
+@keyframes sbSheen{0%{left:-40%;}55%,100%{left:120%;}}
+@media(max-width:1250px){#sb-truck-road .sb-banner-smile{display:none;}#sb-truck-road .sb-banner-text{font-size:10px;letter-spacing:.5px;}}
+@media(prefers-reduced-motion:reduce){#sb-truck-road .sb-banner{animation:none;}#sb-truck-road .sb-banner::after{display:none;}}
 .nav-tabs{display:flex;gap:4px;}.nav-tab{padding:5px 12px;border:1px solid #000;background:#fff;color:#333;border-radius:4px;cursor:pointer;font-size:12px;font-weight:500;transition:background .22s ease,color .22s ease,transform .15s ease,box-shadow .22s ease;}
 .nav-tab:hover{background:#e0e0e0;color:#000;transform:translateY(-1px);}
 .nav-tab.active{background:#2e7d32;color:#fff;border-color:#2e7d32;box-shadow:0 2px 8px rgba(46,125,50,.4);animation:tabPop .25s ease;}
@@ -4234,7 +4327,8 @@ async function fetchHourlyData(){
             const stow=raw.stow||{},pStow=raw.palletStow||{},pick=raw.pick||{},obDock=raw.obDock||{},sort=raw.sort||{},ppr=raw.ppr||{},rsr=raw.rsr||{},toFluid=raw.toFluidLoad||{},toDock=raw.toDock||{};
             // OB loaded volume (cases) = TO Fluid Load jobs + Transfer Out Dock pallet cases (split
             // reports). Fall back to the legacy single obDock report if neither returned anything.
-            const obLoaded=(((toFluid.jobs||0)+(toDock.caseUnits||0))||(obDock.fluidLoadJobs||0))+(sort.totesLoaded||0);
+            const hrLoadedTotes=(toFluid.fluidToteUnits||0)+((raw.palletizeTote||{}).jobs||0);
+            const obLoaded=(((toFluid.jobs||0)+(toDock.caseUnits||0))||(obDock.fluidLoadJobs||0))+hrLoadedTotes;
             const obLoadedRate=toFluid.jph||obDock.fluidCaseJPH||0;
             const obLoadedHC=((toFluid.headcount||0)+(toDock.headcount||0))||obDock.headcount||0;
             const palletCases=pStow.palletCases||0;
@@ -4866,7 +4960,7 @@ async function fetchEOSWashData(){
         const cplhPpr=cplhData.ppr||{};
         const siteThroughputVolSync=((cplhData.toFluidLoad?.jobs||0)+(cplhData.toDock?.caseUnits||0))
             +(cplhData.stow?.totalUnits||0)+(cplhData.palletStow?.palletCases||0)
-            +(cplhData.sort?.totesLoaded||0);   // sort-site totes loaded = loaded freight
+            +((cplhData.toFluidLoad?.fluidToteUnits||0)+(cplhData.palletizeTote?.jobs||0));   // loaded totes = Fluid Load tote + Palletize tote
         const siteThroughputHrsSync=cplhPpr.throughputHrs||0;
         const siteCplhSync=siteThroughputHrsSync>0?siteThroughputVolSync/siteThroughputHrsSync:0;
         dbg('[SB-EOS siteCPLH] vol='+siteThroughputVolSync+' hrs='+siteThroughputHrsSync.toFixed(2)+' siteCPLH='+siteCplhSync.toFixed(2)+' (12hr window)');
@@ -5997,6 +6091,8 @@ function initBoard(){
     document.getElementById('btn-fetch-hourly')?.addEventListener('click',fetchHourlyData);
     document.getElementById('btn-fetch-eoswash')?.addEventListener('click',fetchEOSWashData);
     document.getElementById('btn-fetch-faststart')?.addEventListener('click',fetchFastStartData);
+    document.getElementById('btn-save-fs-sos')?.addEventListener('click',()=>saveFastStartSnapshot('SOS'));
+    document.getElementById('btn-save-fs-break')?.addEventListener('click',()=>saveFastStartSnapshot('1st Break'));
     document.getElementById('btn-email-eoswash')?.addEventListener('click',emailEOSWash);
     initEosPlanInputs(); // seed + wire the manual IB/DA daily-plan target inputs
     document.getElementById('btn-fetch-vrets')?.addEventListener('click',fetchVRETsData);
@@ -6021,12 +6117,13 @@ function initBoard(){
     document.getElementById('btn-clear-actions')?.addEventListener('click',()=>{if(confirm('Clear all actions?')){saveActions([]);renderActions();}});
     document.getElementById('btn-save-settings')?.addEventListener('click',saveSettingsUI);
     // Prefill the Settings Slack fields from localStorage (the only place the URLs live).
-    { const sos=document.getElementById('slack-sos-url'),jb=document.getElementById('slack-jobbalance-url');
-      if(sos)sos.value=getSlackSosUrl();if(jb)jb.value=getSlackJobBalanceUrl(); }
+    { const sos=document.getElementById('slack-sos-url'),jb=document.getElementById('slack-jobbalance-url'),fs=document.getElementById('slack-faststart-url');
+      if(sos)sos.value=getSlackSosUrl();if(jb)jb.value=getSlackJobBalanceUrl();if(fs)fs.value=getSlackFastStartUrl(); }
     document.getElementById('btn-save-slack')?.addEventListener('click',()=>{
         const sos=(document.getElementById('slack-sos-url')?.value||'').trim();
         const jb=(document.getElementById('slack-jobbalance-url')?.value||'').trim();
-        try{localStorage.setItem(SLACK_SOS_KEY,sos);localStorage.setItem(SLACK_JOB_BALANCE_KEY,jb);}catch(e){}
+        const fs=(document.getElementById('slack-faststart-url')?.value||'').trim();
+        try{localStorage.setItem(SLACK_SOS_KEY,sos);localStorage.setItem(SLACK_JOB_BALANCE_KEY,jb);localStorage.setItem(SLACK_FASTSTART_KEY,fs);}catch(e){}
         const note=document.getElementById('slack-save-note');if(note){note.textContent='\u2713 Saved (this browser only)';setTimeout(()=>{note.textContent='';},2500);}
     });
     sel.onchange=e=>{config.site=e.target.value;if(SITE_SCHEDULES[config.site]){config.days=SITE_SCHEDULES[config.site].days;config.nights=SITE_SCHEDULES[config.site].nights;}saveConfig(config);refreshSettingsInputs();currentMetrics=null;clearBoard();updatePeriodDots();};
@@ -6268,11 +6365,11 @@ async function doFetch(isRetry){
         const cplhToDock=raw.cplhData?.toDock||{};
         const obDockFluid=((cplhToFluid.jobs||0)+(cplhToDock.caseUnits||0))||(raw.cplhData?.obDock?.fluidLoadJobs||0);
         const tHrs=cplhPpr.throughputHrs||0;
-        // Sort sites: totes loaded (RC Sort Support tote-wrangle) are loaded freight -> part of the
-        // Site CPLH loaded-volume numerator. 0 on non-sort sites. Hours (denominator) already
-        // include sort hours via the PPR throughput window, so only the volume is added here.
-        const cplhSortTotes=raw.cplhData?.sort?.totesLoaded||0;
-        const siteThroughputVol=obDockFluid+stowJobs+palletCases24+cplhSortTotes;
+        // Sort sites: loaded totes = Fluid Load - Tote units + Palletize - Tote jobs. Loaded freight
+        // -> part of the Site CPLH loaded-volume numerator. 0 on non-sort sites. Hours (denominator)
+        // already include their hours via the PPR throughput window, so only the volume is added.
+        const cplhLoadedTotes=(cplhToFluid.fluidToteUnits||0)+(raw.cplhData?.palletizeTote?.jobs||0);
+        const siteThroughputVol=obDockFluid+stowJobs+palletCases24+cplhLoadedTotes;
         const siteCplh=tHrs>0?siteThroughputVol/tHrs:0;
         setEl('site-cplh-value',siteCplh>0?fmt(siteCplh,2):'\u2014');
         // Color Site CPLH based on target
