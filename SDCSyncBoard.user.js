@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.12.2
+// @version      15.16.1
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -29,7 +29,7 @@
 const STORAGE_KEY = 'syncboard_config';
 const ACTIONS_KEY = 'syncboard_actions';
 const SUPPORT_KEY = 'syncboard_support';
-const SITES = ['KRB3','KRB1','KRB2','KRB4','KRB6','ATL7','AVP8','HGR5','QXX6','SAV7'];
+const SITES = ['KRB3','KRB1','KRB2','KRB4','KRB5','KRB6','ATL7','AVP8','FTW8','HGR5','ONT9','QXX6','SAV7'];
 
 // Verbose debug logging. OFF by default so the console stays clean. To turn it on for
 // troubleshooting, run in the console: localStorage.setItem('syncboard_debug','1') then reload.
@@ -48,6 +48,14 @@ const SITE_SCHEDULES = {
     HGR5: { days:{full:{sh:5,sm:0,eh:16,em:30},p1:{sh:5,sm:30,eh:9,em:0},p2:{sh:9,sm:1,eh:12,em:30},p3:{sh:12,sm:30,eh:15,em:45}}, nights:{full:{sh:16,sm:0,eh:5,em:45},p1:{sh:16,sm:30,eh:20,em:0},p2:{sh:20,sm:1,eh:23,em:30},p3:{sh:23,sm:30,eh:5,em:0}} },
     QXX6: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:18,sm:30,eh:6,em:15},p1:{sh:19,sm:0,eh:22,em:30},p2:{sh:22,sm:31,eh:2,em:0},p3:{sh:2,sm:0,eh:5,em:30}} },
     SAV7: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:18,sm:30,eh:6,em:15},p1:{sh:19,sm:0,eh:22,em:30},p2:{sh:22,sm:31,eh:2,em:0},p3:{sh:2,sm:0,eh:5,em:30}} },
+    // Added for Hourly-tab support. Raw shift (SOS->EOS): FTW8 D 7:00-17:30 / N 19:00-5:30;
+    // KRB5 D 7:00-17:30 / N 18:00-4:30; ONT9 D 6:30-17:00 / N 17:30-4:00. full = SOS-30 -> EOS+45
+    // (matches the convention used by the other sites). Break/period boundaries are ESTIMATED from
+    // the cadence of similar sites (~3.5h P1, ~3.5h P2, ~3h P3) and should be corrected once the
+    // real meal/break times are confirmed.
+    FTW8: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:18,sm:30,eh:6,em:15},p1:{sh:19,sm:0,eh:22,em:30},p2:{sh:22,sm:31,eh:2,em:0},p3:{sh:2,sm:0,eh:5,em:30}} },
+    KRB5: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:17,sm:30,eh:5,em:15},p1:{sh:18,sm:0,eh:21,em:30},p2:{sh:21,sm:31,eh:1,em:0},p3:{sh:1,sm:0,eh:4,em:30}} },
+    ONT9: { days:{full:{sh:6,sm:0,eh:17,em:45},p1:{sh:6,sm:30,eh:10,em:0},p2:{sh:10,sm:1,eh:13,em:30},p3:{sh:13,sm:30,eh:17,em:0}}, nights:{full:{sh:17,sm:0,eh:4,em:45},p1:{sh:17,sm:30,eh:21,em:0},p2:{sh:21,sm:1,eh:0,em:30},p3:{sh:0,sm:30,eh:4,em:0}} },
 };
 // Per-site shift-hours used by the EOS Wash CTI/TOP Hours Variance:
 //   block = paid shift block per HC (e.g. a 10-hr site), ops = productive hours (shift minus
@@ -66,6 +74,23 @@ const PROCESS_IDS = { stow:'1003035', palletStow:'1003041', pick:'1003065', sort
     // on the EOS Wash "Transfer Out Support" row + used in its Hours Variance. tfoot Total Paid
     // Hours is the value we read (e.g. 56.17 for the KRB3 10/8 night shift).
     toSupport:'01785144518570' };
+// RC SORT process paths. Sort sites (e.g. QXX6) break sort into per-path FunctionRollup reports,
+// each measured in UNITS (jobs), not cases. We fetch each path and aggregate:
+//   - throughput paths (20lb / 5lb / Euro / Manual): contribute UNITS (jobs, tfoot index 1) and
+//     DIRECT HOURS (Total Paid Hours, tfoot index 0).
+//   - RC Sort Support: contributes INDIRECT HOURS only (no units) — its hours go into the CPLH
+//     denominator but not the rate denominator.
+// A site "has sort" if any throughput path returns units>0 or hours>0 (else the Sort section is
+// hidden, so non-sort sites like KRB3 are unaffected). The old single '1003009' rollup is no
+// longer fetched — these per-path reports replace it.
+const SORT_PATHS = {
+    rcSortSupport:'01785143618796',  // indirect hours only
+    sort20lb:'01785143578969',       // US_20LB_Induct
+    sort5lb:'01785143554504',
+    sortEuro:'01785143602512',       // not present at every site -> 0
+    sortManual:'01785143512767'
+};
+const SORT_THROUGHPUT_KEYS=['sort20lb','sort5lb','sortEuro','sortManual'];
 // ICQA DC% (Direct Count %):
 //   numerator   = "Library Deep" (Direct Count) functions: SBC - Library Deep + Other Library Deep
 //   denominator = report GRAND TOTAL paid hours (all functions), read from summary tfoot total row
@@ -84,8 +109,8 @@ const DEFAULT_CONFIG = {
 // carry the same cages-on-dock, runway/backlog health, and Slack notifications.
 // Per-site cage density (units per cage). STOW = inbound dock (IDRT/CTI); LOAD = outbound
 // staged cartons (Pick/Fluid Load). Static per site (not pulled from FCLM).
-const SITE_CAGE_DENSITY_STOW = { AVP8:22, HGR5:27, KRB1:20, KRB2:17, KRB3:19, KRB4:21, KRB6:20, QXX6:20, SAV7:19 };
-const SITE_CAGE_DENSITY_LOAD = { AVP8:19, HGR5:28, KRB1:19, KRB2:19, KRB3:18, KRB4:19, KRB6:18, QXX6:19, SAV7:18 };
+const SITE_CAGE_DENSITY_STOW = { AVP8:22, HGR5:27, KRB1:20, KRB2:17, KRB3:19, KRB4:21, KRB5:20, KRB6:20, FTW8:20, ONT9:20, QXX6:20, SAV7:19 };
+const SITE_CAGE_DENSITY_LOAD = { AVP8:19, HGR5:28, KRB1:19, KRB2:19, KRB3:18, KRB4:19, KRB5:18, KRB6:18, FTW8:18, ONT9:18, QXX6:19, SAV7:18 };
 // Runway/backlog thresholds (hours). Inbound: LOW runway = bad. Outbound: HIGH backlog = bad.
 const RUNWAY_RED=0.5, RUNWAY_YELLOW=1.0;       // inbound stow: <30m red, <1h yellow
 const LOAD_BACKLOG_GREEN=1.5, LOAD_BACKLOG_RED=2.0; // outbound load: <=1.5h green, >2h red
@@ -415,6 +440,86 @@ function parseFnRollup(html){
     return{totalUnits:units,directHours:hours,rate,headcount:hc,palletCases,eachUnits,caseUnits,fluidLoadJobs,fluidCaseJPH,fluidCaseJobs,transshipPalletCases,palletizeToteJobs,palletizeToteCases,wallBuilderHC};
 }
 
+// TOTES LOADED (sort sites): the RC Sort Support report contains per-path "*_ToteWrangle" function
+// blocks (e.g. UIS_20lb_ToteWrangle, UIS_5lb_ToteWrangle). Their ToteHandled "Jobs" are totes that
+// got loaded as freight and COUNT toward DA/OB loaded volume (as cartons). This walks the report's
+// function blocks, reads each ToteWrangle function's Total-row Jobs (2nd numeric), maps it to a
+// path key by size keyword, and returns {total, perPath}. `total` is taken from the report's
+// grand-total (tfoot) Jobs so it's authoritative even if a ToteWrangle variant isn't keyword-mapped.
+// Non-sort sites (no RC Sort Support rows) return zeros. Jobs column = 2nd numeric in a Total row
+// ([Total Paid Hours, Jobs, JPH, EACH-UNIT, EACH-UPH]).
+function parseToteWrangled(html){
+    const doc=new DOMParser().parseFromString(html,'text/html');
+    const perPath={sort20lb:0,sort5lb:0,sortEuro:0,sortManual:0};
+    // Grand-total totes loaded = report tfoot Jobs (index 1), authoritative total.
+    const foot=doc.querySelector('tfoot tr.total.empl-all')||doc.querySelector('tr.total.empl-all')||doc.querySelector('tfoot tr.total')||doc.querySelector('tfoot tr');
+    let total=0;
+    if(foot){const n=[];foot.querySelectorAll('td.numeric').forEach(c=>{const v=parseFloat(c.textContent.replace(/,/g,''));if(!isNaN(v))n.push(v);});if(n.length>=2)total=Math.round(n[1]);}
+    // Map a function name to a path key by its size keyword.
+    const keyFor=(name)=>{const s=name.toLowerCase();if(s.indexOf('20lb')!==-1||s.indexOf('20 lb')!==-1)return'sort20lb';if(s.indexOf('5lb')!==-1||s.indexOf('5 lb')!==-1)return'sort5lb';if(s.indexOf('euro')!==-1)return'sortEuro';if(s.indexOf('manual')!==-1||s.indexOf('mansort')!==-1)return'sortManual';return null;};
+    // Walk function blocks: a function name appears as link/td text; its Total sub-row carries the
+    // ToteHandled Jobs. Only consider blocks whose name contains "tote" + "wrangle".
+    const rows=doc.querySelectorAll('tr');
+    let curFn=null;
+    for(const row of rows){
+        const txt=row.textContent;
+        // New function block? (link text or a td exactly naming the function)
+        const link=row.querySelector('a');
+        const linkName=link?link.textContent.trim():'';
+        if(linkName&&/tote.*wrangle/i.test(linkName)){curFn=linkName;continue;}
+        else if(linkName){curFn=null;}  // a different named function begins -> stop attributing
+        if(!curFn)continue;
+        // Total sub-row of the current ToteWrangle function: read its Jobs (2nd numeric).
+        const tds=row.querySelectorAll('td');
+        const isTotal=Array.from(tds).some(td=>td.textContent.trim()==='Total');
+        if(isTotal){
+            const nums=[];tds.forEach(td=>{if(td.className.indexOf('numeric')!==-1){const v=parseFloat(td.textContent.replace(/,/g,''));if(!isNaN(v))nums.push(v);}});
+            const key=keyFor(curFn);
+            if(key&&nums.length>=2)perPath[key]+=Math.round(nums[1]);
+            curFn=null;  // done with this block
+        }
+    }
+    return{total,perPath};
+}
+
+// Aggregate the per-path RC-sort reports (parsed into res.sort_<key> by fetchPeriod) into one
+// sort object. Each parsed path has {totalUnits (jobs), directHours (paid hours), rate (JPH)}.
+//   - UNITS: summed across the throughput paths (20lb/5lb/Euro/Manual) only. RC Sort Support is
+//     support work and contributes NO units.
+//   - DIRECT HOURS: summed across the throughput paths. RC Sort Support hours are INDIRECT.
+//   - rate = units / directHours  (throughput JPH, excludes support hours).
+//   - cplh = units / totalHours   (totalHours = directHours + support hours), same basis as IB/OB.
+// perPath keeps each path's own units/hours so the Shift Plan per-path volume plans can compare.
+function aggregateSort(res){
+    let units=0,directHours=0,hc=0;
+    const perPath={};
+    SORT_THROUGHPUT_KEYS.forEach(k=>{
+        const p=res['sort_'+k]||{};
+        const u=p.totalUnits||0,h=p.directHours||0;
+        units+=u;directHours+=h;hc+=(p.headcount||0);
+        perPath[k]={units:u,hours:h,rate:p.rate||0};
+    });
+    const support=res['sort_rcSortSupport']||{};
+    const supportHours=support.directHours||0;
+    const totalHours=directHours+supportHours;
+    // TOTES LOADED: from the RC Sort Support report's *_ToteWrangle function rows. The grand total
+    // is authoritative (report tfoot Jobs); perPath is the keyword-mapped breakdown. These totes
+    // are loaded freight -> added to DA/OB loaded volume (as cartons) in processData.
+    const totes=support.totes||{total:0,perPath:{}};
+    return{
+        totalUnits:units,
+        directHours:directHours,          // throughput (direct) hours only
+        supportHours:supportHours,        // RC Sort Support (indirect) hours
+        totalHours:totalHours,            // direct + support (CPLH denominator)
+        headcount:hc,
+        rate:directHours>0?units/directHours:0,
+        cplh:totalHours>0?units/totalHours:0,
+        perPath:perPath,
+        totesLoaded:totes.total||0,       // total totes loaded (freight) from RC Sort Support
+        totesPerPath:totes.perPath||{}    // per-path tote-wrangle breakdown (20lb/5lb/Euro/Manual)
+    };
+}
+
 // Helper: pull the numeric cells from a fn-rollup report's grand-total (tfoot) row.
 function fnRollupTotalNums(html){
     const doc=new DOMParser().parseFromString(html,'text/html');
@@ -533,13 +638,19 @@ async function fetchPeriod(site,startDate,sched){
     let sDate=new Date(startDate);
     if(sh<12&&startDate.getHours()>=12){sDate.setDate(sDate.getDate()+1);}
     let eDate=new Date(sDate);if(eh<sh)eDate.setDate(eDate.getDate()+1);
-    const urls={ppr:buildPPRUrl(site,sDate,sh,sm,eDate,eh,em),stow:buildFnUrl(site,PROCESS_IDS.stow,sDate,sh,sm,eDate,eh,em),palletStow:buildFnUrl(site,PROCESS_IDS.palletStow,sDate,sh,sm,eDate,eh,em),pick:buildFnUrl(site,PROCESS_IDS.pick,sDate,sh,sm,eDate,eh,em),sort:buildFnUrl(site,PROCESS_IDS.sort,sDate,sh,sm,eDate,eh,em),obDock:buildFnUrl(site,PROCESS_IDS.obDock,sDate,sh,sm,eDate,eh,em),toFluidLoad:buildFnUrl(site,PROCESS_IDS.toFluidLoad,sDate,sh,sm,eDate,eh,em),toDock:buildFnUrl(site,PROCESS_IDS.toDock,sDate,sh,sm,eDate,eh,em),rsr:buildFnUrl(site,PROCESS_IDS.rsr,sDate,sh,sm,eDate,eh,em)};
+    const urls={ppr:buildPPRUrl(site,sDate,sh,sm,eDate,eh,em),stow:buildFnUrl(site,PROCESS_IDS.stow,sDate,sh,sm,eDate,eh,em),palletStow:buildFnUrl(site,PROCESS_IDS.palletStow,sDate,sh,sm,eDate,eh,em),pick:buildFnUrl(site,PROCESS_IDS.pick,sDate,sh,sm,eDate,eh,em),obDock:buildFnUrl(site,PROCESS_IDS.obDock,sDate,sh,sm,eDate,eh,em),toFluidLoad:buildFnUrl(site,PROCESS_IDS.toFluidLoad,sDate,sh,sm,eDate,eh,em),toDock:buildFnUrl(site,PROCESS_IDS.toDock,sDate,sh,sm,eDate,eh,em),rsr:buildFnUrl(site,PROCESS_IDS.rsr,sDate,sh,sm,eDate,eh,em)};
+    // Add the per-path RC-sort reports (each a FunctionRollup). Keyed sort_<path> so they share the
+    // generic parser and the same fetch loop; aggregated into res.sort below.
+    Object.entries(SORT_PATHS).forEach(([k,pid])=>{urls['sort_'+k]=buildFnUrl(site,pid,sDate,sh,sm,eDate,eh,em);});
     const res={};
     // Dispatch each report to its parser. PPR uses parsePPR; the split TO reports use their own
-    // parsers; everything else uses the generic fn-rollup parser.
-    const parseFor=(k,h)=>{if(k==='ppr')return parsePPR(h);if(k==='toFluidLoad')return parseToFluidLoad(h);if(k==='toDock')return parseToDock(h);return parseFnRollup(h);};
+    // parsers; everything else (incl. each sort_* path) uses the generic fn-rollup parser.
+    const parseFor=(k,h)=>{if(k==='ppr')return parsePPR(h);if(k==='toFluidLoad')return parseToFluidLoad(h);if(k==='toDock')return parseToDock(h);
+        if(k==='sort_rcSortSupport'){const base=parseFnRollup(h);base.totes=parseToteWrangled(h);return base;}
+        return parseFnRollup(h);};
     const emptyFor=(k)=>{if(k==='ppr')return{ibPlannedHrs:0,ibActualHrs:0,obPlannedHrs:0,obActualHrs:0,daTransferHrs:0,daTransferPlan:0,caseStowReserveHrs:0,throughputVol:0,throughputHrs:0,totHrs:0};if(k==='toFluidLoad')return{jobs:0,caseUnits:0,eachUnits:0,jph:0,directHours:0,headcount:0};if(k==='toDock')return{caseUnits:0,palletUnits:0,jobs:0,directHours:0,headcount:0};return{totalUnits:0,directHours:0,rate:0,headcount:0};};
     await Promise.all(Object.entries(urls).map(async([k,u])=>{try{const h=await fetchHTML(u);res[k]=parseFor(k,h);}catch(e){console.warn('[SB]',k,e.message);res[k]=emptyFor(k);}}));
+    res.sort=aggregateSort(res);
     return res;
 }
 
@@ -1671,22 +1782,25 @@ async function fetchDayData(site,dayOffset){
         const palletStowUrl=buildFnUrl(site,PROCESS_IDS.palletStow,start,0,0,end,eh,em);
         const toFluidUrl=buildFnUrl(site,PROCESS_IDS.toFluidLoad,start,0,0,end,eh,em);
         const toDockUrl=buildFnUrl(site,PROCESS_IDS.toDock,start,0,0,end,eh,em);
+        // RC Sort Support (tote-wrangle totes = loaded freight) for sort sites. 0 at non-sort sites.
+        const rcSupportUrl=buildFnUrl(site,SORT_PATHS.rcSortSupport,start,0,0,end,eh,em);
         // PPR over the window for the hours (IB actual, DA transfer, throughput).
         const pprUrl=buildPPRUrl(site,start,0,0,end,eh,em);
         // VRET actual = Vendor Return PACK EACH-Total over the day window (same source + basis the
         // VRETs tab uses via vretFetchOne). Compared against the GalaxyBI Vendor Returns LP plan.
-        const [stowHtml,palletStowHtml,toFluidHtml,toDockHtml,pprHtml,vretPackVol]=await Promise.all([
-            fetchHTML(stowUrl),fetchHTML(palletStowUrl),fetchHTML(toFluidUrl),fetchHTML(toDockUrl),fetchHTML(pprUrl),
+        const [stowHtml,palletStowHtml,toFluidHtml,toDockHtml,rcSupportHtml,pprHtml,vretPackVol]=await Promise.all([
+            fetchHTML(stowUrl),fetchHTML(palletStowUrl),fetchHTML(toFluidUrl),fetchHTML(toDockUrl),fetchHTML(rcSupportUrl),fetchHTML(pprUrl),
             vretFetchOne(site,PROCESS_IDS.vretPack,start,0,0,end,eh,em)
         ]);
         const stow=parseFnRollup(stowHtml);
         const pStow=parseFnRollup(palletStowHtml);
         const toFluid=parseToFluidLoad(toFluidHtml);
         const toDock=parseToDock(toDockHtml);
+        const sortTotesLoaded=(parseToteWrangled(rcSupportHtml)||{}).total||0;
         const ppr=parsePPR(pprHtml);
         const palletCases=pStow.palletCases||0;
         const ibVol=(stow.totalUnits||0)+palletCases;
-        const obVol=(toFluid.jobs||0)+(toDock.caseUnits||0);
+        const obVol=(toFluid.jobs||0)+(toDock.caseUnits||0)+sortTotesLoaded;   // + sort totes loaded
         const ibDensity=(stow.caseUnits||0)>0?(stow.eachUnits||0)/(stow.caseUnits||1):0;
         const obDensity=(toFluid.caseUnits||0)>0?(toFluid.eachUnits||0)/(toFluid.caseUnits||1):0;
         // CPLH — same formulas as the shift (renderIB/renderOB/Site CPLH), over this window.
@@ -2561,8 +2675,12 @@ function processData(raw){
         // The TO loaded volume was split into two reports; sum them here. Fall back to the legacy
         // single obDock.fluidLoadJobs only if neither new report returned anything.
         const toLoaded=(toFluid.jobs||0)+(toDock.caseUnits||0);
-        const loadedUnits=toLoaded>0?toLoaded:(obDock.fluidLoadJobs||0);
-        console.warn('[SB-DA loaded] toFluidJobs='+(toFluid.jobs||0)+' toDockCases='+(toDock.caseUnits||0)+' => loadedUnits='+loadedUnits);
+        // SORT SITES: totes loaded via RC Sort Support *_ToteWrangle are loaded freight and count
+        // toward DA/OB loaded volume (as cartons). Additive — NOT already in TO Fluid Load or Dock.
+        // 0 on non-sort sites (no RC Sort Support). This flows into Site CPLH's loaded-volume numerator.
+        const sortTotesLoaded=sort.totesLoaded||0;
+        const loadedUnits=(toLoaded>0?toLoaded:(obDock.fluidLoadJobs||0))+sortTotesLoaded;
+        console.warn('[SB-DA loaded] toFluidJobs='+(toFluid.jobs||0)+' toDockCases='+(toDock.caseUnits||0)+' sortTotesLoaded='+sortTotesLoaded+' => loadedUnits='+loadedUnits);
         m.ob[p]={pickUnits:pick.totalUnits||0,loadedUnits:loadedUnits,
             // periodPick / periodLoaded stay per-period (that time window only). syncLoaded is the
             // cumulative running total used ONLY by the OB Sync Metrics row.
@@ -2577,9 +2695,15 @@ function processData(raw){
             // Density (units/case): prefer the new TO Fluid Load report's each/case; fall back to legacy obDock.
             density:(toFluid.caseUnits||0)>0?(toFluid.eachUnits||0)/(toFluid.caseUnits||1):((obDock.caseUnits||0)>0?(obDock.eachUnits||0)/(obDock.caseUnits||1):0),
             directHC:dur>0?obPickDH/dur:0,indirectHC:dur>0?obIndirect/dur:0,
+            // Totes loaded (sort sites) folded into loadedUnits above; also surfaced as its own
+            // DA display row. 0 on non-sort sites.
+            totesLoaded:sortTotesLoaded,periodTotesLoaded:sortTotesLoaded,
             pprPlannedHrs:daPlan,pprActualHrs:daHrs,
             pctToOP:daPlan>0?(daHrs/daPlan)*100:0};
-        m.sort[p]={totalUnits:sort.totalUnits||0,directHours:sort.directHours||0,totalHours:sort.directHours||0,rate:sort.rate||0,headcount:sort.headcount||0,cplh:(sort.directHours||0)>0?sort.totalUnits/sort.directHours:0};
+        // Sort now aggregates RC-sort paths (see aggregateSort): totalUnits = throughput units,
+        // directHours = throughput (direct) hours, supportHours = RC Sort Support (indirect) hours,
+        // totalHours = direct + support. rate = units/directHours (JPH); cplh = units/totalHours.
+        m.sort[p]={totalUnits:sort.totalUnits||0,directHours:sort.directHours||0,supportHours:sort.supportHours||0,totalHours:sort.totalHours||((sort.directHours||0)+(sort.supportHours||0)),rate:sort.rate||0,headcount:sort.headcount||0,cplh:(sort.cplh!=null?sort.cplh:((sort.totalHours||0)>0?sort.totalUnits/sort.totalHours:0)),perPath:sort.perPath||{},totesLoaded:sort.totesLoaded||0,totesPerPath:sort.totesPerPath||{}};
     });
     // Cumulative running totals for the SYNC METRICS rows ONLY (IB totalStow, OB syncLoaded,
     // Sort totalUnits). The per-period rows (CTI/PTI, Pick - Total, Cases Picked, Loaded per
@@ -2654,7 +2778,7 @@ function blankFuturePeriods(config){
         if(!hasPeriodStarted(periods[idx],config)){
             const prefixes=['ib-sync-','ib-stow-','ib-cases-','ib-pallets-','ib-cti-','ib-rate-','ib-density-','ib-dhrs-','ib-dpct-','ib-ihrs-','ib-ipct-','ib-thrs-','ib-cplh-','ib-op-',
                 'ob-sync-','ob-pick-','ob-cases-','ob-rate-','ob-density-','ob-loadp-','ob-palletloaded-','ob-dhrs-','ob-dpct-','ob-ihrs-','ob-ipct-','ob-thrs-','ob-cplh-','ob-op-',
-                'sort-total-','sort-units-','sort-rate-','sort-dhrs-','sort-cplh-'];
+                'sort-total-','sort-units-','sort-rate-','sort-dhrs-'];
             prefixes.forEach(pre=>{const el=document.getElementById(pre+pk);if(el){el.textContent='';el.style.background='';}});
         }
     });
@@ -2736,6 +2860,14 @@ function renderOB(m){
     const pal2=p2.periodPalletLoaded!=null?p2.periodPalletLoaded:(p2.palletLoadedCases||0);
     const pal3=p3.periodPalletLoaded!=null?p3.periodPalletLoaded:(p3.palletLoadedCases||0);
     setEl('ob-palletloaded-p1',fmt(pal1));setEl('ob-palletloaded-p2',fmt(pal2));setEl('ob-palletloaded-p3',fmt(pal3));setEl('ob-palletloaded-total',fmt(f.palletLoadedCases||0));
+    // Totes Loaded (sort sites): RC Sort Support tote-wrangle totes folded into DA loaded volume.
+    // Row shows only when the site loads totes (0/absent on non-sort sites).
+    const tl1=p1.periodTotesLoaded!=null?p1.periodTotesLoaded:(p1.totesLoaded||0);
+    const tl2=p2.periodTotesLoaded!=null?p2.periodTotesLoaded:(p2.totesLoaded||0);
+    const tl3=p3.periodTotesLoaded!=null?p3.periodTotesLoaded:(p3.totesLoaded||0);
+    const totesRow=document.getElementById('ob-totesloaded-row');
+    if(totesRow)totesRow.style.display=(f.totesLoaded||0)>0?'':'none';
+    if((f.totesLoaded||0)>0){setEl('ob-totesloaded-p1',fmt(tl1));setEl('ob-totesloaded-p2',fmt(tl2));setEl('ob-totesloaded-p3',fmt(tl3));setEl('ob-totesloaded-total',fmt(f.totesLoaded||0));}
     setEl('ob-dhrs-p1',fmt(p1.directHours,2));setEl('ob-dhrs-p2',fmt(p2.directHours,2));setEl('ob-dhrs-p3',fmt(p3.directHours,2));setEl('ob-dhrs-total',fmt(f.directHours,2));
     setEl('ob-dpct-p1',fmtPct(p1.directPct));setEl('ob-dpct-p2',fmtPct(p2.directPct));setEl('ob-dpct-p3',fmtPct(p3.directPct));setEl('ob-dpct-total',fmtPct(f.directPct));
     setEl('ob-ihrs-p1',fmt(p1.indirectHours,2));setEl('ob-ihrs-p2',fmt(p2.indirectHours,2));setEl('ob-ihrs-p3',fmt(p3.indirectHours,2));setEl('ob-ihrs-total',fmt(f.indirectHours,2));
@@ -2757,15 +2889,51 @@ function renderSort(m){
     if(sortRight)sortRight.style.display=hasData?'':'none';
     if(sortCard)sortCard.style.display=hasData?'':'none';
     if(!hasData)return;
-    setEl('sort-total-p1',fmt(p1.totalUnits));setEl('sort-total-p2',fmt(p2.totalUnits));setEl('sort-total-p3',fmt(p3.totalUnits));setEl('sort-total-total',fmt(f.totalUnits));
+    // Per-path breakdown (20lb / 5lb / Euro / Manual). Each period carries its own perPath map
+    // (units + that path's JPH for the window); Total column uses the full-shift perPath. A path
+    // row is HIDDEN when it produced no units all shift (e.g. Euro at QXX6), so each site only
+    // shows the paths it actually runs. Labels for the Shift Plan per-path rate targets.
+    const pathData=(pp,key)=>(pp.perPath&&pp.perPath[key])||{units:0,hours:0,rate:0};
+    const toteData=(pp,key)=>(pp.totesPerPath&&pp.totesPerPath[key])||0;
+    const sortTargets=loadSortTargets();
+    SORT_THROUGHPUT_KEYS.forEach(key=>{
+        const fp=pathData(f,key);
+        const active=(fp.units||0)>0;
+        // A units/rate path row shows when that path sorted units; a totes row shows when that
+        // path has tote-wrangle volume (tote-wrangle only exists on some paths, e.g. 20lb/5lb).
+        document.querySelectorAll('tr.sort-path:not(.sort-totes-row)[data-sortpath="'+key+'"]').forEach(tr=>{tr.style.display=active?'':'none';});
+        const toteActive=(toteData(f,key)||0)>0;
+        document.querySelectorAll('tr.sort-totes-row[data-sortpath="'+key+'"]').forEach(tr=>{tr.style.display=toteActive?'':'none';});
+        if(active){
+            setEl('sort-u-'+key+'-p1',fmt(pathData(p1,key).units));setEl('sort-u-'+key+'-p2',fmt(pathData(p2,key).units));setEl('sort-u-'+key+'-p3',fmt(pathData(p3,key).units));setEl('sort-u-'+key+'-total',fmt(fp.units));
+            setEl('sort-r-'+key+'-p1',fmt(pathData(p1,key).rate,1));setEl('sort-r-'+key+'-p2',fmt(pathData(p2,key).rate,1));setEl('sort-r-'+key+'-p3',fmt(pathData(p3,key).rate,1));setEl('sort-r-'+key+'-total',fmt(fp.rate,1));
+            const tgt=sortTargets.rate&&sortTargets.rate[key];
+            const tgtEl=document.getElementById('sort-rate-tgt-'+key);
+            if(tgtEl)tgtEl.textContent=(tgt>0)?('Tgt '+fmt(tgt,0)):'';
+        }
+        if(toteActive){
+            setEl('sort-t-'+key+'-p1',fmt(toteData(p1,key)));setEl('sort-t-'+key+'-p2',fmt(toteData(p2,key)));setEl('sort-t-'+key+'-p3',fmt(toteData(p3,key)));setEl('sort-t-'+key+'-total',fmt(toteData(f,key)));
+        }
+    });
+    // Totes Loaded total (= RC Sort Support grand-total tote-wrangle jobs). Hide the whole Totes
+    // section when the site loads no totes at all.
+    const anyTotes=(f.totesLoaded||0)>0;
+    document.querySelectorAll('tr.sort-totes-grp, tr.row-total.sort-totes-row').forEach(tr=>{tr.style.display=anyTotes?'':'none';});
+    if(anyTotes){
+        setEl('sort-totes-p1',fmt(p1.totesLoaded));setEl('sort-totes-p2',fmt(p2.totesLoaded));setEl('sort-totes-p3',fmt(p3.totesLoaded));setEl('sort-totes-total',fmt(f.totesLoaded));
+    }
     setEl('sort-units-p1',fmt(p1.totalUnits));setEl('sort-units-p2',fmt(p2.totalUnits));setEl('sort-units-p3',fmt(p3.totalUnits));setEl('sort-units-total',fmt(f.totalUnits));
     setEl('sort-rate-p1',fmt(p1.rate,1));setEl('sort-rate-p2',fmt(p2.rate,1));setEl('sort-rate-p3',fmt(p3.rate,1));setEl('sort-rate-total',fmt(f.rate,1));
     setEl('sort-dhrs-p1',fmt(p1.directHours,2));setEl('sort-dhrs-p2',fmt(p2.directHours,2));setEl('sort-dhrs-p3',fmt(p3.directHours,2));setEl('sort-dhrs-total',fmt(f.directHours,2));
-    setEl('sort-cplh-p1',fmt(p1.cplh,2));setEl('sort-cplh-p2',fmt(p2.cplh,2));setEl('sort-cplh-p3',fmt(p3.cplh,2));setEl('sort-cplh-total',fmt(f.cplh,2));
+    setEl('sort-shrs-p1',fmt(p1.supportHours,2));setEl('sort-shrs-p2',fmt(p2.supportHours,2));setEl('sort-shrs-p3',fmt(p3.supportHours,2));setEl('sort-shrs-total',fmt(f.supportHours,2));
+    setEl('sort-thrs-p1',fmt(p1.totalHours,2));setEl('sort-thrs-p2',fmt(p2.totalHours,2));setEl('sort-thrs-p3',fmt(p3.totalHours,2));setEl('sort-thrs-total',fmt(f.totalHours,2));
 }
 
 function updateTargetRows(){
     const config=loadConfig(),periods=config.schedType==='4Q'?4:3;
+    // Roll per-path Sort volume plans into the hidden sort-goal + Shift Plan TOTAL row first,
+    // so the summary card and hourly (which read sort-goal) see the aggregate.
+    syncSortGoalFromPaths();
     const ibG=parseFloat(document.getElementById('ib-goal-input')?.value)||0;
     const obG=parseFloat(document.getElementById('ob-goal-input')?.value)||0;
     const sortG=parseFloat(document.getElementById('sort-goal')?.value)||0;
@@ -2827,7 +2995,7 @@ function renderTargets(m){
         const bar=document.getElementById('ob-progress-bar');if(bar){bar.style.width=Math.min(p,100)+'%';bar.className='goal-progress-bar '+pColor;}}
     const obM1=document.getElementById('ob-marker-p1');const obM2=document.getElementById('ob-marker-p2');
     if(obM1)obM1.style.left=(100/periods)+'%';if(obM2)obM2.style.left=(200/periods)+'%';
-    setEl('sum-sort-goal',sortG>0?fmt(sortG):'—');setEl('sum-sort-rate',sf.rate?fmt(sf.rate,1):'—');setEl('sum-sort-cplh',sf.cplh?fmt(sf.cplh,2):'—');
+    setEl('sum-sort-goal',sortG>0?fmt(sortG):'—');setEl('sum-sort-rate',sf.rate?fmt(sf.rate,1):'—');
     if(sortG>0&&sf.totalUnits){const p=(sf.totalUnits/sortG)*100;const el=countUpEl('sum-sort-pct',p,'%',1);const pColor=getPaceColor(p,config);el.classList.remove('pct-good','pct-warn','pct-bad');el.classList.add(pColor==='green'?'pct-good':pColor==='amber'?'pct-warn':'pct-bad');setEl('sum-sort-actual',fmt(sf.totalUnits));setEl('sum-sort-remaining',fmt(sortG-sf.totalUnits));
         const bar=document.getElementById('sort-progress-bar');if(bar){bar.style.width=Math.min(p,100)+'%';bar.className='goal-progress-bar '+pColor;}}
     // Pace Insights — use most recent period's active headcount (from function rollup employee links)
@@ -3089,7 +3257,7 @@ function updatePeriodDots(){
 // === HTML ===
 function buildHTML(){return `
 <nav class="topnav"><div class="topnav-left"><span class="logo"><svg width="28" height="28" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="46" fill="#333A44" stroke="#4a9eff" stroke-width="4"/><path d="M25 65 L25 40 L50 28 L75 40 L75 65 Z" fill="none" stroke="#E8EAED" stroke-width="3" stroke-linejoin="round"/><line x1="25" y1="65" x2="75" y2="65" stroke="#E8EAED" stroke-width="3"/><rect x="30" y="45" width="16" height="20" fill="none" stroke="#E8EAED" stroke-width="2"/><line x1="30" y1="50" x2="46" y2="50" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="55" x2="46" y2="55" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="60" x2="46" y2="60" stroke="#E8EAED" stroke-width="1.5"/><rect x="54" y="48" width="14" height="17" fill="none" stroke="#E8EAED" stroke-width="2"/><rect x="57" y="52" width="4" height="5" fill="#E8EAED"/><rect x="62" y="55" width="3" height="4" fill="#E8EAED"/></svg></span><h1 class="site-title">FC Sync Board<span style="display:block;font-size:11px;font-weight:800;color:#146EB4;letter-spacing:.3px;margin-top:-1px;">by snodgtyl</span></h1>
-<div class="nav-tabs"><button class="nav-tab active" data-tab="sync">Sync IB-OB</button><button class="nav-tab" data-tab="hourly">Hourly</button><button class="nav-tab" data-tab="faststart">Fast Start</button><button class="nav-tab" data-tab="vrets">VRETs</button><button class="nav-tab" data-tab="eoswash">EOS Wash</button><button class="nav-tab" data-tab="settings">Settings</button></div></div>
+<div class="nav-tabs"><button class="nav-tab active" data-tab="sync">Sync IB-OB</button><button class="nav-tab" data-tab="hourly">Hourly</button><button class="nav-tab" data-tab="faststart">Fast Start</button><button class="nav-tab" data-tab="vrets">VRETs</button><button class="nav-tab" data-tab="eoswash" style="display:none;">EOS Wash</button><button class="nav-tab" data-tab="settings">Settings</button></div></div>
 <div id="sb-truck-road" title="Peccy run"><div class="sb-peccy"><svg width="30" height="30" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><g class="sb-peccy-feet" fill="#E8780A"><rect x="22" y="55" width="8" height="7" rx="2.5"/><rect x="34" y="55" width="8" height="7" rx="2.5"/></g><ellipse cx="9" cy="36" rx="6" ry="7.5" fill="#FF9D14"/><ellipse cx="55" cy="36" rx="6" ry="7.5" fill="#FF9D14"/><rect x="12" y="4" width="40" height="54" rx="19" fill="#FF9D14"/><g fill="#fff" stroke="#1a2733" stroke-width="1.6"><ellipse cx="25" cy="22" rx="7" ry="8.5"/><ellipse cx="39" cy="22" rx="7" ry="8.5"/></g><g fill="#1a2733"><circle cx="26.5" cy="23" r="4.2"/><circle cx="40.5" cy="23" r="4.2"/></g><path d="M20 33 Q32 44 44 33" fill="none" stroke="#1a2733" stroke-width="3" stroke-linecap="round"/><g><path d="M18 40 h28 v16 a2 2 0 0 1 -2 2 h-24 a2 2 0 0 1 -2 -2 z" fill="#F59C00"/><rect x="23" y="40" width="4.5" height="18" fill="#FFE000"/><rect x="36.5" y="40" width="4.5" height="18" fill="#FFE000"/><rect x="18" y="47" width="28" height="4" fill="#FFE000"/></g></svg></div><div class="sb-boxes"><span class="sb-box"></span><span class="sb-box sb-box-dbl"></span></div></div>
 <div class="topnav-right"><select id="site-select" class="select-input"></select><select id="shift-select" class="select-input"><option value="Days">Days</option><option value="Nights">Nights</option></select>
 <div class="period-indicator"><span class="period-dot" id="dot-p1">P1</span><span class="period-dot" id="dot-p2">P2</span><span class="period-dot" id="dot-p3">P3</span></div>
@@ -3126,9 +3294,13 @@ function buildHTML(){return `
 <tr><td>EOL FAST START</td><td><input type="number" id="ob-fast-eol" class="target-input" value="18" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ob-fast-eol-pct">\u2014</span></td></tr>
 </tbody></table></div>
 </div>
-<div id="sort-targets-right" class="sort-tgt"><h4>SORT</h4><table class="target-table"><tbody>
-<tr><td>SORT PRIMARY GOAL</td><td><input type="number" id="sort-goal" class="target-input"></td><td><span id="sort-goal-pct">\u2014</span></td></tr>
-<tr><td>SORT RATE (UPH)</td><td><input type="number" id="sort-rate-target" class="target-input"></td><td></td></tr>
+<div id="sort-targets-right" class="sort-tgt"><h4>SORT</h4><table class="target-table sort-tgt-table"><thead><tr><th></th><th>Vol Plan</th><th>Rate Plan</th></tr></thead><tbody>
+<tr><td>20lb</td><td><input type="number" id="sort-vol-sort20lb" class="target-input"></td><td><input type="number" id="sort-rate-sort20lb" class="target-input"></td></tr>
+<tr><td>5lb</td><td><input type="number" id="sort-vol-sort5lb" class="target-input"></td><td><input type="number" id="sort-rate-sort5lb" class="target-input"></td></tr>
+<tr><td>Euro</td><td><input type="number" id="sort-vol-sortEuro" class="target-input"></td><td><input type="number" id="sort-rate-sortEuro" class="target-input"></td></tr>
+<tr><td>Manual</td><td><input type="number" id="sort-vol-sortManual" class="target-input"></td><td><input type="number" id="sort-rate-sortManual" class="target-input"></td></tr>
+<tr class="lp-row"><td>TOTAL</td><td><span id="sort-vol-total" class="lp-val">\u2014</span></td><td><span id="sort-rate-blended-tgt" class="lp-val">\u2014</span></td></tr>
+<input type="hidden" id="sort-goal"><input type="hidden" id="sort-rate-target">
 </tbody></table></div>
 <div class="sort-tgt" style="margin-top:6px;padding-top:6px;border-top:2px solid #000;"><h4 style="color:#333;">SITE</h4><table class="target-table"><tbody>
 <tr><td>SITE CPLH TARGET</td><td><input type="number" id="site-cplh-target" class="target-input" step="0.01"></td><td><span id="site-cplh-pct">\u2014</span></td></tr>
@@ -3233,6 +3405,7 @@ function buildHTML(){return `
 <tr><td>Density <span style="margin-left:20px;font-size:11px;background:#fff3e0;color:#e65100;padding:2px 8px;border-radius:4px;font-weight:700;">LP Target = <span id="lp-ob-density-display">\u2014</span></span></td><td id="ob-density-p1">\u2014</td><td id="ob-density-p2">\u2014</td><td id="ob-density-p3">\u2014</td><td id="ob-density-total">\u2014</td></tr>
 <tr><td>Loaded per Period</td><td id="ob-loadp-p1">0</td><td id="ob-loadp-p2">0</td><td id="ob-loadp-p3">0</td><td id="ob-loadp-total">0</td></tr>
 <tr><td>Palletized Cases Loaded</td><td id="ob-palletloaded-p1">0</td><td id="ob-palletloaded-p2">0</td><td id="ob-palletloaded-p3">0</td><td id="ob-palletloaded-total">0</td></tr>
+<tr id="ob-totesloaded-row" style="display:none;"><td>Totes Loaded <span style="font-size:9px;color:#888;">(RC Sort)</span></td><td id="ob-totesloaded-p1">0</td><td id="ob-totesloaded-p2">0</td><td id="ob-totesloaded-p3">0</td><td id="ob-totesloaded-total">0</td></tr>
 <tr><td>Direct Hours</td><td id="ob-dhrs-p1">0</td><td id="ob-dhrs-p2">0</td><td id="ob-dhrs-p3">0</td><td id="ob-dhrs-total">0</td></tr>
 <tr><td>&nbsp;&nbsp;Direct %</td><td id="ob-dpct-p1">\u2014</td><td id="ob-dpct-p2">\u2014</td><td id="ob-dpct-p3">\u2014</td><td id="ob-dpct-total">\u2014</td></tr>
 <tr><td>Indirect Hours</td><td id="ob-ihrs-p1">0</td><td id="ob-ihrs-p2">0</td><td id="ob-ihrs-p3">0</td><td id="ob-ihrs-total">0</td></tr>
@@ -3247,12 +3420,28 @@ function buildHTML(){return `
 
 <section class="metrics-section sort-section" id="sort-section"><div class="section-header"><h2>SORT | NTP</h2></div>
 <table class="metrics-table"><thead><tr><th></th><th>P1</th><th>P2</th><th>P3</th><th>Total</th></tr></thead><tbody>
-<tr class="row-target"><td class="bold">Targets</td><td id="sort-target-p1">\u2014</td><td id="sort-target-p2">\u2014</td><td id="sort-target-p3">\u2014</td><td id="sort-target-total">\u2014</td></tr>
-<tr><td>Sort - Total</td><td id="sort-total-p1">0</td><td id="sort-total-p2">0</td><td id="sort-total-p3">0</td><td id="sort-total-total">0</td></tr>
-<tr><td>Sort (Units)</td><td id="sort-units-p1">0</td><td id="sort-units-p2">0</td><td id="sort-units-p3">0</td><td id="sort-units-total">0</td></tr>
-<tr class="row-rate"><td>Sort Rate (UPH)</td><td id="sort-rate-p1">\u2014</td><td id="sort-rate-p2">\u2014</td><td id="sort-rate-p3">\u2014</td><td id="sort-rate-total">\u2014</td></tr>
+<tr class="sort-grp"><td colspan="5">Units Sorted (by path)</td></tr>
+<tr class="sort-path" data-sortpath="sort20lb"><td>&nbsp;&nbsp;20lb</td><td id="sort-u-sort20lb-p1">0</td><td id="sort-u-sort20lb-p2">0</td><td id="sort-u-sort20lb-p3">0</td><td id="sort-u-sort20lb-total">0</td></tr>
+<tr class="sort-path" data-sortpath="sort5lb"><td>&nbsp;&nbsp;5lb</td><td id="sort-u-sort5lb-p1">0</td><td id="sort-u-sort5lb-p2">0</td><td id="sort-u-sort5lb-p3">0</td><td id="sort-u-sort5lb-total">0</td></tr>
+<tr class="sort-path" data-sortpath="sortEuro"><td>&nbsp;&nbsp;Euro</td><td id="sort-u-sortEuro-p1">0</td><td id="sort-u-sortEuro-p2">0</td><td id="sort-u-sortEuro-p3">0</td><td id="sort-u-sortEuro-total">0</td></tr>
+<tr class="sort-path" data-sortpath="sortManual"><td>&nbsp;&nbsp;Manual</td><td id="sort-u-sortManual-p1">0</td><td id="sort-u-sortManual-p2">0</td><td id="sort-u-sortManual-p3">0</td><td id="sort-u-sortManual-total">0</td></tr>
+<tr class="row-total"><td>Total Units</td><td id="sort-units-p1">0</td><td id="sort-units-p2">0</td><td id="sort-units-p3">0</td><td id="sort-units-total">0</td></tr>
+<tr class="sort-grp sort-totes-grp"><td colspan="5">Totes Loaded (by path) <span style="font-weight:400;text-transform:none;">\u2192 counts toward DA loaded freight</span></td></tr>
+<tr class="sort-path sort-totes-row" data-sortpath="sort20lb"><td>&nbsp;&nbsp;20lb</td><td id="sort-t-sort20lb-p1">0</td><td id="sort-t-sort20lb-p2">0</td><td id="sort-t-sort20lb-p3">0</td><td id="sort-t-sort20lb-total">0</td></tr>
+<tr class="sort-path sort-totes-row" data-sortpath="sort5lb"><td>&nbsp;&nbsp;5lb</td><td id="sort-t-sort5lb-p1">0</td><td id="sort-t-sort5lb-p2">0</td><td id="sort-t-sort5lb-p3">0</td><td id="sort-t-sort5lb-total">0</td></tr>
+<tr class="sort-path sort-totes-row" data-sortpath="sortEuro"><td>&nbsp;&nbsp;Euro</td><td id="sort-t-sortEuro-p1">0</td><td id="sort-t-sortEuro-p2">0</td><td id="sort-t-sortEuro-p3">0</td><td id="sort-t-sortEuro-total">0</td></tr>
+<tr class="sort-path sort-totes-row" data-sortpath="sortManual"><td>&nbsp;&nbsp;Manual</td><td id="sort-t-sortManual-p1">0</td><td id="sort-t-sortManual-p2">0</td><td id="sort-t-sortManual-p3">0</td><td id="sort-t-sortManual-total">0</td></tr>
+<tr class="row-total sort-totes-row"><td>Total Totes Loaded</td><td id="sort-totes-p1">0</td><td id="sort-totes-p2">0</td><td id="sort-totes-p3">0</td><td id="sort-totes-total">0</td></tr>
+<tr class="sort-grp"><td colspan="5">Rate (UPH, by path)</td></tr>
+<tr class="sort-path row-rate" data-sortpath="sort20lb"><td>&nbsp;&nbsp;20lb <span class="sort-rate-tgt" id="sort-rate-tgt-sort20lb"></span></td><td id="sort-r-sort20lb-p1">\u2014</td><td id="sort-r-sort20lb-p2">\u2014</td><td id="sort-r-sort20lb-p3">\u2014</td><td id="sort-r-sort20lb-total">\u2014</td></tr>
+<tr class="sort-path row-rate" data-sortpath="sort5lb"><td>&nbsp;&nbsp;5lb <span class="sort-rate-tgt" id="sort-rate-tgt-sort5lb"></span></td><td id="sort-r-sort5lb-p1">\u2014</td><td id="sort-r-sort5lb-p2">\u2014</td><td id="sort-r-sort5lb-p3">\u2014</td><td id="sort-r-sort5lb-total">\u2014</td></tr>
+<tr class="sort-path row-rate" data-sortpath="sortEuro"><td>&nbsp;&nbsp;Euro <span class="sort-rate-tgt" id="sort-rate-tgt-sortEuro"></span></td><td id="sort-r-sortEuro-p1">\u2014</td><td id="sort-r-sortEuro-p2">\u2014</td><td id="sort-r-sortEuro-p3">\u2014</td><td id="sort-r-sortEuro-total">\u2014</td></tr>
+<tr class="sort-path row-rate" data-sortpath="sortManual"><td>&nbsp;&nbsp;Manual <span class="sort-rate-tgt" id="sort-rate-tgt-sortManual"></span></td><td id="sort-r-sortManual-p1">\u2014</td><td id="sort-r-sortManual-p2">\u2014</td><td id="sort-r-sortManual-p3">\u2014</td><td id="sort-r-sortManual-total">\u2014</td></tr>
+<tr class="row-rate row-total"><td>Blended Rate (UPH)</td><td id="sort-rate-p1">\u2014</td><td id="sort-rate-p2">\u2014</td><td id="sort-rate-p3">\u2014</td><td id="sort-rate-total">\u2014</td></tr>
+<tr class="sort-grp"><td colspan="5">Hours &amp; CPLH</td></tr>
 <tr><td>Direct Hours</td><td id="sort-dhrs-p1">0</td><td id="sort-dhrs-p2">0</td><td id="sort-dhrs-p3">0</td><td id="sort-dhrs-total">0</td></tr>
-<tr class="row-cplh"><td class="bold">CPLH</td><td id="sort-cplh-p1">\u2014</td><td id="sort-cplh-p2">\u2014</td><td id="sort-cplh-p3">\u2014</td><td id="sort-cplh-total">\u2014</td></tr>
+<tr><td>Support Hours <span style="font-size:9px;color:#888;">(RC Sort Support)</span></td><td id="sort-shrs-p1">0</td><td id="sort-shrs-p2">0</td><td id="sort-shrs-p3">0</td><td id="sort-shrs-total">0</td></tr>
+<tr class="row-total"><td>Total Hours</td><td id="sort-thrs-p1">0</td><td id="sort-thrs-p2">0</td><td id="sort-thrs-p3">0</td><td id="sort-thrs-total">0</td></tr>
 </tbody></table></section>
 
 
@@ -3262,7 +3451,7 @@ function buildHTML(){return `
 <div class="goal-summary-col">
 <div class="goal-card ib-card"><div class="goal-header"><span class="goal-title">Inbound</span><span class="goal-pct" id="sum-ib-pct">\u2014</span></div><div class="goal-progress" id="ib-progress-wrap"><div class="goal-progress-bar green" id="ib-progress-bar" style="width:0%"></div><div class="period-marker" id="ib-marker-p1" data-label="P1" style="left:33%"></div><div class="period-marker" id="ib-marker-p2" data-label="P2" style="left:66%"></div></div><div class="goal-stats"><span>Goal <strong id="sum-stow-goal">\u2014</strong></span><span>Actual <strong id="sum-ib-actual">\u2014</strong></span><span>Remaining <strong id="sum-ib-remaining">\u2014</strong></span></div><div class="goal-stats"><span>\u25B2 <strong id="sum-stow-rate">\u2014</strong> Rate</span><span>\u2713 <strong id="sum-ib-cplh">\u2014</strong> CPLH</span></div><div class="pace-insight" id="ib-pace-insight"></div><div class="callback-insight" id="ib-callback"></div></div>
 <div class="goal-card ob-card"><div class="goal-header"><span class="goal-title">Outbound</span><span class="goal-pct" id="sum-ob-pct">\u2014</span></div><div class="goal-progress" id="ob-progress-wrap"><div class="goal-progress-bar green" id="ob-progress-bar" style="width:0%"></div><div class="period-marker" id="ob-marker-p1" data-label="P1" style="left:33%"></div><div class="period-marker" id="ob-marker-p2" data-label="P2" style="left:66%"></div></div><div class="goal-stats"><span>Goal <strong id="sum-pick-goal">\u2014</strong></span><span>Actual <strong id="sum-ob-actual">\u2014</strong></span><span>Remaining <strong id="sum-ob-remaining">\u2014</strong></span></div><div class="goal-stats"><span>\u25B2 <strong id="sum-pick-rate">\u2014</strong> Rate</span><span>\u2713 <strong id="sum-ob-cplh">\u2014</strong> CPLH</span></div><div class="pace-insight" id="ob-pace-insight"></div><div class="callback-insight" id="ob-callback"></div></div>
-<div class="goal-card sort-card" id="sort-summary-card"><div class="goal-header"><span class="goal-title">Sort</span><span class="goal-pct" id="sum-sort-pct">\u2014</span></div><div class="goal-progress"><div class="goal-progress-bar green" id="sort-progress-bar" style="width:0%"></div></div><div class="goal-stats"><span>Goal <strong id="sum-sort-goal">\u2014</strong></span><span>Actual <strong id="sum-sort-actual">\u2014</strong></span><span>Remaining <strong id="sum-sort-remaining">\u2014</strong></span></div><div class="goal-stats"><span>\u25B2 <strong id="sum-sort-rate">\u2014</strong> Rate</span><span>\u2713 <strong id="sum-sort-cplh">\u2014</strong> CPLH</span></div></div>
+<div class="goal-card sort-card" id="sort-summary-card"><div class="goal-header"><span class="goal-title">Sort</span><span class="goal-pct" id="sum-sort-pct">\u2014</span></div><div class="goal-progress"><div class="goal-progress-bar green" id="sort-progress-bar" style="width:0%"></div></div><div class="goal-stats"><span>Goal <strong id="sum-sort-goal">\u2014</strong></span><span>Actual <strong id="sum-sort-actual">\u2014</strong></span><span>Remaining <strong id="sum-sort-remaining">\u2014</strong></span></div><div class="goal-stats"><span>\u25B2 <strong id="sum-sort-rate">\u2014</strong> Rate</span></div></div>
 </div>
 <div class="icqa-panel" id="icqa-panel" style="background:#fff;border:2px solid #000;border-radius:4px;padding:10px 14px;">
 <input type="hidden" id="icqa-ro-target" value="">
@@ -3677,6 +3866,13 @@ function buildCSS2(){return `
 .metrics-table td{padding:4px 8px;text-align:center;border-bottom:1px solid #ccc;border-right:1px solid #ccc;}.metrics-table td:first-child{text-align:left;border-left:none;}.metrics-table td:last-child{border-right:none;}
 .metrics-table .bold{font-weight:700;}.row-sync td{font-weight:700;}.row-cplh td{font-weight:700;font-size:13px;}
 .row-rate td{color:#e65100;font-weight:600;}.row-fast td{color:#e65100;}.row-total td{border-top:2px solid #000;}.row-target td{background:#fff9c4;font-weight:700;}.row-hc td{color:#666;font-style:italic;}.row-wip td{font-style:italic;color:#666;}
+/* SORT per-path breakdown: group sub-headers + per-path rate-target chips. */
+.metrics-table tr.sort-grp td{background:#f3eefb;color:#6a1b9a;font-weight:700;font-size:10px;letter-spacing:.4px;text-transform:uppercase;text-align:left;border-top:2px solid #6a1b9a;}
+.metrics-table tr.sort-path td:first-child{padding-left:14px;}
+.sort-rate-tgt{font-size:9px;color:#6a1b9a;background:#f0e8fa;padding:1px 6px;border-radius:3px;font-weight:700;margin-left:6px;}
+.sort-tgt-table thead th{font-size:9px;color:#6a1b9a;}
+#sb-root.dark-mode .metrics-table tr.sort-grp td{background:#2a1f3d!important;color:#c9a8ff!important;}
+#sb-root.dark-mode .sort-rate-tgt{background:#2a1f3d!important;color:#c9a8ff!important;}
 .table-input{width:60px;padding:2px 5px;background:#ffffcc;border:1px solid #000;color:#000;border-radius:3px;font-size:12px;text-align:center;font-weight:700;-moz-appearance:textfield;}
 .table-input::-webkit-outer-spin-button,.table-input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
 .wip-eos{font-size:9px;color:#666;margin-right:4px;}
@@ -4038,7 +4234,7 @@ async function fetchHourlyData(){
             const stow=raw.stow||{},pStow=raw.palletStow||{},pick=raw.pick||{},obDock=raw.obDock||{},sort=raw.sort||{},ppr=raw.ppr||{},rsr=raw.rsr||{},toFluid=raw.toFluidLoad||{},toDock=raw.toDock||{};
             // OB loaded volume (cases) = TO Fluid Load jobs + Transfer Out Dock pallet cases (split
             // reports). Fall back to the legacy single obDock report if neither returned anything.
-            const obLoaded=((toFluid.jobs||0)+(toDock.caseUnits||0))||(obDock.fluidLoadJobs||0);
+            const obLoaded=(((toFluid.jobs||0)+(toDock.caseUnits||0))||(obDock.fluidLoadJobs||0))+(sort.totesLoaded||0);
             const obLoadedRate=toFluid.jph||obDock.fluidCaseJPH||0;
             const obLoadedHC=((toFluid.headcount||0)+(toDock.headcount||0))||obDock.headcount||0;
             const palletCases=pStow.palletCases||0;
@@ -4067,7 +4263,7 @@ async function fetchHourlyData(){
                     loadedHC:obLoadedHC,                     // active AAs on the dock this hour (TO Fluid Load + Dock)
                     wallBuilderHC:obDock.wallBuilderHC||0,   // Wall Builder HEADCOUNT (# AAs) from OB Dock report
                     loadedRate:obLoadedRate},                // Loaded Cartons Rate = TO Fluid Load JPH
-                sort:{totalUnits:sort.totalUnits||0,rate:sort.rate||0,directHours:sort.directHours||0,cplh:(sort.directHours||0)>0?sort.totalUnits/sort.directHours:0}
+                sort:{totalUnits:sort.totalUnits||0,rate:sort.rate||0,directHours:sort.directHours||0,supportHours:sort.supportHours||0,totalHours:sort.totalHours||0,cplh:(sort.cplh!=null?sort.cplh:((sort.totalHours||0)>0?sort.totalUnits/sort.totalHours:0))}
             };
         });
         renderHourlyTables(hourlyData,totalHours);
@@ -4669,7 +4865,8 @@ async function fetchEOSWashData(){
         // Transfer In + Pallet Transfer In cases) / THROUGHPUT hours, all over the 12hr window.
         const cplhPpr=cplhData.ppr||{};
         const siteThroughputVolSync=((cplhData.toFluidLoad?.jobs||0)+(cplhData.toDock?.caseUnits||0))
-            +(cplhData.stow?.totalUnits||0)+(cplhData.palletStow?.palletCases||0);
+            +(cplhData.stow?.totalUnits||0)+(cplhData.palletStow?.palletCases||0)
+            +(cplhData.sort?.totesLoaded||0);   // sort-site totes loaded = loaded freight
         const siteThroughputHrsSync=cplhPpr.throughputHrs||0;
         const siteCplhSync=siteThroughputHrsSync>0?siteThroughputVolSync/siteThroughputHrsSync:0;
         dbg('[SB-EOS siteCPLH] vol='+siteThroughputVolSync+' hrs='+siteThroughputHrsSync.toFixed(2)+' siteCPLH='+siteCplhSync.toFixed(2)+' (12hr window)');
@@ -4832,8 +5029,8 @@ function renderEOSWash(data){
     const dc=cfDensityColors();
     // Read existing Sync-tab plan inputs (no re-entry).
     const gv=id=>{const el=document.getElementById(id);if(!el)return 0;const raw=(el.value!=null&&el.value!=='')?el.value:el.textContent;return parseFloat(String(raw).replace(/,/g,''))||0;};
-    const ibBB=gv('ib-bb-goal'),ibPlan=gv('ib-goal-input');
-    const daBB=gv('ob-bb-goal'),daPlan=gv('ob-goal-input');
+    const ibPlan=gv('ib-goal-input');
+    const daPlan=gv('ob-goal-input');
     // IB/DA CPLH GOAL (used by the TOTAL "% to LP"): prefer the manual CPLH target input, but FALL
     // BACK to the GalaxyBI LP CPLH (loadLPValues().ibCplh/.obCplh) — the SAME value the Sync tab
     // shows as "IB/DA LP CPLH". This fixes the wash's IB/DA LP CPLH not populating when the manual
@@ -5294,12 +5491,10 @@ function renderEOSWash(data){
     const accuracyHTML=`<section class="eoswash-section">
         <h3>Shift Accuracy</h3>
         <table class="metrics-table eos-accuracy-table"><thead><tr><th>Metric</th><th>Plan</th><th>Actual</th><th>% to Plan</th></tr></thead><tbody>
-        ${accRow('IB 24hr BB',ibBB,ibActVol)}
         ${accRow('IB Shift LP BB',eosLpTargetIB,ibActVol)}
         ${accRow('IB Shift Plan',ibPlan,ibActVol)}
         ${accRow('IB CPLH',ibCplh,ibActCplhSync,2)}
         <tr><td colspan="4" style="height:6px;background:#888;"></td></tr>
-        ${accRow('OB 24hr BB',daBB,daActVol)}
         ${accRow('OB Shift LP BB',eosLpTargetDA,daActVol)}
         ${accRow('DA Shift Plan',daPlan,daActVol)}
         ${accRow('DA CPLH',daCplh,daActCplh,2)}
@@ -5713,7 +5908,11 @@ function makeLaunchDraggable(b){
 
 function launch(){
     if(boardActive)return;boardActive=true;
-    {const lb=document.getElementById('sb-launch');if(lb)lb.style.display='none';}
+    // REMOVE the launch button from the DOM before snapshotting originalBody, so the saved markup
+    // does NOT contain a (hidden) #sb-launch. Otherwise exitBoard restores that stale button and
+    // addLaunchBtn() no-ops on it (id already present) — leaving a dead/hidden button until the
+    // page is refreshed. With it removed here, exit always rebuilds a fresh, draggable button.
+    {const lb=document.getElementById('sb-launch');if(lb)lb.remove();}
     originalBody=document.body.innerHTML;
     const style=document.createElement('style');style.textContent=buildCSS()+buildCSS2();document.head.appendChild(style);
     document.body.innerHTML='<div id="sb-root">'+buildHTML()+'</div>';
@@ -5723,7 +5922,15 @@ function launch(){
     initBoard();
 }
 
-function exitBoard(){document.body.innerHTML=originalBody;boardActive=false;addLaunchBtn();}
+function exitBoard(){
+    document.body.innerHTML=originalBody;
+    boardActive=false;
+    // Drop any stale #sb-launch that may have been baked into originalBody (older sessions), so
+    // addLaunchBtn() always builds a fresh, draggable, visible button instead of no-opping on a
+    // dead one. Then rebuild it right away.
+    const stale=document.getElementById('sb-launch');if(stale)stale.remove();
+    addLaunchBtn();
+}
 
 function clearBoard(){
     // Clear all metric cells (not inputs, not target rows)
@@ -5763,7 +5970,8 @@ function initBoard(){
     document.getElementById('shift-select').value=config.shiftType;
     // Load targets
     const t=config.targets||{};
-    ['ib-bb-goal','ib-goal-input','ib-lp-plan-vol','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-lp-plan-vol','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','site-cplh-target','dept-ib-units','dept-ib-cases','dept-ib-days-units','dept-ib-days-cases','dept-ib-ipt','dept-da-units','dept-da-cases','dept-da-days-units','dept-da-days-cases','dept-da-ipt'].forEach(id=>{const el=document.getElementById(id);if(el&&t[id])el.value=t[id];});
+    ['ib-bb-goal','ib-goal-input','ib-lp-plan-vol','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-lp-plan-vol','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','sort-vol-sort20lb','sort-vol-sort5lb','sort-vol-sortEuro','sort-vol-sortManual','sort-rate-sort20lb','sort-rate-sort5lb','sort-rate-sortEuro','sort-rate-sortManual','site-cplh-target','dept-ib-units','dept-ib-cases','dept-ib-days-units','dept-ib-days-cases','dept-ib-ipt','dept-da-units','dept-da-cases','dept-da-days-units','dept-da-days-cases','dept-da-ipt'].forEach(id=>{const el=document.getElementById(id);if(el&&t[id])el.value=t[id];});
+    syncSortGoalFromPaths();
     // Load settings
     const ds=config.days,ns=config.nights;
     ['ds-full-sh','ds-full-sm','ds-full-eh','ds-full-em','ds-p1-sh','ds-p1-sm','ds-p1-eh','ds-p1-em','ds-p2-sh','ds-p2-sm','ds-p2-eh','ds-p2-em','ds-p3-sh','ds-p3-sm','ds-p3-eh','ds-p3-em'].forEach((id,i)=>{const vals=[ds.full.sh,ds.full.sm,ds.full.eh,ds.full.em,ds.p1.sh,ds.p1.sm,ds.p1.eh,ds.p1.em,ds.p2.sh,ds.p2.sm,ds.p2.eh,ds.p2.em,ds.p3.sh,ds.p3.sm,ds.p3.eh,ds.p3.em];const el=document.getElementById(id);if(el)el.value=vals[i];});
@@ -5804,8 +6012,8 @@ function initBoard(){
     document.getElementById('btn-view-current')?.addEventListener('click',()=>setDayView('current'));
     document.getElementById('btn-view-prior')?.addEventListener('click',()=>setDayView('prior'));
     document.getElementById('btn-clear-targets')?.addEventListener('click',()=>{
-        ['ib-bb-goal','ib-goal-input','ib-lp-plan-vol','ib-rate-target','ib-cplh-target','ib-density-target','ob-bb-goal','ob-goal-input','ob-lp-plan-vol','ob-rate-target','ob-cplh-target','ob-density-target','sort-goal','sort-rate-target','dept-ib-units','dept-ib-cases','dept-ib-days-units','dept-ib-days-cases','dept-ib-ipt','dept-da-units','dept-da-cases','dept-da-days-units','dept-da-days-cases','dept-da-ipt'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
-        saveTargetsUI();updateTargetRows();
+        ['ib-bb-goal','ib-goal-input','ib-lp-plan-vol','ib-rate-target','ib-cplh-target','ib-density-target','ob-bb-goal','ob-goal-input','ob-lp-plan-vol','ob-rate-target','ob-cplh-target','ob-density-target','sort-goal','sort-rate-target','sort-vol-sort20lb','sort-vol-sort5lb','sort-vol-sortEuro','sort-vol-sortManual','sort-rate-sort20lb','sort-rate-sort5lb','sort-rate-sortEuro','sort-rate-sortManual','dept-ib-units','dept-ib-cases','dept-ib-days-units','dept-ib-days-cases','dept-ib-ipt','dept-da-units','dept-da-cases','dept-da-days-units','dept-da-days-cases','dept-da-ipt'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
+        syncSortGoalFromPaths();saveTargetsUI();updateTargetRows();
         // Clear the % column displays
         ['ib-goal-pct','ib-rate-pct','ib-cplh-pct','ib-density-pct','ob-goal-pct','ob-rate-pct','ob-cplh-pct','ob-density-pct','sort-goal-pct','sort-rate-pct'].forEach(id=>{const el=document.getElementById(id);if(el){el.textContent='\u2014';el.classList.remove('pct-good','pct-warn','pct-bad');}});
     });
@@ -6060,7 +6268,11 @@ async function doFetch(isRetry){
         const cplhToDock=raw.cplhData?.toDock||{};
         const obDockFluid=((cplhToFluid.jobs||0)+(cplhToDock.caseUnits||0))||(raw.cplhData?.obDock?.fluidLoadJobs||0);
         const tHrs=cplhPpr.throughputHrs||0;
-        const siteThroughputVol=obDockFluid+stowJobs+palletCases24;
+        // Sort sites: totes loaded (RC Sort Support tote-wrangle) are loaded freight -> part of the
+        // Site CPLH loaded-volume numerator. 0 on non-sort sites. Hours (denominator) already
+        // include sort hours via the PPR throughput window, so only the volume is added here.
+        const cplhSortTotes=raw.cplhData?.sort?.totesLoaded||0;
+        const siteThroughputVol=obDockFluid+stowJobs+palletCases24+cplhSortTotes;
         const siteCplh=tHrs>0?siteThroughputVol/tHrs:0;
         setEl('site-cplh-value',siteCplh>0?fmt(siteCplh,2):'\u2014');
         // Color Site CPLH based on target
@@ -6157,8 +6369,36 @@ async function doFetch(isRetry){
     finally{btn.disabled=false;btn.textContent='\u25B6 Get Data';btn.classList.remove('btn-fetching');}
 }
 
+// Read the per-path Sort shift-plan targets from the inputs: {vol:{key:n}, rate:{key:n}}.
+// Used by renderSort to show each path's rate target and to compute the blended/total figures.
+function loadSortTargets(){
+    const vol={},rate={};
+    SORT_THROUGHPUT_KEYS.forEach(key=>{
+        vol[key]=parseFloat(document.getElementById('sort-vol-'+key)?.value)||0;
+        rate[key]=parseFloat(document.getElementById('sort-rate-'+key)?.value)||0;
+    });
+    return{vol,rate};
+}
+// Roll the per-path Sort volume plans into the single hidden sort-goal (summary card / hourly
+// still read sort-goal as the overall sort goal). Also fills the Shift Plan TOTAL row: total
+// volume plan, and a blended planned rate = total planned volume / sum(vol/rate) planned hours.
+function syncSortGoalFromPaths(){
+    const st=loadSortTargets();
+    let totVol=0,plannedHrs=0;
+    SORT_THROUGHPUT_KEYS.forEach(key=>{
+        const v=st.vol[key]||0,r=st.rate[key]||0;
+        totVol+=v;
+        if(v>0&&r>0)plannedHrs+=v/r;   // planned hours implied by this path's vol & rate
+    });
+    const blended=plannedHrs>0?totVol/plannedHrs:0;
+    const goalEl=document.getElementById('sort-goal');if(goalEl)goalEl.value=totVol>0?String(Math.round(totVol)):'';
+    const rateEl=document.getElementById('sort-rate-target');if(rateEl)rateEl.value=blended>0?blended.toFixed(1):'';
+    const vt=document.getElementById('sort-vol-total');if(vt)vt.textContent=totVol>0?fmt(totVol):'\u2014';
+    const bt=document.getElementById('sort-rate-blended-tgt');if(bt)bt.textContent=blended>0?fmt(blended,1):'\u2014';
+}
+
 function saveTargetsUI(){
-    const t={};['ib-bb-goal','ib-goal-input','ib-lp-plan-vol','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-lp-plan-vol','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','site-cplh-target','dept-ib-units','dept-ib-cases','dept-ib-days-units','dept-ib-days-cases','dept-ib-ipt','dept-da-units','dept-da-cases','dept-da-days-units','dept-da-days-cases','dept-da-ipt'].forEach(id=>{t[id]=document.getElementById(id)?.value||'';});
+    const t={};['ib-bb-goal','ib-goal-input','ib-lp-plan-vol','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-lp-plan-vol','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','sort-vol-sort20lb','sort-vol-sort5lb','sort-vol-sortEuro','sort-vol-sortManual','sort-rate-sort20lb','sort-rate-sort5lb','sort-rate-sortEuro','sort-rate-sortManual','site-cplh-target','dept-ib-units','dept-ib-cases','dept-ib-days-units','dept-ib-days-cases','dept-ib-ipt','dept-da-units','dept-da-cases','dept-da-days-units','dept-da-days-cases','dept-da-ipt'].forEach(id=>{t[id]=document.getElementById(id)?.value||'';});
     config.targets=t;saveConfig(config);
     // Save LP values separately
     const lp={ibCplh:document.getElementById('lp-ib-cplh')?.value||'',obCplh:document.getElementById('lp-ob-cplh')?.value||'',siteCplh:document.getElementById('lp-site-cplh')?.value||''};
