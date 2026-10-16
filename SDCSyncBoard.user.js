@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.21.5
+// @version      15.22.2
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -148,7 +148,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.21.5';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.22.2';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -198,31 +198,22 @@ function SB_whoami(){
 let _lastPing={action:'',at:0};
 function trackUsage(action){
     try{
-        const url=getMetricsUrl();
-        console.warn('[SB-usage] trackUsage('+action+') url='+(url?url:'(EMPTY - tracking off)'));
-        if(!url)return;   // tracking disabled until the creator sets the URL
+        const url=getMetricsUrl();if(!url)return;   // tracking disabled when no webhook configured
         // De-dupe accidental double-fires of the same action within 1.5s (e.g. rapid re-click).
-        const now=Date.now();if(_lastPing.action===action&&(now-_lastPing.at)<1500){console.warn('[SB-usage] de-duped '+action);return;}_lastPing={action,at:now};
-        // One-line Slack message (same single-"message"-variable shape the other triggers use), e.g.:
-        //   Usage | KRB3 | getData | snodgtyl | v15.21.0 | Oct 16, 06:31
+        const now=Date.now();if(_lastPing.action===action&&(now-_lastPing.at)<1500)return;_lastPing={action,at:now};
+        // One-line Slack message (single "message" variable, same shape as the other triggers):
+        //   Usage | KRB3 | getData | snodgtyl | v15.22.0 | Oct 16, 06:31
         const msg='Usage | '+((loadConfig().site||'').toUpperCase())+' | '+action+' | '+getUserAlias()+' | v'+SB_VERSION+' | '+fmtSlackTime(new Date().toISOString());
-        console.warn('[SB-usage] posting ->',msg);
-        // Post WITHOUT a Content-Type header (confirmed working from the console). Setting
-        // application/json triggers a CORS preflight that Slack's trigger endpoint rejects; omitting
-        // the header sends a "simple request" that goes straight through. Use a plain no-cors fetch
-        // (same as the manual test that landed in #syncboardusage). GM_xmlhttpRequest is tried first
-        // when available (also no custom header) and falls back to fetch.
+        // Post WITHOUT a Content-Type header: application/json triggers a CORS preflight that Slack's
+        // trigger endpoint rejects; omitting it sends a "simple request" that goes straight through.
         const payloadStr=JSON.stringify({message:msg});
         if(typeof GM_xmlhttpRequest==='function'){
             GM_xmlhttpRequest({method:'POST',url,data:payloadStr,
-                onload:(r)=>console.warn('[SB-usage] status='+r.status),
-                onerror:()=>{ // GM failed -> fall back to the plain fetch that works
-                    fetch(url,{method:'POST',mode:'no-cors',body:payloadStr}).then(()=>console.warn('[SB-usage] fetch fallback sent')).catch(e=>console.warn('[SB-usage] fetch fallback FAILED:',e));
-                },timeout:8000});
+                onerror:()=>{fetch(url,{method:'POST',mode:'no-cors',body:payloadStr}).catch(()=>{});},timeout:8000});
         }else{
-            fetch(url,{method:'POST',mode:'no-cors',body:payloadStr}).then(()=>console.warn('[SB-usage] fetch sent')).catch(e=>console.warn('[SB-usage] fetch FAILED:',e));
+            fetch(url,{method:'POST',mode:'no-cors',body:payloadStr}).catch(()=>{});
         }
-    }catch(e){console.warn('[SB-usage] threw:',e);}
+    }catch(e){/* never let tracking break the tool */}
 }
 
 function flowCageDensity(site,mode){
@@ -3461,7 +3452,7 @@ function buildHTML(){return `
 <tr><td>SOS FAST START</td><td><input type="number" id="ib-fast-sos" class="target-input" value="13" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ib-fast-sos-pct">\u2014</span></td></tr>
 <tr><td>EOL FAST START</td><td><input type="number" id="ib-fast-eol" class="target-input" value="18" readonly style="background:#eee;color:#333;cursor:default;"></td><td><span id="ib-fast-eol-pct">\u2014</span></td></tr>
 </tbody></table></div>
-<div class="tg-compact"><h4>OUTBOUND</h4><table class="target-table"><thead><tr><th></th><th>Target</th><th>%</th></tr></thead><tbody>
+<div class="tg-compact"><h4>DA</h4><table class="target-table"><thead><tr><th></th><th>Target</th><th>%</th></tr></thead><tbody>
 <tr><td>24 HR BB GOAL</td><td><span id="ob-bb-goal" style="font-weight:bold;">\u2014</span></td><td></td></tr>
 <tr><td>DA GOAL</td><td><input type="number" id="ob-goal-input" class="target-input"></td><td><span id="ob-goal-pct">\u2014</span></td></tr>
 <tr><td>OB LP SHIFT PLAN</td><td><input type="number" id="ob-lp-plan-vol" class="target-input"></td><td></td></tr>
@@ -3631,7 +3622,7 @@ function buildHTML(){return `
 <div class="sync-right">
 <div class="goal-summary-col">
 <div class="goal-card ib-card"><div class="goal-header"><span class="goal-title">Inbound</span><span class="goal-pct" id="sum-ib-pct">\u2014</span></div><div class="goal-progress" id="ib-progress-wrap"><div class="goal-progress-bar green" id="ib-progress-bar" style="width:0%"></div><div class="period-marker" id="ib-marker-p1" data-label="P1" style="left:33%"></div><div class="period-marker" id="ib-marker-p2" data-label="P2" style="left:66%"></div></div><div class="goal-stats"><span>Goal <strong id="sum-stow-goal">\u2014</strong></span><span>Actual <strong id="sum-ib-actual">\u2014</strong></span><span>Remaining <strong id="sum-ib-remaining">\u2014</strong></span></div><div class="goal-stats"><span>\u25B2 <strong id="sum-stow-rate">\u2014</strong> Rate</span><span>\u2713 <strong id="sum-ib-cplh">\u2014</strong> CPLH</span></div><div class="pace-insight" id="ib-pace-insight"></div><div class="callback-insight" id="ib-callback"></div></div>
-<div class="goal-card ob-card"><div class="goal-header"><span class="goal-title">Outbound</span><span class="goal-pct" id="sum-ob-pct">\u2014</span></div><div class="goal-progress" id="ob-progress-wrap"><div class="goal-progress-bar green" id="ob-progress-bar" style="width:0%"></div><div class="period-marker" id="ob-marker-p1" data-label="P1" style="left:33%"></div><div class="period-marker" id="ob-marker-p2" data-label="P2" style="left:66%"></div></div><div class="goal-stats"><span>Goal <strong id="sum-pick-goal">\u2014</strong></span><span>Actual <strong id="sum-ob-actual">\u2014</strong></span><span>Remaining <strong id="sum-ob-remaining">\u2014</strong></span></div><div class="goal-stats"><span>\u25B2 <strong id="sum-pick-rate">\u2014</strong> Rate</span><span>\u2713 <strong id="sum-ob-cplh">\u2014</strong> CPLH</span></div><div class="pace-insight" id="ob-pace-insight"></div><div class="callback-insight" id="ob-callback"></div></div>
+<div class="goal-card ob-card"><div class="goal-header"><span class="goal-title">DA</span><span class="goal-pct" id="sum-ob-pct">\u2014</span></div><div class="goal-progress" id="ob-progress-wrap"><div class="goal-progress-bar green" id="ob-progress-bar" style="width:0%"></div><div class="period-marker" id="ob-marker-p1" data-label="P1" style="left:33%"></div><div class="period-marker" id="ob-marker-p2" data-label="P2" style="left:66%"></div></div><div class="goal-stats"><span>Goal <strong id="sum-pick-goal">\u2014</strong></span><span>Actual <strong id="sum-ob-actual">\u2014</strong></span><span>Remaining <strong id="sum-ob-remaining">\u2014</strong></span></div><div class="goal-stats"><span>\u25B2 <strong id="sum-pick-rate">\u2014</strong> Rate</span><span>\u2713 <strong id="sum-ob-cplh">\u2014</strong> CPLH</span></div><div class="pace-insight" id="ob-pace-insight"></div><div class="callback-insight" id="ob-callback"></div></div>
 <div class="goal-card sort-card" id="sort-summary-card"><div class="goal-header"><span class="goal-title">Sort</span><span class="goal-pct" id="sum-sort-pct">\u2014</span></div><div class="goal-progress"><div class="goal-progress-bar green" id="sort-progress-bar" style="width:0%"></div></div><div class="goal-stats"><span>Goal <strong id="sum-sort-goal">\u2014</strong></span><span>Actual <strong id="sum-sort-actual">\u2014</strong></span><span>Remaining <strong id="sum-sort-remaining">\u2014</strong></span></div><div class="goal-stats"><span>\u25B2 <strong id="sum-sort-rate">\u2014</strong> Rate</span></div></div>
 </div>
 <div class="icqa-panel" id="icqa-panel" style="background:#fff;border:2px solid #000;border-radius:4px;padding:10px 14px;">
@@ -3715,7 +3706,7 @@ function buildHTML(){return `
 </div>
 <div>
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
-<span style="font-size:11px;font-weight:600;color:#e65100;">OUTBOUND</span>
+<span style="font-size:11px;font-weight:600;color:#e65100;">DA</span>
 <span style="font-size:11px;" id="bb24-ob-text">\u2014</span>
 </div>
 <div style="position:relative;background:#e0e0e0;border-radius:3px;height:12px;overflow:hidden;">
@@ -6229,26 +6220,29 @@ function initBoard(){
         // Driving truck shows ONLY on the Sync tab.
         {const tr=document.getElementById('sb-truck-road');if(tr)tr.style.display=(tab.dataset.tab==='sync')?'':'none';}
         window.scrollTo(0,0);
-        // Auto-load the Hourly tab the first time it's opened.
+        // Hourly tab: NO auto-fetch — the user clicks "Fetch Hourly" themselves (so usage counts
+        // reflect deliberate use). Show a prompt in the empty table instead.
         if(tab.dataset.tab==='hourly'){
             const ht=document.getElementById('hourly-tables');
-            if(ht&&ht.innerHTML.trim()===''){fetchHourlyData();}
+            if(ht&&ht.innerHTML.trim()===''){ht.innerHTML='<div style="padding:20px;font-size:14px;color:#666;">Click <strong>\u25B6 Fetch Hourly</strong> to load the hourly flow.</div>';}
         }
-        // Auto-load the EOS Wash tab the first time it's opened.
+        // EOS Wash tab: NO auto-fetch — the user clicks "Fetch EOS Wash" themselves. Prompt in the
+        // empty content area instead.
         if(tab.dataset.tab==='eoswash'){
             const et=document.getElementById('eoswash-content');
-            if(et&&et.innerHTML.trim()===''){fetchEOSWashData();}
+            if(et&&et.innerHTML.trim()===''){et.innerHTML='<div style="padding:20px;font-size:14px;color:#666;">Click <strong>\u25B6 Fetch EOS Wash</strong> to load.</div>';}
         }
         // Prime the Fast Start tab controls the first time it's opened (no auto-fetch:
         // Fast Start is a heavy, on-demand query, so the user clicks Run themselves).
         if(tab.dataset.tab==='faststart'){
             initFastStartControls();
         }
-        // Auto-load the VRETs tab the first time it's opened.
+        // VRETs tab: prime the week selector but NO auto-fetch — the user clicks "Fetch VRETs".
+        // Prompt in the empty content area instead.
         if(tab.dataset.tab==='vrets'){
             vretPopulateWeeks();
             const vc=document.getElementById('vrets-content');
-            if(vc&&vc.innerHTML.trim()===''){fetchVRETsData();}
+            if(vc&&vc.innerHTML.trim()===''){vc.innerHTML='<div style="padding:20px;font-size:14px;color:#666;">Click <strong>\u25B6 Fetch VRETs</strong> to load.</div>';}
         }
     });
     const sup=loadSupport();Object.keys(sup).forEach(id=>{const el=document.getElementById(id);if(el)el.value=sup[id];});
