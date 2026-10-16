@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.19.1
+// @version      15.21.3
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -143,6 +143,87 @@ function getSlackJobBalanceUrl(){try{const v=localStorage.getItem(SLACK_JOB_BALA
 function getSlackFastStartUrl(){try{const v=localStorage.getItem(SLACK_FASTSTART_KEY);return v!=null?v:SLACK_FASTSTART_DEFAULT;}catch(e){return SLACK_FASTSTART_DEFAULT;}}
 const SOS_LOG_KEY='syncboard_sosLog_v1';
 const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
+// --- USAGE TRACKING: posts a one-line "usage ping" to a Slack webhook each time the tool is used,
+// so the creator can tally uses per week in a Slack channel. Uses the SAME Slack-webhook plumbing
+// as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
+// baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
+// remains an optional per-browser override. Blank = tracking disabled. ---
+const SB_VERSION='15.21.3';   // keep in sync with the @version header; recorded on each usage ping
+const METRICS_URL_KEY='syncboard_metrics_url';
+// Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
+// it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
+// Baked-in #syncboardusage Slack trigger (base64 chunks of the path after /triggers/).
+const _mId=['RTAxNUdVR0QyVjYvMTIz','MjYxNTIwOTE4NzcvMDA5','ODc2ZDg3M2RkMmEwYTU1','ZjBhM2JiOGRmMjAxNTk='];   // base64 chunks of the Slack trigger path after 'https://hooks.slack.com/triggers/'
+function _metricsDefault(){try{if(!_mId.length)return'';return'https://hooks.slack.com/triggers/'+_mId.map(function(s){return atob(s);}).join('');}catch(e){return'';}}
+const METRICS_URL_DEFAULT=_metricsDefault();
+function getMetricsUrl(){try{const v=localStorage.getItem(METRICS_URL_KEY);return(v!=null&&v!=='')?v:METRICS_URL_DEFAULT;}catch(e){return METRICS_URL_DEFAULT;}}
+// Best-effort grab of the logged-in FCLM user's login/alias so uses can be attributed without the
+// user typing anything. FCLM renders it in the top header; we try a few known spots, then fall back
+// to a cached value or 'unknown'. Cached in localStorage once found so later pings are instant.
+function getUserAlias(){
+    try{
+        const cached=localStorage.getItem('syncboard_alias');
+        const valid=(t)=>t&&/^[a-z0-9]{3,20}$/i.test(t)&&!/^(the|and|for|home|menu|help|login|logout|user|name|site|date|time)$/i.test(t);
+        // 1) FCLM links to a person's badge photo / phonetool / people page carry the login.
+        //    e.g. href="...?employeeId=snodgtyl", "/users/snodgtyl", "phonetool.amazon.com/users/snodgtyl",
+        //    "badgephotos...?login=snodgtyl". Scan all anchors for these patterns.
+        const anchors=Array.from(document.querySelectorAll('a[href]'));
+        const rxes=[/[?&](?:login|user|userId|alias|employeeId)=([a-z0-9]{3,20})/i,/(?:phonetool|people|users)\/([a-z0-9]{3,20})/i,/badgephoto[^?]*\?[^#]*?(?:login|user)=([a-z0-9]{3,20})/i];
+        for(const a of anchors){const href=a.getAttribute('href')||'';for(const rx of rxes){const m=href.match(rx);if(m&&valid(m[1])){localStorage.setItem('syncboard_alias',m[1].toLowerCase());return m[1].toLowerCase();}}}
+        // 2) A badge/avatar <img> whose src encodes the login.
+        for(const img of Array.from(document.querySelectorAll('img[src]'))){const src=img.getAttribute('src')||'';const m=src.match(/(?:login|user|employeeId)=([a-z0-9]{3,20})/i);if(m&&valid(m[1])){localStorage.setItem('syncboard_alias',m[1].toLowerCase());return m[1].toLowerCase();}}
+        // 3) Known id/class candidates for a header login element.
+        const sels=['#login','#username','.loginName','#user-name','#header-user','.header-username','.user-login','#currentUser'];
+        for(const s of sels){const el=document.querySelector(s);const t=el&&(el.textContent||'').trim();if(valid(t)){localStorage.setItem('syncboard_alias',t.toLowerCase());return t.toLowerCase();}}
+        // 4) Text patterns anywhere near the top of the page.
+        const bodyTxt=(document.body&&document.body.innerText||'').slice(0,4000);
+        const m=bodyTxt.match(/(?:logged in as|signed in as|hello,?|welcome,?)\s*([a-z0-9]{3,20})/i);
+        if(m&&valid(m[1])){localStorage.setItem('syncboard_alias',m[1].toLowerCase());return m[1].toLowerCase();}
+        return cached||'unknown';
+    }catch(e){return 'unknown';}
+}
+// One-time debug helper you can run from the console: SB_whoami() prints what the page exposes so
+// we can tune getUserAlias for this site's FCLM layout. Lists candidate anchors/imgs that look
+// like they carry a login.
+function SB_whoami(){
+    try{
+        const hits=[];
+        document.querySelectorAll('a[href],img[src]').forEach(el=>{const v=el.getAttribute('href')||el.getAttribute('src')||'';if(/(login|user|alias|employeeId|phonetool|people\/|users\/|badgephoto)/i.test(v))hits.push(v);});
+        console.warn('[SB-whoami] alias detected =',getUserAlias());
+        console.warn('[SB-whoami] candidate links/imgs:',hits.slice(0,40));
+    }catch(e){console.warn('[SB-whoami] error',e);}
+}
+// Fire a usage ping (fire-and-forget, never blocks or throws). action e.g. 'getData','hourly',
+// 'faststart','eoswash','vrets'. Posts a one-line Slack message to the usage channel.
+let _lastPing={action:'',at:0};
+function trackUsage(action){
+    try{
+        const url=getMetricsUrl();
+        console.warn('[SB-usage] trackUsage('+action+') url='+(url?url:'(EMPTY - tracking off)'));
+        if(!url)return;   // tracking disabled until the creator sets the URL
+        // De-dupe accidental double-fires of the same action within 1.5s (e.g. rapid re-click).
+        const now=Date.now();if(_lastPing.action===action&&(now-_lastPing.at)<1500){console.warn('[SB-usage] de-duped '+action);return;}_lastPing={action,at:now};
+        // One-line Slack message (same single-"message"-variable shape the other triggers use), e.g.:
+        //   Usage | KRB3 | getData | snodgtyl | v15.21.0 | Oct 16, 06:31
+        const msg='Usage | '+((loadConfig().site||'').toUpperCase())+' | '+action+' | '+getUserAlias()+' | v'+SB_VERSION+' | '+fmtSlackTime(new Date().toISOString());
+        console.warn('[SB-usage] posting ->',msg);
+        // Post WITHOUT a Content-Type header (confirmed working from the console). Setting
+        // application/json triggers a CORS preflight that Slack's trigger endpoint rejects; omitting
+        // the header sends a "simple request" that goes straight through. Use a plain no-cors fetch
+        // (same as the manual test that landed in #syncboardusage). GM_xmlhttpRequest is tried first
+        // when available (also no custom header) and falls back to fetch.
+        const payloadStr=JSON.stringify({message:msg});
+        if(typeof GM_xmlhttpRequest==='function'){
+            GM_xmlhttpRequest({method:'POST',url,data:payloadStr,
+                onload:(r)=>console.warn('[SB-usage] status='+r.status),
+                onerror:()=>{ // GM failed -> fall back to the plain fetch that works
+                    fetch(url,{method:'POST',mode:'no-cors',body:payloadStr}).then(()=>console.warn('[SB-usage] fetch fallback sent')).catch(e=>console.warn('[SB-usage] fetch fallback FAILED:',e));
+                },timeout:8000});
+        }else{
+            fetch(url,{method:'POST',mode:'no-cors',body:payloadStr}).then(()=>console.warn('[SB-usage] fetch sent')).catch(e=>console.warn('[SB-usage] fetch FAILED:',e));
+        }
+    }catch(e){console.warn('[SB-usage] threw:',e);}
+}
 
 function flowCageDensity(site,mode){
     const t=mode==='load'?SITE_CAGE_DENSITY_LOAD:SITE_CAGE_DENSITY_STOW;
@@ -3494,7 +3575,7 @@ function buildHTML(){return `
 <tr class="row-lc-loss"><td colspan="5" id="ib-lc-loss" style="font-size:12px;color:#5B6B7A;padding:4px 0;">New-Hire LC Loss: \u2014</td></tr>
 </tbody></table></section>
 
-<section class="metrics-section ob-section"><div class="section-header"><h2>OUTBOUND | NTP</h2><span class="fclm-timestamp" id="ob-timestamp">\u2014</span></div>
+<section class="metrics-section ob-section"><div class="section-header"><h2>DA | NTP</h2><span class="fclm-timestamp" id="ob-timestamp">\u2014</span></div>
 <table class="metrics-table"><thead><tr><th></th><th>P1</th><th>P2</th><th>P3</th><th>Total</th></tr></thead><tbody>
 <tr class="row-target"><td class="bold">Targets</td><td id="ob-target-p1">\u2014</td><td id="ob-target-p2">\u2014</td><td id="ob-target-p3">\u2014</td><td id="ob-target-total">\u2014</td></tr>
 <tr class="row-sync"><td class="bold">Sync Metrics</td><td id="ob-sync-p1">0</td><td id="ob-sync-p2">0</td><td id="ob-sync-p3">0</td><td id="ob-sync-total">0</td></tr>
@@ -3734,7 +3815,9 @@ function buildHTML(){return `
 <div class="setting-row"><label>SOS cages</label><input type="text" id="slack-sos-url" class="select-input" placeholder="https://hooks.slack.com/triggers/\u2026" style="flex:1;min-width:280px;"></div>
 <div class="setting-row"><label>Job balance</label><input type="text" id="slack-jobbalance-url" class="select-input" placeholder="https://hooks.slack.com/triggers/\u2026" style="flex:1;min-width:280px;"></div>
 <div class="setting-row"><label>Fast Start</label><input type="text" id="slack-faststart-url" class="select-input" placeholder="https://hooks.slack.com/triggers/\u2026" style="flex:1;min-width:280px;"></div>
-<button id="btn-save-slack" class="btn btn-primary">\uD83D\uDCBE Save Slack URLs</button> <span id="slack-save-note" class="settings-note" style="margin-left:8px;"></span></div>
+<div class="setting-row"><label>Usage tracking</label><input type="text" id="metrics-url" class="select-input" placeholder="Slack usage-channel trigger URL\u2026" style="flex:1;min-width:280px;"></div>
+<p class="settings-note" style="margin:2px 0 8px;font-size:10px;">Usage tracking posts a one-line Slack message (site, action, login, time) to your usage channel on each Get Data / tab-fetch click so the creator can tally weekly uses. Blank = off.</p>
+<button id="btn-save-slack" class="btn btn-primary">\uD83D\uDCBE Save URLs</button> <span id="slack-save-note" class="settings-note" style="margin-left:8px;"></span></div>
 </div></main>
 `;}
 
@@ -6088,14 +6171,16 @@ function initBoard(){
         if(currentVRETs){renderVRETsTab(currentVRETs);updateVRETsPanel(currentVRETs);}};
     // Restore dark mode preference
     if(localStorage.getItem('syncboard_dark')==='1'){document.getElementById('sb-root').classList.add('dark-mode');document.getElementById('btn-dark').textContent='\u2600';}
-    document.getElementById('btn-fetch-hourly')?.addEventListener('click',fetchHourlyData);
-    document.getElementById('btn-fetch-eoswash')?.addEventListener('click',fetchEOSWashData);
-    document.getElementById('btn-fetch-faststart')?.addEventListener('click',fetchFastStartData);
+    // Usage pings fire on the actual BUTTON CLICK (not inside the fetch fns) so auto-loads and the
+    // internal VRETs refresh in doFetch don't inflate the count. One deliberate click = one ping.
+    document.getElementById('btn-fetch-hourly')?.addEventListener('click',()=>{trackUsage('hourly');fetchHourlyData();});
+    document.getElementById('btn-fetch-eoswash')?.addEventListener('click',()=>{trackUsage('eoswash');fetchEOSWashData();});
+    document.getElementById('btn-fetch-faststart')?.addEventListener('click',()=>{trackUsage('faststart');fetchFastStartData();});
     document.getElementById('btn-save-fs-sos')?.addEventListener('click',()=>saveFastStartSnapshot('SOS'));
     document.getElementById('btn-save-fs-break')?.addEventListener('click',()=>saveFastStartSnapshot('1st Break'));
     document.getElementById('btn-email-eoswash')?.addEventListener('click',emailEOSWash);
     initEosPlanInputs(); // seed + wire the manual IB/DA daily-plan target inputs
-    document.getElementById('btn-fetch-vrets')?.addEventListener('click',fetchVRETsData);
+    document.getElementById('btn-fetch-vrets')?.addEventListener('click',()=>{trackUsage('vrets');fetchVRETsData();});
     // Populate the VRETs week selector and default goal input on init.
     vretPopulateWeeks();
     { const gi=document.getElementById('vrets-goal-input'); if(gi&&!gi.value)gi.value=vretLoadGoal();
@@ -6117,13 +6202,14 @@ function initBoard(){
     document.getElementById('btn-clear-actions')?.addEventListener('click',()=>{if(confirm('Clear all actions?')){saveActions([]);renderActions();}});
     document.getElementById('btn-save-settings')?.addEventListener('click',saveSettingsUI);
     // Prefill the Settings Slack fields from localStorage (the only place the URLs live).
-    { const sos=document.getElementById('slack-sos-url'),jb=document.getElementById('slack-jobbalance-url'),fs=document.getElementById('slack-faststart-url');
-      if(sos)sos.value=getSlackSosUrl();if(jb)jb.value=getSlackJobBalanceUrl();if(fs)fs.value=getSlackFastStartUrl(); }
+    { const sos=document.getElementById('slack-sos-url'),jb=document.getElementById('slack-jobbalance-url'),fs=document.getElementById('slack-faststart-url'),mu=document.getElementById('metrics-url');
+      if(sos)sos.value=getSlackSosUrl();if(jb)jb.value=getSlackJobBalanceUrl();if(fs)fs.value=getSlackFastStartUrl();if(mu)mu.value=getMetricsUrl(); }
     document.getElementById('btn-save-slack')?.addEventListener('click',()=>{
         const sos=(document.getElementById('slack-sos-url')?.value||'').trim();
         const jb=(document.getElementById('slack-jobbalance-url')?.value||'').trim();
         const fs=(document.getElementById('slack-faststart-url')?.value||'').trim();
-        try{localStorage.setItem(SLACK_SOS_KEY,sos);localStorage.setItem(SLACK_JOB_BALANCE_KEY,jb);localStorage.setItem(SLACK_FASTSTART_KEY,fs);}catch(e){}
+        const mu=(document.getElementById('metrics-url')?.value||'').trim();
+        try{localStorage.setItem(SLACK_SOS_KEY,sos);localStorage.setItem(SLACK_JOB_BALANCE_KEY,jb);localStorage.setItem(SLACK_FASTSTART_KEY,fs);localStorage.setItem(METRICS_URL_KEY,mu);}catch(e){}
         const note=document.getElementById('slack-save-note');if(note){note.textContent='\u2713 Saved (this browser only)';setTimeout(()=>{note.textContent='';},2500);}
     });
     sel.onchange=e=>{config.site=e.target.value;if(SITE_SCHEDULES[config.site]){config.days=SITE_SCHEDULES[config.site].days;config.nights=SITE_SCHEDULES[config.site].nights;}saveConfig(config);refreshSettingsInputs();currentMetrics=null;clearBoard();updatePeriodDots();};
@@ -6304,6 +6390,7 @@ async function doFetch(isRetry){
     dayData[0]=null;dayData[1]=null;
     priorBBGoals.ib=0;priorBBGoals.ob=0;priorBBGoals.vret=0;   // yesterday's goals re-fetch on next Prior Day render
     const btn=document.getElementById('btn-fetch');btn.disabled=true;btn.textContent=isRetry?'\u23F3 Retrying...':'\u23F3 Fetching...';btn.classList.add('btn-fetching');
+    if(!isRetry)trackUsage('getData');   // usage ping (not on auto-retries, so one click = one use)
     try{
         const raw=await fetchAllData(config);
         // Session-expiry detection. A stale FCLM session returns a TOTAL blackout (every report
@@ -6853,4 +6940,6 @@ function initFastStartControls(){
 }
 
 ensureLaunchBtn();
+// Expose the alias debugger to the console (works across TM's sandbox): run SB_whoami()
+try{(typeof unsafeWindow!=='undefined'?unsafeWindow:window).SB_whoami=SB_whoami;}catch(e){try{window.SB_whoami=SB_whoami;}catch(_){}}
 })();
