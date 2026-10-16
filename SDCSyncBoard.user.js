@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.21.4
+// @version      15.21.5
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -148,7 +148,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.21.4';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.21.5';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -6382,8 +6382,14 @@ function reauthFclmAndRetry(){
 }
 
 async function doFetch(isRetry){
-    console.warn('[SB-usage] doFetch entered isRetry='+isRetry+' SB_VERSION='+SB_VERSION);   // build marker
-    if(!isRetry)trackUsage('getData');   // usage ping FIRST, before anything can throw/abort
+    // NOTE: doFetch is also wired as a click handler, so a real click passes a PointerEvent as the
+    // first arg (truthy!). Only treat it as an auto-retry when isRetry is the EXPLICIT 'reauth'
+    // flag the retry path passes — otherwise a user click would be mis-detected as a retry and the
+    // usage ping (and retry logic) would be skipped.
+    // Retry calls pass a STRING flag ('quick' / 'reauth'); a real user click passes a PointerEvent
+    // (or nothing). So treat ONLY string args as retries -> ping fires on genuine clicks only.
+    const _realRetry=(typeof isRetry==='string');
+    if(!_realRetry)trackUsage('getData');   // usage ping FIRST, before anything can throw/abort
     config=loadConfig();config.site=document.getElementById('site-select').value;config.shiftType=document.getElementById('shift-select').value;saveConfig(config);
     // Invalidate the day caches so they re-fetch for the (possibly new) site/day. Note which day
     // view is currently showing so we can refresh it after this fetch.
@@ -6391,7 +6397,7 @@ async function doFetch(isRetry){
     const priDayVisible=document.getElementById('spt-prior-view')?.style.display!=='none';
     dayData[0]=null;dayData[1]=null;
     priorBBGoals.ib=0;priorBBGoals.ob=0;priorBBGoals.vret=0;   // yesterday's goals re-fetch on next Prior Day render
-    const btn=document.getElementById('btn-fetch');btn.disabled=true;btn.textContent=isRetry?'\u23F3 Retrying...':'\u23F3 Fetching...';btn.classList.add('btn-fetching');
+    const btn=document.getElementById('btn-fetch');btn.disabled=true;btn.textContent=_realRetry?'\u23F3 Retrying...':'\u23F3 Fetching...';btn.classList.add('btn-fetching');
     try{
         const raw=await fetchAllData(config);
         // Session-expiry detection. A stale FCLM session returns a TOTAL blackout (every report
@@ -6418,7 +6424,7 @@ async function doFetch(isRetry){
             // WITHOUT a reload: load the FCLM portal in a hidden iframe to refresh the cookie,
             // wait, then auto-retry the fetch. isRetry===undefined -> quick immediate retry;
             // isRetry==='reauth' -> we've already tried the iframe re-auth once.
-            if(!isRetry){
+            if(!_realRetry){
                 setStatus('\u21BB Refreshing data...');
                 return doFetch('quick');
             }
