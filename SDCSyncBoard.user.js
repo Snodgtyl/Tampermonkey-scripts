@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.22.2
+// @version      15.23.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -64,6 +64,10 @@ const SITE_SCHEDULES = {
 const SHIFT_HOURS = { KRB3:{block:10, ops:9.25} };
 const SHIFT_HOURS_DEFAULT = {block:10, ops:9.25};
 const PROCESS_IDS = { stow:'1003035', palletStow:'1003041', pick:'1003065', sort:'1003009', obDock:'1003021', icqa:'1003030', vretPack:'1003056', vretPick:'1003034', rsr:'01003012',
+    // OB NTP (Pack & Ship area, processId 1002991): actual-only metric, no plan. We read ItemPacked
+    // Jobs (tfoot idx1) + ItemShipped Jobs (tfoot idx7) + Total Paid Hours (idx0). Combined jobs
+    // (packed+shipped) feed the Site CPLH volume numerator. Sites without this report -> 0 (hidden).
+    obNtp:'1002991',
     // TO (Transfer Out) loaded volume was split into two separate reports (line-item / process-id
     // changes). Fluid-load totes+cases now live under "TO Fluid Load" (toFluidLoad); pallet-loaded
     // cases live under "Transfer Out Dock" (toDock). loadedUnits = fluid-load jobs + dock pallet cases.
@@ -148,7 +152,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.22.2';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.23.0';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -697,6 +701,20 @@ function parsePalletizeTote(html){
     if(jobs>0)dbg('[SB-PalletizeTote] jobs='+jobs+' hrs='+paidHours+' hc='+headcount);
     return{jobs,directHours:paidHours,headcount};
 }
+// OB NTP (Pack & Ship, processId 1002991). Actual-only. The report's tfoot grand-total has two
+// groups (ItemPacked, ItemShipped). From the sample: [paidHours, packedJobs, packedJPH, ...EACH/
+// Package..., shippedJobs, shippedJPH, ...]. ItemPacked Jobs = idx1, ItemShipped Jobs = idx7,
+// Total Paid Hours = idx0. We surface packed, shipped, combined (packed+shipped), hours, and a
+// blended rate (combined/hours). 0/absent on sites without the report.
+function parseObNtp(html){
+    const {nums,headcount}=fnRollupTotalNums(html);
+    const hours=nums.length>=1?nums[0]:0;
+    const packed=nums.length>=2?Math.round(nums[1]):0;
+    const shipped=nums.length>=8?Math.round(nums[7]):0;
+    const combined=packed+shipped;
+    if(combined>0||hours>0)dbg('[SB-OBNTP] packed='+packed+' shipped='+shipped+' combined='+combined+' hrs='+hours+' hc='+headcount);
+    return{packed,shipped,combined,directHours:hours,rate:hours>0?combined/hours:0,headcount};
+}
 // "Transfer Out Dock" report (processId 1003022). Pallet-loaded cases for TO loaded volume.
 // tfoot Total numerics are [paidHours, Jobs, JPH, Case-UNIT, Case-UPH, Pallet-UNIT, Pallet-UPH]
 // e.g. [0.04, 10, 285.71, 389, 11114.29, 10, 285.71] -> cases=389, pallets=10.
@@ -797,13 +815,15 @@ async function fetchPeriod(site,startDate,sched){
     Object.entries(SORT_PATHS).forEach(([k,pid])=>{urls['sort_'+k]=buildFnUrl(site,pid,sDate,sh,sm,eDate,eh,em);});
     // Palletize - Tote report (loaded palletized totes). Parsed by parsePalletizeTote below.
     urls.palletizeTote=buildFnUrl(site,PROCESS_IDS.palletizeTote,sDate,sh,sm,eDate,eh,em);
+    // OB NTP (Pack & Ship) report. Parsed by parseObNtp below.
+    urls.obNtp=buildFnUrl(site,PROCESS_IDS.obNtp,sDate,sh,sm,eDate,eh,em);
     const res={};
     // Dispatch each report to its parser. PPR uses parsePPR; the split TO reports use their own
     // parsers; everything else (incl. each sort_* path) uses the generic fn-rollup parser.
-    const parseFor=(k,h)=>{if(k==='ppr')return parsePPR(h);if(k==='toFluidLoad')return parseToFluidLoad(h);if(k==='toDock')return parseToDock(h);if(k==='palletizeTote')return parsePalletizeTote(h);
+    const parseFor=(k,h)=>{if(k==='ppr')return parsePPR(h);if(k==='toFluidLoad')return parseToFluidLoad(h);if(k==='toDock')return parseToDock(h);if(k==='palletizeTote')return parsePalletizeTote(h);if(k==='obNtp')return parseObNtp(h);
         if(k==='sort_rcSortSupport'){const base=parseFnRollup(h);base.totes=parseToteWrangled(h);return base;}
         return parseFnRollup(h);};
-    const emptyFor=(k)=>{if(k==='ppr')return{ibPlannedHrs:0,ibActualHrs:0,obPlannedHrs:0,obActualHrs:0,daTransferHrs:0,daTransferPlan:0,caseStowReserveHrs:0,throughputVol:0,throughputHrs:0,totHrs:0};if(k==='toFluidLoad')return{jobs:0,caseUnits:0,eachUnits:0,jph:0,fluidToteUnits:0,directHours:0,headcount:0};if(k==='toDock')return{caseUnits:0,palletUnits:0,jobs:0,directHours:0,headcount:0};if(k==='palletizeTote')return{jobs:0,directHours:0,headcount:0};return{totalUnits:0,directHours:0,rate:0,headcount:0};};
+    const emptyFor=(k)=>{if(k==='ppr')return{ibPlannedHrs:0,ibActualHrs:0,obPlannedHrs:0,obActualHrs:0,daTransferHrs:0,daTransferPlan:0,caseStowReserveHrs:0,throughputVol:0,throughputHrs:0,totHrs:0};if(k==='toFluidLoad')return{jobs:0,caseUnits:0,eachUnits:0,jph:0,fluidToteUnits:0,directHours:0,headcount:0};if(k==='toDock')return{caseUnits:0,palletUnits:0,jobs:0,directHours:0,headcount:0};if(k==='palletizeTote')return{jobs:0,directHours:0,headcount:0};if(k==='obNtp')return{packed:0,shipped:0,combined:0,directHours:0,rate:0,headcount:0};return{totalUnits:0,directHours:0,rate:0,headcount:0};};
     await Promise.all(Object.entries(urls).map(async([k,u])=>{try{const h=await fetchHTML(u);res[k]=parseFor(k,h);}catch(e){console.warn('[SB]',k,e.message);res[k]=emptyFor(k);}}));
     res.sort=aggregateSort(res);
     return res;
@@ -1940,12 +1960,14 @@ async function fetchDayData(site,dayOffset){
         // Palletize - Tote (loaded palletized totes) for sort sites. 0 at non-sort sites. Combined
         // with the Fluid Load - Tote units (parsed from the TO Fluid Load report below) = loaded totes.
         const palletizeToteUrl=buildFnUrl(site,PROCESS_IDS.palletizeTote,start,0,0,end,eh,em);
+        // OB NTP (Pack & Ship) for sites that have it. Combined jobs feed Site CPLH volume. 0 otherwise.
+        const obNtpUrl=buildFnUrl(site,PROCESS_IDS.obNtp,start,0,0,end,eh,em);
         // PPR over the window for the hours (IB actual, DA transfer, throughput).
         const pprUrl=buildPPRUrl(site,start,0,0,end,eh,em);
         // VRET actual = Vendor Return PACK EACH-Total over the day window (same source + basis the
         // VRETs tab uses via vretFetchOne). Compared against the GalaxyBI Vendor Returns LP plan.
-        const [stowHtml,palletStowHtml,toFluidHtml,toDockHtml,palletizeToteHtml,pprHtml,vretPackVol]=await Promise.all([
-            fetchHTML(stowUrl),fetchHTML(palletStowUrl),fetchHTML(toFluidUrl),fetchHTML(toDockUrl),fetchHTML(palletizeToteUrl),fetchHTML(pprUrl),
+        const [stowHtml,palletStowHtml,toFluidHtml,toDockHtml,palletizeToteHtml,obNtpHtml,pprHtml,vretPackVol]=await Promise.all([
+            fetchHTML(stowUrl),fetchHTML(palletStowUrl),fetchHTML(toFluidUrl),fetchHTML(toDockUrl),fetchHTML(palletizeToteUrl),fetchHTML(obNtpUrl),fetchHTML(pprUrl),
             vretFetchOne(site,PROCESS_IDS.vretPack,start,0,0,end,eh,em)
         ]);
         const stow=parseFnRollup(stowHtml);
@@ -1954,6 +1976,8 @@ async function fetchDayData(site,dayOffset){
         const toDock=parseToDock(toDockHtml);
         // Loaded totes = Fluid Load - Tote units + Palletize - Tote jobs (loaded freight).
         const sortTotesLoaded=(toFluid.fluidToteUnits||0)+((parsePalletizeTote(palletizeToteHtml)||{}).jobs||0);
+        // OB NTP (Pack & Ship) combined jobs for the Site CPLH volume. 0 on sites without it.
+        const obNtpCombined=(parseObNtp(obNtpHtml)||{}).combined||0;
         const ppr=parsePPR(pprHtml);
         const palletCases=pStow.palletCases||0;
         const ibVol=(stow.totalUnits||0)+palletCases;
@@ -1966,7 +1990,7 @@ async function fetchDayData(site,dayOffset){
         const tHrs=ppr.throughputHrs||0;
         const ibCplh=ibHrs>0?ibVol/ibHrs:0;
         const obCplh=daHrs>0?obVol/daHrs:0;
-        const siteVol=obVol+(stow.totalUnits||0)+palletCases;
+        const siteVol=obVol+(stow.totalUnits||0)+palletCases+obNtpCombined;   // + OB NTP (Pack & Ship)
         const siteCplh=tHrs>0?siteVol/tHrs:0;
         const vretVol=vretPackVol||0;
         dbg('[SB-Day'+off+'] '+fmtDate(start)+' ibVol='+ibVol+' obVol='+obVol+' vretVol='+vretVol+' ibCplh='+ibCplh.toFixed(2)+' obCplh='+obCplh.toFixed(2)+' siteCplh='+siteCplh.toFixed(2)+' (ibHrs='+ibHrs+' daHrs='+daHrs+' tHrs='+tHrs+')');
@@ -2786,7 +2810,7 @@ function renderLCLoss(elId,lcHours,lcUnits,lcCounts,lcRates){
 
 // === DATA PROCESSING (cumulative) ===
 function processData(raw){
-    const m={ib:{},ob:{},sort:{}};
+    const m={ib:{},ob:{},sort:{},obntp:{}};
     const config=loadConfig();
     const sched=config.shiftType==='Nights'?config.nights:config.days;
     // Period durations in hours (for HC calculation)
@@ -2865,6 +2889,10 @@ function processData(raw){
         // directHours = throughput (direct) hours, supportHours = RC Sort Support (indirect) hours,
         // totalHours = direct + support. rate = units/directHours (JPH); cplh = units/totalHours.
         m.sort[p]={totalUnits:sort.totalUnits||0,directHours:sort.directHours||0,supportHours:sort.supportHours||0,totalHours:sort.totalHours||((sort.directHours||0)+(sort.supportHours||0)),rate:sort.rate||0,headcount:sort.headcount||0,cplh:(sort.cplh!=null?sort.cplh:((sort.totalHours||0)>0?sort.totalUnits/sort.totalHours:0)),perPath:sort.perPath||{},totesLoaded:sort.totesLoaded||0,totesPerPath:sort.totesPerPath||{}};
+        // OB NTP (Pack & Ship): actual-only. packed+shipped jobs, hours, blended rate. 0 on sites
+        // without the report. Combined jobs flow into the Site CPLH volume numerator (below/elsewhere).
+        const obntp=d.obNtp||{};
+        m.obntp[p]={packed:obntp.packed||0,shipped:obntp.shipped||0,combined:obntp.combined||0,directHours:obntp.directHours||0,rate:obntp.rate||0,headcount:obntp.headcount||0};
     });
     // Cumulative running totals for the SYNC METRICS rows ONLY (IB totalStow, OB syncLoaded,
     // Sort totalUnits). The per-period rows (CTI/PTI, Pick - Total, Cases Picked, Loaded per
@@ -2939,7 +2967,8 @@ function blankFuturePeriods(config){
         if(!hasPeriodStarted(periods[idx],config)){
             const prefixes=['ib-sync-','ib-stow-','ib-cases-','ib-pallets-','ib-cti-','ib-rate-','ib-density-','ib-dhrs-','ib-dpct-','ib-ihrs-','ib-ipct-','ib-thrs-','ib-cplh-','ib-op-',
                 'ob-sync-','ob-pick-','ob-cases-','ob-rate-','ob-density-','ob-loadp-','ob-palletloaded-','ob-dhrs-','ob-dpct-','ob-ihrs-','ob-ipct-','ob-thrs-','ob-cplh-','ob-op-',
-                'sort-total-','sort-units-','sort-rate-','sort-dhrs-'];
+                'sort-total-','sort-units-','sort-rate-','sort-dhrs-',
+                'obntp-packed-','obntp-shipped-','obntp-combined-','obntp-hrs-','obntp-rate-'];
             prefixes.forEach(pre=>{const el=document.getElementById(pre+pk);if(el){el.textContent='';el.style.background='';}});
         }
     });
@@ -3097,6 +3126,23 @@ function renderSort(m){
     setEl('sort-dhrs-p1',fmt(p1.directHours,2));setEl('sort-dhrs-p2',fmt(p2.directHours,2));setEl('sort-dhrs-p3',fmt(p3.directHours,2));setEl('sort-dhrs-total',fmt(f.directHours,2));
     setEl('sort-shrs-p1',fmt(p1.supportHours,2));setEl('sort-shrs-p2',fmt(p2.supportHours,2));setEl('sort-shrs-p3',fmt(p3.supportHours,2));setEl('sort-shrs-total',fmt(f.supportHours,2));
     setEl('sort-thrs-p1',fmt(p1.totalHours,2));setEl('sort-thrs-p2',fmt(p2.totalHours,2));setEl('sort-thrs-p3',fmt(p3.totalHours,2));setEl('sort-thrs-total',fmt(f.totalHours,2));
+}
+
+// OB NTP (Pack & Ship) section — actual-only, no plan. Shows per-period packed/shipped/combined
+// jobs, hours, and rate. The whole section hides on sites that don't run this process (combined=0
+// across the shift). Combined jobs also feed the Site CPLH volume numerator (handled where Site
+// CPLH is computed).
+function renderObNtp(m){
+    const p1=m.obntp.p1||{},p2=m.obntp.p2||{},p3=m.obntp.p3||{},f=m.obntp.full||{};
+    const sec=document.getElementById('obntp-section');
+    const hasData=(f.combined||0)>0||(f.directHours||0)>0;
+    if(sec)sec.style.display=hasData?'':'none';
+    if(!hasData)return;
+    setEl('obntp-packed-p1',fmt(p1.packed));setEl('obntp-packed-p2',fmt(p2.packed));setEl('obntp-packed-p3',fmt(p3.packed));setEl('obntp-packed-total',fmt(f.packed));
+    setEl('obntp-shipped-p1',fmt(p1.shipped));setEl('obntp-shipped-p2',fmt(p2.shipped));setEl('obntp-shipped-p3',fmt(p3.shipped));setEl('obntp-shipped-total',fmt(f.shipped));
+    setEl('obntp-combined-p1',fmt(p1.combined));setEl('obntp-combined-p2',fmt(p2.combined));setEl('obntp-combined-p3',fmt(p3.combined));setEl('obntp-combined-total',fmt(f.combined));
+    setEl('obntp-hrs-p1',fmt(p1.directHours,2));setEl('obntp-hrs-p2',fmt(p2.directHours,2));setEl('obntp-hrs-p3',fmt(p3.directHours,2));setEl('obntp-hrs-total',fmt(f.directHours,2));
+    setEl('obntp-rate-p1',fmt(p1.rate,1));setEl('obntp-rate-p2',fmt(p2.rate,1));setEl('obntp-rate-p3',fmt(p3.rate,1));setEl('obntp-rate-total',fmt(f.rate,1));
 }
 
 function updateTargetRows(){
@@ -3587,6 +3633,15 @@ function buildHTML(){return `
 <tr class="row-fast"><td>Fast Start</td><td id="ob-fast-p1">\u2014</td><td id="ob-fast-p2">\u2014</td><td id="ob-fast-p3">\u2014</td><td></td></tr>
 <tr class="row-lc"><td colspan="5" id="ob-lc-display" style="font-size:11px;color:#5B6B7A;">Learning Curve Mix: \u2014</td></tr>
 <tr class="row-lc-loss"><td colspan="5" id="ob-lc-loss" style="font-size:12px;color:#5B6B7A;padding:4px 0;">New-Hire LC Loss: \u2014</td></tr>
+</tbody></table></section>
+
+<section class="metrics-section ob-section" id="obntp-section"><div class="section-header"><h2>OB | NTP</h2><span class="meta-text" style="font-size:10px;color:#888;">Pack &amp; Ship</span></div>
+<table class="metrics-table"><thead><tr><th></th><th>P1</th><th>P2</th><th>P3</th><th>Total</th></tr></thead><tbody>
+<tr><td>Jobs Packed</td><td id="obntp-packed-p1">0</td><td id="obntp-packed-p2">0</td><td id="obntp-packed-p3">0</td><td id="obntp-packed-total">0</td></tr>
+<tr><td>Jobs Shipped</td><td id="obntp-shipped-p1">0</td><td id="obntp-shipped-p2">0</td><td id="obntp-shipped-p3">0</td><td id="obntp-shipped-total">0</td></tr>
+<tr class="row-total"><td>Total Jobs <span style="font-size:9px;color:#888;">(Packed + Shipped)</span></td><td id="obntp-combined-p1">0</td><td id="obntp-combined-p2">0</td><td id="obntp-combined-p3">0</td><td id="obntp-combined-total">0</td></tr>
+<tr><td>Total Hours</td><td id="obntp-hrs-p1">0</td><td id="obntp-hrs-p2">0</td><td id="obntp-hrs-p3">0</td><td id="obntp-hrs-total">0</td></tr>
+<tr class="row-rate"><td>Rate (JPH)</td><td id="obntp-rate-p1">\u2014</td><td id="obntp-rate-p2">\u2014</td><td id="obntp-rate-p3">\u2014</td><td id="obntp-rate-total">\u2014</td></tr>
 </tbody></table></section>
 
 <section class="metrics-section sort-section" id="sort-section"><div class="section-header"><h2>SORT | NTP</h2></div>
@@ -5034,7 +5089,8 @@ async function fetchEOSWashData(){
         const cplhPpr=cplhData.ppr||{};
         const siteThroughputVolSync=((cplhData.toFluidLoad?.jobs||0)+(cplhData.toDock?.caseUnits||0))
             +(cplhData.stow?.totalUnits||0)+(cplhData.palletStow?.palletCases||0)
-            +((cplhData.toFluidLoad?.fluidToteUnits||0)+(cplhData.palletizeTote?.jobs||0));   // loaded totes = Fluid Load tote + Palletize tote
+            +((cplhData.toFluidLoad?.fluidToteUnits||0)+(cplhData.palletizeTote?.jobs||0))   // loaded totes = Fluid Load tote + Palletize tote
+            +(cplhData.obNtp?.combined||0);   // OB NTP (Pack & Ship) combined jobs
         const siteThroughputHrsSync=cplhPpr.throughputHrs||0;
         const siteCplhSync=siteThroughputHrsSync>0?siteThroughputVolSync/siteThroughputHrsSync:0;
         dbg('[SB-EOS siteCPLH] vol='+siteThroughputVolSync+' hrs='+siteThroughputHrsSync.toFixed(2)+' siteCPLH='+siteCplhSync.toFixed(2)+' (12hr window)');
@@ -6437,7 +6493,7 @@ async function doFetch(isRetry){
             btn.disabled=false;btn.textContent='\u25B6 Get Data';return;
         }
         currentMetrics=processData(raw);
-        renderIB(currentMetrics);renderOB(currentMetrics);renderSort(currentMetrics);
+        renderIB(currentMetrics);renderOB(currentMetrics);renderSort(currentMetrics);renderObNtp(currentMetrics);
         renderTargets(currentMetrics);renderCharts(currentMetrics);
         currentFastStart=raw.fastStart;   // keep for re-apply after async renders settle
         renderFastStartRow(raw.fastStart,config);
@@ -6457,7 +6513,10 @@ async function doFetch(isRetry){
         // -> part of the Site CPLH loaded-volume numerator. 0 on non-sort sites. Hours (denominator)
         // already include their hours via the PPR throughput window, so only the volume is added.
         const cplhLoadedTotes=(cplhToFluid.fluidToteUnits||0)+(raw.cplhData?.palletizeTote?.jobs||0);
-        const siteThroughputVol=obDockFluid+stowJobs+palletCases24+cplhLoadedTotes;
+        // OB NTP (Pack & Ship) combined jobs also feed the Site CPLH volume numerator. 0 on sites
+        // without the process. Small number, minor impact.
+        const cplhObNtp=(raw.cplhData?.obNtp?.combined||0);
+        const siteThroughputVol=obDockFluid+stowJobs+palletCases24+cplhLoadedTotes+cplhObNtp;
         const siteCplh=tHrs>0?siteThroughputVol/tHrs:0;
         setEl('site-cplh-value',siteCplh>0?fmt(siteCplh,2):'\u2014');
         // Color Site CPLH based on target
