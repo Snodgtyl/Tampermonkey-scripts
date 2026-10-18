@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.23.0
+// @version      15.24.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -19,6 +19,7 @@
 // @connect      fcmenu-iad-regionalized.corp.amazon.com
 // @connect      alps-iad.iad.proxy.amazon.com
 // @connect      hooks.slack.com
+// @connect      raw.githubusercontent.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -152,7 +153,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.23.0';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.24.0';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -218,6 +219,64 @@ function trackUsage(action){
             fetch(url,{method:'POST',mode:'no-cors',body:payloadStr}).catch(()=>{});
         }
     }catch(e){/* never let tracking break the tool */}
+}
+
+// --- VERSION / AUTO-UPDATE HEALTH CHECK -------------------------------------------------------
+// Fetches the @version from the GitHub-hosted copy, compares it to the running SB_VERSION, and if
+// this machine is BEHIND, flags it: amber "update" badge in the header, a note in Settings, and a
+// once-per-day Slack ping to the usage channel so the creator can see which boards are running
+// stale. This surfaces auto-update failures (version drift) instead of them going unnoticed.
+const SB_RAW_URL='https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js';
+// Compare two dotted version strings. Returns -1 (a<b), 0 (equal), 1 (a>b).
+function cmpVersion(a,b){
+    const pa=String(a).split('.').map(n=>parseInt(n,10)||0),pb=String(b).split('.').map(n=>parseInt(n,10)||0);
+    for(let i=0;i<Math.max(pa.length,pb.length);i++){const x=pa[i]||0,y=pb[i]||0;if(x<y)return -1;if(x>y)return 1;}
+    return 0;
+}
+// Fire-and-forget: fetch the remote @version and act if we're behind. Safe/no-throw.
+function checkForUpdate(){
+    try{
+        if(typeof GM_xmlhttpRequest!=='function')return;   // can't fetch cross-origin without GM
+        GM_xmlhttpRequest({method:'GET',url:SB_RAW_URL+'?t='+Date.now(),timeout:10000,
+            onload:(r)=>{try{
+                const txt=r.responseText||'';
+                const m=txt.match(/@version\s+([0-9][0-9.]*)/);
+                if(!m)return;
+                const remote=m[1];
+                const behind=cmpVersion(SB_VERSION,remote)<0;
+                applyUpdateStatus(behind,remote);
+            }catch(e){}},
+            onerror:()=>{},ontimeout:()=>{}});
+    }catch(e){}
+}
+// Reflect update status in the UI (header badge + Settings note) and ping Slack once/day if behind.
+function applyUpdateStatus(behind,remote){
+    try{
+        // Header badge
+        const badge=document.getElementById('sb-ver-badge');
+        if(badge){
+            if(behind){badge.textContent='v'+SB_VERSION+' \u2191 update to v'+remote;badge.style.color='#e65100';badge.style.fontWeight='800';badge.title='This board is behind. Latest is v'+remote+'. It should auto-update within ~24h; if not, reinstall from GitHub.';}
+            else{badge.textContent='v'+SB_VERSION;badge.style.color='#888';badge.title='Up to date (latest on GitHub is v'+remote+').';}
+        }
+        // Settings note
+        const note=document.getElementById('sb-update-note');
+        if(note){
+            if(behind){note.innerHTML='\u26A0\uFE0F Running <strong>v'+SB_VERSION+'</strong> \u2014 latest is <strong>v'+remote+'</strong>. Auto-update should catch within ~24h. If it doesn\u2019t, reinstall from GitHub.';note.style.color='#c62828';}
+            else{note.innerHTML='\u2713 Up to date (v'+SB_VERSION+', latest on GitHub v'+remote+').';note.style.color='#2e7d32';}
+        }
+        // Once-per-day Slack ping when behind, so the creator sees stale boards in the usage channel.
+        if(behind){
+            const url=getMetricsUrl();if(!url)return;
+            const today=new Date().toISOString().slice(0,10);
+            let last='';try{last=localStorage.getItem('syncboard_stale_pinged')||'';}catch(e){}
+            if(last!==today){
+                try{localStorage.setItem('syncboard_stale_pinged',today);}catch(e){}
+                const msg='StaleVersion | '+((loadConfig().site||'').toUpperCase())+' | running v'+SB_VERSION+' | latest v'+remote+' | '+getUserAlias()+' | '+fmtSlackTime(new Date().toISOString());
+                const body=JSON.stringify({message:msg});
+                try{GM_xmlhttpRequest({method:'POST',url,data:body,onerror:()=>{},timeout:8000});}catch(e){}
+            }
+        }
+    }catch(e){}
 }
 
 function flowCageDensity(site,mode){
@@ -462,7 +521,13 @@ function parseFnRollup(html){
     const doc=new DOMParser().parseFromString(html,'text/html');
     const tr=doc.querySelector('tfoot tr.total.empl-all')||doc.querySelector('tr.total.empl-all')||doc.querySelector('tfoot tr.total')||doc.querySelector('tfoot tr');
     let units=0,hours=0,rate=0,hc=0,eachUnits=0,caseUnits=0,fluidLoadToteJobs=0;
-    if(tr){const cells=tr.querySelectorAll('td.numeric');if(cells.length>=3){hours=parseFloat(cells[0].textContent.replace(/,/g,''))||0;units=parseInt(cells[1].textContent.replace(/,/g,''),10)||0;rate=parseFloat(cells[2].textContent.replace(/,/g,''))||0;}
+    if(tr){const cells=tr.querySelectorAll('td.numeric');
+    // Total Paid Hours is always the FIRST numeric cell — read it whenever present. Some reports
+    // (e.g. an hours-only RC Sort Support like AVP8's Sort Prep + Water Spider) have ONLY that one
+    // cell, so guarding hours behind cells.length>=3 wrongly left hours=0. Units/rate still need
+    // the Jobs/JPH columns (>=3 cells).
+    if(cells.length>=1){hours=parseFloat(cells[0].textContent.replace(/,/g,''))||0;}
+    if(cells.length>=3){units=parseInt(cells[1].textContent.replace(/,/g,''),10)||0;rate=parseFloat(cells[2].textContent.replace(/,/g,''))||0;}
     // EACH UNIT is index 3, CASE UNIT is index 5 (if present)
     if(cells.length>=4){eachUnits=parseInt(cells[3].textContent.replace(/,/g,''),10)||0;}
     if(cells.length>=6){caseUnits=parseInt(cells[5].textContent.replace(/,/g,''),10)||0;}
@@ -3472,7 +3537,7 @@ function updatePeriodDots(){
 
 // === HTML ===
 function buildHTML(){return `
-<nav class="topnav"><div class="topnav-left"><span class="logo"><svg width="28" height="28" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="46" fill="#333A44" stroke="#4a9eff" stroke-width="4"/><path d="M25 65 L25 40 L50 28 L75 40 L75 65 Z" fill="none" stroke="#E8EAED" stroke-width="3" stroke-linejoin="round"/><line x1="25" y1="65" x2="75" y2="65" stroke="#E8EAED" stroke-width="3"/><rect x="30" y="45" width="16" height="20" fill="none" stroke="#E8EAED" stroke-width="2"/><line x1="30" y1="50" x2="46" y2="50" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="55" x2="46" y2="55" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="60" x2="46" y2="60" stroke="#E8EAED" stroke-width="1.5"/><rect x="54" y="48" width="14" height="17" fill="none" stroke="#E8EAED" stroke-width="2"/><rect x="57" y="52" width="4" height="5" fill="#E8EAED"/><rect x="62" y="55" width="3" height="4" fill="#E8EAED"/></svg></span><h1 class="site-title">FC Sync Board<span style="display:block;font-size:11px;font-weight:800;color:#146EB4;letter-spacing:.3px;margin-top:-1px;">by snodgtyl</span></h1>
+<nav class="topnav"><div class="topnav-left"><span class="logo"><svg width="28" height="28" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="46" fill="#333A44" stroke="#4a9eff" stroke-width="4"/><path d="M25 65 L25 40 L50 28 L75 40 L75 65 Z" fill="none" stroke="#E8EAED" stroke-width="3" stroke-linejoin="round"/><line x1="25" y1="65" x2="75" y2="65" stroke="#E8EAED" stroke-width="3"/><rect x="30" y="45" width="16" height="20" fill="none" stroke="#E8EAED" stroke-width="2"/><line x1="30" y1="50" x2="46" y2="50" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="55" x2="46" y2="55" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="60" x2="46" y2="60" stroke="#E8EAED" stroke-width="1.5"/><rect x="54" y="48" width="14" height="17" fill="none" stroke="#E8EAED" stroke-width="2"/><rect x="57" y="52" width="4" height="5" fill="#E8EAED"/><rect x="62" y="55" width="3" height="4" fill="#E8EAED"/></svg></span><h1 class="site-title">FC Sync Board<span style="display:block;font-size:11px;font-weight:800;color:#146EB4;letter-spacing:.3px;margin-top:-1px;">by snodgtyl <span id="sb-ver-badge" style="font-weight:600;color:#888;">v${SB_VERSION}</span></span></h1>
 <div class="nav-tabs"><button class="nav-tab active" data-tab="sync">Sync IB-OB</button><button class="nav-tab" data-tab="hourly">Hourly</button><button class="nav-tab" data-tab="faststart">Fast Start</button><button class="nav-tab" data-tab="vrets">VRETs</button><button class="nav-tab" data-tab="eoswash" style="display:none;">EOS Wash</button><button class="nav-tab" data-tab="settings">Settings</button></div></div>
 <div id="sb-truck-road" title="SDC Sync Board"><div class="sb-banner"><span class="sb-banner-smile" aria-hidden="true"></span><span class="sb-banner-text">S D C &nbsp;&middot;&nbsp; S Y N C &nbsp;&middot;&nbsp; B O A R D</span><span class="sb-banner-smile" aria-hidden="true"></span></div></div>
 <div id="sb-truck-road-OLD" style="display:none;" title="Peccy at the beach"><svg class="sb-scene" viewBox="0 0 300 30" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="sbSky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#d8f1ff"/></linearGradient><linearGradient id="sbSea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2bb3c0"/><stop offset="1" stop-color="#1f8fb0"/></linearGradient><linearGradient id="sbSand" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f6e3b4"/><stop offset="1" stop-color="#eccf8c"/></linearGradient></defs><rect x="0" y="0" width="300" height="30" fill="url(#sbSky)"/><g class="sb-sun"><circle cx="252" cy="9" r="6" fill="#FFD34E"/><circle cx="252" cy="9" r="9" fill="#FFD34E" opacity=".25"/></g><g class="sb-cloud" opacity=".9"><ellipse cx="60" cy="7" rx="11" ry="3.4" fill="#fff"/><ellipse cx="70" cy="8" rx="8" ry="3" fill="#fff"/></g><g class="sb-cloud2" opacity=".8"><ellipse cx="150" cy="5" rx="9" ry="3" fill="#fff"/><ellipse cx="158" cy="6" rx="6" ry="2.4" fill="#fff"/></g><rect x="0" y="15" width="300" height="9" fill="url(#sbSea)"/><path class="sb-wave" d="M0 16 q10 2 20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0" fill="none" stroke="#bfeef4" stroke-width="1" opacity=".7"/><rect x="0" y="23" width="300" height="7" fill="url(#sbSand)"/><g transform="translate(214,2)"><rect x="9" y="3" width="2.5" height="18" rx="1.2" fill="#8a5a2b"/><g class="sb-palm"><path d="M10 4 q-11 -3 -17 2 q10 -1 17 1" fill="#2e9b4e"/><path d="M10 4 q11 -3 17 2 q-10 -1 -17 1" fill="#36b05c"/><path d="M10 4 q-5 -9 -13 -9 q7 4 13 10" fill="#2e9b4e"/><path d="M10 4 q5 -9 13 -9 q-7 4 -13 10" fill="#36b05c"/></g><circle cx="7" cy="7" r="1.3" fill="#6b4423"/><circle cx="13" cy="7" r="1.3" fill="#6b4423"/></g><g class="sb-peccy-g" transform="translate(16,6)"><ellipse cx="12" cy="20" rx="11" ry="2" fill="rgba(0,0,0,.12)"/><rect x="2" y="0" width="20" height="20" rx="9" fill="#FF9D14"/><g class="sb-peccy-arm"><rect x="20" y="4" width="4" height="8" rx="2" fill="#FF9D14"/></g><g fill="#1a2733"><rect x="5" y="6" width="6.5" height="3.4" rx="1.4"/><rect x="12.5" y="6" width="6.5" height="3.4" rx="1.4"/><rect x="11" y="7" width="2" height="1.2"/></g><path d="M8 13 Q12 16.5 16 13" fill="none" stroke="#1a2733" stroke-width="1.3" stroke-linecap="round"/></g></svg></div>
@@ -3864,6 +3929,9 @@ function buildHTML(){return `
 <div class="setting-row"><label>Usage tracking</label><input type="text" id="metrics-url" class="select-input" placeholder="Slack usage-channel trigger URL\u2026" style="flex:1;min-width:280px;"></div>
 <p class="settings-note" style="margin:2px 0 8px;font-size:10px;">Usage tracking posts a one-line Slack message (site, action, login, time) to your usage channel on each Get Data / tab-fetch click so the creator can tally weekly uses. Blank = off.</p>
 <button id="btn-save-slack" class="btn btn-primary">\uD83D\uDCBE Save URLs</button> <span id="slack-save-note" class="settings-note" style="margin-left:8px;"></span></div>
+<div class="settings-card"><h2>Version</h2>
+<p class="settings-note" id="sb-update-note" style="margin:0;">Checking for updates\u2026</p>
+<p class="settings-note" style="margin:6px 0 0;font-size:10px;">Auto-updates from GitHub (~daily). If this shows "behind" for more than a day, reinstall once from the GitHub link to re-link auto-update.</p></div>
 </div></main>
 `;}
 
@@ -6188,6 +6256,7 @@ function clearBoard(){
 
 function initBoard(){
     config=loadConfig();
+    checkForUpdate();   // compare running version vs GitHub; flag + Slack-ping if this board is stale
     const sel=document.getElementById('site-select');
     SITES.forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=s;sel.appendChild(o);});
     sel.value=config.site;
