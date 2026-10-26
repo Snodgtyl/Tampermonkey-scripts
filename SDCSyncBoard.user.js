@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.46.1
+// @version      15.46.2
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -180,7 +180,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.46.1';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.46.2';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -6922,8 +6922,9 @@ function renderEOSWash(data){
     function hoursVariance(dept,lpRate,actualHours,useShiftMultiplier){
         const lpVol=(dept==='ib')?gv('ib-lp-plan-vol'):(dept==='ob')?gv('ob-lp-plan-vol'):gv('ib-lp-plan-vol')+gv('ob-lp-plan-vol');
         if(!(lpVol>0)||!(lpRate>0))return null;
-        let base=lpVol/lpRate;
-        if(useShiftMultiplier)base*=eosShift.block;
+        // (15.46.2, user spec) ONE rule for every row: (dept LP volume / row LP rate) - actual hours.
+        // The old Formula B shift-hours multiplier is retired (useShiftMultiplier is ignored).
+        const base=lpVol/lpRate;
         return base-((actualHours!=null)?actualHours:0);
     }
 
@@ -7033,14 +7034,12 @@ function renderEOSWash(data){
         //  - Transfer Out - Fluid Load: Formula B (owner spec) — ((LP_volume/LP_rate)*shiftHours)
         //    - actualHours, dept ob, LP_rate = the row's LP Rate (lpRateVal). Sign-based varBg.
         //  - Other direct paths (Pallet/Stow-Reserve/Dock): |actual rate - LP rate|, 3% band.
-        const isFluidLoad=(pprName==='Transfer Out - Fluid Load');
-        const flVar=isFluidLoad?hoursVariance('ob',lpRateVal,hrs,true):null;
-        const dirVar=(rate>0&&lpRateVal>0)?Math.abs(rate-lpRateVal):null;
-        const varCell=isPctRow
-            ? `<td style="${varBg(hoursVar)}">${hoursVar!=null?fv(hoursVar,2):dash()}</td>`
-            : isFluidLoad
-            ? `<td style="${varBg(flVar)}">${flVar!=null?fv(flVar,2):dash()}</td>`
-            : `<td style="${varBand(rate,lpRateVal)}">${dirVar!=null?fv(dirVar,2):dash()}</td>`;
+        // (15.46.2, user spec) Every volume row: (section LP volume / this row's LP rate) - actual
+        // hours. IB rows use the IB LP volume, DA rows the DA LP volume. e.g. Pallet Transfer In
+        // 6060/425.5 = 14.25 - 1.25 = +13.00. Sign-colored (green = fewer hours than plan).
+        const rowDept=IB_ROWS.some(r=>r[1]===pprName)?'ib':'ob';
+        const rowVar=isPctRow?hoursVar:hoursVariance(rowDept,lpRateVal,hrs,false);
+        const varCell=`<td style="${varBg(rowVar)}">${rowVar!=null?fv(rowVar,2):dash()}</td>`;
         return `<tr>
             <td style="text-align:left;">${label}</td>
             <td>${vol!=null?fv(vol):dash()}</td>
@@ -7093,7 +7092,10 @@ function renderEOSWash(data){
         // IB LP Shift Plan + OB LP Shift Plan (dept 'total'); LP_CPLH = cplhGoal (ibCplh for IB
         // TOTAL, daCplh for DA TOTAL); totalActualHours = this section's summed hours (hrs).
         // Sign-based varBg (green = fewer hours than plan), 2 decimals; blank when inputs missing.
-        const totVar=hoursVariance('total',cplhGoal,hrs,false);
+        // (15.46.2, user spec) Use THIS section's LP volume only (IB TOTAL -> IB LP vol, DA TOTAL ->
+        // DA LP vol), not the combined IB+DA. e.g. IB 6060 / LP CPLH 25 = 242.4 - 180 = +62.4.
+        const totDept=(label.indexOf('IB')===0)?'ib':'ob';
+        const totVar=hoursVariance(totDept,cplhGoal,hrs,false);
         // TOTAL row's LP Rate column = the section's LP CPLH goal (the same cplhGoal the % is
         // measured against), so the column is populated for the totals too.
         return `<tr class="${cls}" style="font-weight:700;border-top:2px solid #000;">
@@ -7225,14 +7227,18 @@ function renderEOSWash(data){
         // this row's LP Rate and actual hours (Formula A for IB rows, Formula B for the two OB
         // rows) + sign-based varBg + 2 decimals. Non-listed support rows (e.g. TO Problem Solve)
         // keep the old |Actual Rate - LP Rate| magnitude with the 3% band + 1 decimal.
-        const sv=SUP_VAR[pprName];
-        const hoursVar=sv?hoursVariance(sv.dept,lpRate,hrs,sv.mult):((actRate>0&&lpRate>0)?Math.abs(actRate-lpRate):null);
+        // (15.46.2, user spec) EVERY support row: (section LP volume / LP rate) - actual hours,
+        // no shift multiplier, no 3% band. Dept from SUP_VAR, else from IB_ROWS membership.
+        // e.g. Transfer In Support 6060/128 = 47.34 - 50.56 = -3.21.
+        const svMap=SUP_VAR[pprName];
+        const sv={dept:svMap?svMap.dept:(IB_ROWS.some(r=>r[1]===pprName)?'ib':'ob')};
+        const hoursVar=hoursVariance(sv.dept,lpRate,hrs,false);
         return `<tr>
             <td style="text-align:left;">${label}</td>
             <td>${hrs!=null?fv(hrs,2):dash()}</td>
             <td>${actRate>0?fv(actRate,1):dash()}</td>
             ${lpCell}
-            <td style="${sv?varBg(hoursVar):varBand(actRate,lpRate)}">${hoursVar!=null?fv(hoursVar,sv?2:1):dash()}</td>
+            <td style="${varBg(hoursVar)}">${hoursVar!=null?fv(hoursVar,2):dash()}</td>
             ${bridge(slug(label))}
         </tr>`;
     }
