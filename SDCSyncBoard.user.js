@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.46.2
+// @version      15.46.3
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -180,7 +180,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.46.2';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.46.3';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -3846,6 +3846,9 @@ function processData(raw){
             rsrRate:rsr.rate||0,
             // Received Cases = IDRT Total Jobs (same 01003012 fn-rollup tfoot, Jobs column = totalUnits).
             rsrJobs:rsr.totalUnits||0,
+            // (15.46.3) Cases stowed off pallets = Pallet Transfer In CASE UNIT (palletStow report),
+            // shown on its own row under Pallets Stowed.
+            palletCasesStowed:palletCases,
             cplh:cplhHrs>0?ibU/cplhHrs:0,
             density:(stow.caseUnits||0)>0?(stow.eachUnits||0)/(stow.caseUnits||1):0,
             directHC:dur>0?ibDH/dur:0,indirectHC:dur>0?ibIndirect/dur:0,
@@ -3974,7 +3977,7 @@ function blankFuturePeriods(config){
     const keys=['p1','p2','p3'];
     keys.forEach((pk,idx)=>{
         if(!hasPeriodStarted(periods[idx],config)){
-            const prefixes=['ib-sync-','ib-stow-','ib-cases-','ib-pallets-','ib-cti-','ib-rate-','ib-density-','ib-dhrs-','ib-dpct-','ib-ihrs-','ib-ipct-','ib-thrs-','ib-cplh-','ib-op-',
+            const prefixes=['ib-sync-','ib-stow-','ib-cases-','ib-pallets-','ib-palletcases-','ib-cti-','ib-rate-','ib-density-','ib-dhrs-','ib-dpct-','ib-ihrs-','ib-ipct-','ib-thrs-','ib-cplh-','ib-op-',
                 'ob-sync-','ob-pick-','ob-cases-','ob-rate-','ob-density-','ob-loadp-','ob-floadrate-','ob-palletloaded-','ob-dhrs-','ob-dpct-','ob-ihrs-','ob-ipct-','ob-thrs-','ob-cplh-','ob-op-',
                 'sort-total-','sort-units-','sort-rate-','sort-dhrs-',
                 'obntp-packed-','obntp-shipped-','obntp-combined-','obntp-hrs-','obntp-rate-'];
@@ -3995,6 +3998,8 @@ function renderIB(m){
     }
     setEl('ib-cases-p1',fmt(p1.stowUnits));setEl('ib-cases-p2',fmt(p2.stowUnits));setEl('ib-cases-p3',fmt(p3.stowUnits));setEl('ib-cases-total',fmt(f.stowUnits));
     setEl('ib-pallets-p1',fmt(p1.palletUnits||0));setEl('ib-pallets-p2',fmt(p2.palletUnits||0));setEl('ib-pallets-p3',fmt(p3.palletUnits||0));setEl('ib-pallets-total',fmt(f.palletUnits||0));
+    // Pallet Cases Stowed = Pallet Transfer In CASE UNIT per period (the PTI part of CTI/PTI, shown on its own).
+    setEl('ib-palletcases-p1',fmt(p1.palletCasesStowed||0));setEl('ib-palletcases-p2',fmt(p2.palletCasesStowed||0));setEl('ib-palletcases-p3',fmt(p3.palletCasesStowed||0));setEl('ib-palletcases-total',fmt(f.palletCasesStowed||0));
     // CTI/PTI per period = ONLY that period's production (not the cumulative Sync Metrics running total)
     setEl('ib-cti-p1',fmt(p1.periodStow!=null?p1.periodStow:p1.totalStow));setEl('ib-cti-p2',fmt(p2.periodStow!=null?p2.periodStow:p2.totalStow));setEl('ib-cti-p3',fmt(p3.periodStow!=null?p3.periodStow:p3.totalStow));setEl('ib-cti-total',fmt(f.totalStow));
     setEl('ib-rate-p1',fmt(p1.rate,1));setEl('ib-rate-p2',fmt(p2.rate,1));setEl('ib-rate-p3',fmt(p3.rate,1));setEl('ib-rate-total',fmt(f.rate,1));
@@ -4609,6 +4614,7 @@ function buildHTML(){return `
 <tr class="row-sync"><td class="bold">Sync Metrics</td><td id="ib-sync-p1">0</td><td id="ib-sync-p2">0</td><td id="ib-sync-p3">0</td><td id="ib-sync-total">0</td></tr>
 <tr><td>&nbsp;&nbsp;Cases Stowed</td><td id="ib-cases-p1">0</td><td id="ib-cases-p2">0</td><td id="ib-cases-p3">0</td><td id="ib-cases-total">0</td></tr>
 <tr><td>&nbsp;&nbsp;Pallets Stowed</td><td id="ib-pallets-p1">0</td><td id="ib-pallets-p2">0</td><td id="ib-pallets-p3">0</td><td id="ib-pallets-total">0</td></tr>
+<tr><td title="Pallet Transfer In CASE UNIT (cases stowed off pallets)">&nbsp;&nbsp;Pallet Cases Stowed</td><td id="ib-palletcases-p1">0</td><td id="ib-palletcases-p2">0</td><td id="ib-palletcases-p3">0</td><td id="ib-palletcases-total">0</td></tr>
 <tr><td>&nbsp;&nbsp;CTI/PTI per period</td><td id="ib-cti-p1">0</td><td id="ib-cti-p2">0</td><td id="ib-cti-p3">0</td><td id="ib-cti-total">0</td></tr>
 <tr class="row-rate"><td>Stow Rate <span style="margin-left:20px;font-size:11px;background:#e3f2fd;color:#1565c0;padding:2px 8px;border-radius:4px;font-weight:700;">LP Target = <span id="lp-cti-rate-display">\u2014</span></span></td><td id="ib-rate-p1">\u2014</td><td id="ib-rate-p2">\u2014</td><td id="ib-rate-p3">\u2014</td><td id="ib-rate-total">\u2014</td></tr>
 <tr><td>Received Cases</td><td id="ib-rcv-p1">\u2014</td><td id="ib-rcv-p2">\u2014</td><td id="ib-rcv-p3">\u2014</td><td id="ib-rcv-total">\u2014</td></tr>
