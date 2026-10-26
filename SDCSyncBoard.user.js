@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.45.5
+// @version      15.46.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -180,7 +180,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.45.5';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.46.0';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -3014,8 +3014,9 @@ function setDayView(which){
     // Dept Backlog only shows for the day views (Current / Prior), not Shift Plan Targets.
     const dept=document.getElementById('spt-dept-backlog');
     if(dept)dept.style.display=(which==='current'||which==='prior')?'':'none';
-    if(which==='current')ensureDay(0);
-    else if(which==='prior')ensureDay(1);
+    // Dept Backlog auto-fill: Current Day = live fetch (memoized); Prior Day = saved snapshot only.
+    if(which==='current'){ensureDay(0);fillDeptBacklogCurrent();}
+    else if(which==='prior'){ensureDay(1);fillDeptBacklogPrior();}
 }
 // Fetch a day's data on demand (offset 0=today,1=yesterday), cache it, then render.
 function ensureDay(off){
@@ -3702,13 +3703,13 @@ function updateLCDisplay(elId,lcCounts,lcRates,lcHours,lcUnits){
     const total=lcCounts[1]+lcCounts[2]+lcCounts[3]+lcCounts[4]+lcCounts[5]+(lcCounts.unknown||0);
     if(total===0){el.innerHTML='<span style="color:#5B6B7A;">Learning Curve Mix: No data</span>';return;}
     const pct=(n)=>Math.round((n/total)*100);
-    const avgRate=(lvl)=>{const rates=(lcRates&&lcRates[lvl])||[];if(rates.length===0)return'';const avg=rates.reduce((a,b)=>a+b,0)/rates.length;if(avg>300||avg<1)return'';return` (${Math.round(avg)} UPH)`;};
+    const avgRate=(lvl)=>{const rates=(lcRates&&lcRates[lvl])||[];if(rates.length===0)return'';const avg=rates.reduce((a,b)=>a+b,0)/rates.length;if(avg>300||avg<1)return'';return` (${Math.round(avg)} CPH)`;};
     const parts=[];
     if(lcCounts[5]>0)parts.push(`<span style="color:#27AE60;font-weight:bold;">LC5 ${pct(lcCounts[5])}%${avgRate(5)}</span>`);
     if(lcCounts[4]>0)parts.push(`<span style="color:#5B6B7A;font-weight:bold;">LC4 ${pct(lcCounts[4])}%${avgRate(4)}</span>`);
     if(lcCounts[3]>0)parts.push(`<span style="color:#eab308;">LC3 ${pct(lcCounts[3])}%${avgRate(3)}</span>`);
     const l12=lcCounts[1]+lcCounts[2];
-    if(l12>0){const r12=[...(lcRates[1]||[]),...(lcRates[2]||[])];let avg12='';if(r12.length>0){const a=r12.reduce((x,y)=>x+y,0)/r12.length;if(a<=300&&a>=1)avg12=` (${Math.round(a)} UPH)`;}parts.push(`<span style="color:#F2994A;font-weight:bold;">LC1-2 ${pct(l12)}%${avg12}</span>`);}
+    if(l12>0){const r12=[...(lcRates[1]||[]),...(lcRates[2]||[])];let avg12='';if(r12.length>0){const a=r12.reduce((x,y)=>x+y,0)/r12.length;if(a<=300&&a>=1)avg12=` (${Math.round(a)} CPH)`;}parts.push(`<span style="color:#F2994A;font-weight:bold;">LC1-2 ${pct(l12)}%${avg12}</span>`);}
     el.innerHTML=`<span style="color:#5B6B7A;font-weight:600;">Learning Curve Mix</span> &nbsp; ${parts.join(' <span style="color:#555;">\u2022</span> ')}`;
     renderLCLoss(elId,lcHours,lcUnits,lcCounts,lcRates);
 }
@@ -4560,18 +4561,19 @@ function buildHTML(){return `
 <div id="spt-dept-backlog" class="sort-tgt dept-tgt" style="display:none;margin-top:6px;padding-top:6px;border-top:2px solid #000;"><h4 style="color:#333;">DEPT BACKLOG</h4>
 <table class="target-table dept-table"><thead><tr><th></th><th>Units</th><th>Cases</th><th>Days (Units)</th><th>Days (Cases)</th><th>IPT Backlog</th></tr></thead><tbody>
 <tr><td>Inbound Backlog</td>
-<td><input type="text" id="dept-ib-units" class="dept-input"></td>
-<td><input type="text" id="dept-ib-cases" class="dept-input"></td>
-<td><input type="text" id="dept-ib-days-units" class="dept-input"></td>
-<td><input type="text" id="dept-ib-days-cases" class="dept-input"></td>
+<td><span id="dept-ib-units" class="dept-val">&mdash;</span></td>
+<td><span id="dept-ib-cases" class="dept-val">&mdash;</span></td>
+<td><span id="dept-ib-days-units" class="dept-val">&mdash;</span></td>
+<td><span id="dept-ib-days-cases" class="dept-val">&mdash;</span></td>
 <td><input type="text" id="dept-ib-ipt" class="dept-input"></td></tr>
 <tr><td>DA Backlog</td>
-<td><input type="text" id="dept-da-units" class="dept-input"></td>
-<td><input type="text" id="dept-da-cases" class="dept-input"></td>
-<td><input type="text" id="dept-da-days-units" class="dept-input"></td>
-<td><input type="text" id="dept-da-days-cases" class="dept-input"></td>
+<td><span id="dept-da-units" class="dept-val">&mdash;</span></td>
+<td><span id="dept-da-cases" class="dept-val">&mdash;</span></td>
+<td><span id="dept-da-days-units" class="dept-val">&mdash;</span></td>
+<td><span id="dept-da-days-cases" class="dept-val">&mdash;</span></td>
 <td><input type="text" id="dept-da-ipt" class="dept-input"></td></tr>
-</tbody></table></div>
+</tbody></table>
+<div id="dept-bl-note" class="dept-note" style="display:none;"></div></div>
 </div><!-- /targets-panel-top -->
 
 <div class="sync-layout">
@@ -5028,6 +5030,11 @@ function buildCSS(){return `
 .dept-table td{padding:2px 3px;}
 .dept-input{width:52px;padding:3px 4px;background:#cfe8ff;border:1px solid #000;color:#000;border-radius:3px;font-size:11px;text-align:right;font-weight:600;}
 #sb-root.dark-mode .dept-input{background:#1e3a5f!important;color:#cfe8ff!important;border-color:#777!important;}
+/* Read-only auto-filled Dept Backlog cells (units/cases/days); same footprint as .dept-input */
+.dept-val{display:inline-block;min-width:52px;box-sizing:border-box;padding:3px 4px;font-size:11px;text-align:right;font-weight:700;color:#000;}
+#sb-root.dark-mode .dept-val{color:#fff!important;}
+.dept-note{font-size:9px;color:#777;margin-top:3px;font-style:italic;}
+#sb-root.dark-mode .dept-note{color:#aaa!important;}
 /* View toggle (Shift Plan Targets / Current Day / Prior Day) in the panel title */
 .day-toggle{font-size:11px;padding:5px 10px;border:1px solid #888;background:#eee;color:#333;cursor:pointer;font-weight:700;}
 .day-toggle.active{background:#1565c0;color:#fff;border-color:#1565c0;}
@@ -6545,6 +6552,200 @@ function sbEnsureSpinStyle(){
     }catch(e){}
 }
 
+// ===== SHARED DEPT BACKLOG COMPUTE (EOS Wash Backlog + Sync tab Dept Backlog) =====
+// ONE implementation of: IB/DA backlog fetch + ALPS capacity (+0/+1/+2) fetch + Days math
+// (backlog / average of the finite >0 capacities, 2 decimals, tooltip with the math).
+// Every successful computation also refreshes the session memo and saves a localStorage snapshot
+// (read later by the Prior Day view). `var` (not let/const) so setDayView can't hit a TDZ.
+var SB_BL_MEMO_MS=5*60*1000;           // reuse a live result younger than 5 minutes
+var SB_BL_SNAP_PREFIX='sb_backlog_snap_';
+var SB_BL_SNAP_KEEP_DAYS=14;
+var _sbDeptBacklogMemo=null;           // {site, ts, result}
+var _sbDeptBacklogInflight=null;       // {site, p} — shares one in-flight Current Day fetch
+var _sbDeptGen=0;                      // bumps on each Dept Backlog fill; stale writes are dropped
+function sbBacklogDayLbl(iso){try{const p=String(iso).split('-').map(Number);return new Date(p[0],p[1]-1,p[2]).toLocaleDateString('en-US',{month:'short',day:'numeric'});}catch(e){return String(iso);}}
+// Mean of the finite >0 capacities; null when none. Warns which dates were missing.
+function sbBacklogAvgCap(vals,dates,label){
+    const used=[],missing=[];
+    for(let i=0;i<dates.length;i++){
+        const v=Array.isArray(vals)?vals[i]:null;
+        if(typeof v==='number'&&isFinite(v)&&v>0)used.push({v:v,d:dates[i]});else missing.push(dates[i]);
+    }
+    if(!used.length){console.warn('[SB-BacklogDays] '+label+': no capacity values for '+JSON.stringify(dates));return null;}
+    if(missing.length)console.warn('[SB-BacklogDays] '+label+': missing capacity for '+missing.join(', ')+' \u2014 averaging '+used.length+' day(s)');
+    const avg=used.reduce((a,x)=>a+x.v,0)/used.length;
+    return{avg:avg,used:used.map(x=>x.d),missing:missing};
+}
+// Days cell = backlog/avg (2 decimals) + tooltip with the math; null when not computable.
+function sbBacklogDaysCell(backlog,info){
+    const bl=Number(backlog);
+    if(!(isFinite(bl)&&bl>0)||!info||!(info.avg>0))return null;
+    return{
+        value:bl/info.avg,
+        text:(bl/info.avg).toFixed(2),
+        title:fmt(bl)+' \u00f7 avg '+fmt(info.avg)+' ('+info.used.map(sbBacklogDayLbl).join(', ')+')'+(info.missing.length?' \u2014 missing: '+info.missing.map(sbBacklogDayLbl).join(', '):'')
+    };
+}
+// Starts all 4 fetches in parallel. Returns never-rejecting promises:
+//   ibP/daP -> {units,cases}|null, ibDaysP/daDaysP -> {units:cell|null,cases:cell|null,avgUnits,avgCases}|null,
+//   allP -> combined result (see below) | null. On success (any backlog >0) the memo + snapshot are saved.
+function sbComputeBacklog(site){
+    const S=String(site||'').toUpperCase();
+    // Wraps a fetch so it NEVER rejects (sync throw / reject -> null); lets one promise feed both the
+    // backlog cells and the days cells without fetching twice.
+    const safeP=(fn)=>{try{return Promise.resolve(fn()).catch(()=>null);}catch(e){return Promise.resolve(null);}};
+    const ibP=safeP(()=>fetchInboundBacklog(S));
+    const daP=safeP(()=>fetchDaBacklog(S));
+    // ALPS daily-view capacity for the shift day +0/+1/+2, both selections in parallel with the backlog fetches.
+    let dates=[];
+    try{dates=sbBacklogDayDates();}catch(e){dates=[];}
+    const ibAlpsP=safeP(()=>fetchAlpsBacklogDays(S,'inbound-joint',dates));
+    const daAlpsP=safeP(()=>fetchAlpsBacklogDays(S,'daOBDA-transferOut',dates));
+    const daysFor=(label,blP,alpsP)=>Promise.all([blP,alpsP]).then(([bl,alps])=>{
+        const r=bl||{}, a=alps||{};
+        const uInfo=sbBacklogAvgCap(a.units,dates,label+' units');
+        const cInfo=sbBacklogAvgCap(a.cartons,dates,label+' cartons');
+        dbg('[SB-BacklogDays] '+label+' planId='+(a.planId||null)+' dates='+JSON.stringify(dates)+' backlogUnits='+r.units+' backlogCases='+r.cases+' avgUnitsCap='+(uInfo?uInfo.avg:null)+' avgCartonCap='+(cInfo?cInfo.avg:null));
+        return{units:sbBacklogDaysCell(r.units,uInfo),cases:sbBacklogDaysCell(r.cases,cInfo),avgUnits:uInfo?uInfo.avg:null,avgCases:cInfo?cInfo.avg:null};
+    }).catch(e=>{console.warn('[SB-BacklogDays] '+label+' compute error: '+(e&&e.message));return null;});
+    const ibDaysP=daysFor('IB',ibP,ibAlpsP);
+    const daDaysP=daysFor('DA',daP,daAlpsP);
+    const pos=(n)=>{const v=Number(n);return(n!=null&&isFinite(v)&&v>0)?v:null;};
+    const sec=(bl,dd)=>{
+        const r=bl||{}, d=dd||{};
+        return{units:pos(r.units),cases:pos(r.cases),
+            daysUnits:d.units?Number(d.units.text):null,daysCases:d.cases?Number(d.cases.text):null,
+            titleUnits:d.units?d.units.title:null,titleCases:d.cases?d.cases.title:null};
+    };
+    const allP=Promise.all([ibP,daP,ibDaysP,daDaysP]).then(([ib,da,ibD,daD])=>{
+        const res={site:S,ts:Date.now(),dates:dates.slice(),ib:sec(ib,ibD),da:sec(da,daD),
+            avg:{ibUnits:ibD?ibD.avgUnits:null,ibCases:ibD?ibD.avgCases:null,daUnits:daD?daD.avgUnits:null,daCases:daD?daD.avgCases:null}};
+        const ok=[res.ib.units,res.ib.cases,res.da.units,res.da.cases].some(v=>v!=null);
+        if(ok){
+            _sbDeptBacklogMemo={site:S,ts:res.ts,result:res};
+            sbSaveBacklogSnapshot(res);
+        }else console.warn('[SB-DeptBacklog] '+S+': no backlog values returned \u2014 memo/snapshot not saved');
+        return res;
+    }).catch(e=>{console.warn('[SB-DeptBacklog] compute error: '+(e&&e.message));return null;});
+    return{ibP,daP,ibDaysP,daDaysP,allP};
+}
+// Snapshot key date = the shift's production/start date (a Nights EOS at 5 AM saves under the
+// date the shift started), local calendar.
+function sbBacklogSnapKey(site,iso){return SB_BL_SNAP_PREFIX+String(site||'').toUpperCase()+'_'+iso;}
+function sbSaveBacklogSnapshot(res){
+    try{
+        let iso;
+        try{iso=isoDate(getShiftDates(loadConfig()).startDate);}catch(e){iso=isoDate(new Date());}
+        const strip=(s)=>({units:s.units,cases:s.cases,daysUnits:s.daysUnits,daysCases:s.daysCases});
+        const snap={ib:strip(res.ib),da:strip(res.da),avg:res.avg,dates:res.dates,ts:res.ts};
+        const key=sbBacklogSnapKey(res.site,iso);
+        localStorage.setItem(key,JSON.stringify(snap));   // overwrite: latest capture (EOS) wins
+        dbg('[SB-DeptBacklog] snapshot saved '+key);
+        sbPruneBacklogSnapshots();
+    }catch(e){console.warn('[SB-DeptBacklog] snapshot save failed: '+(e&&e.message));}
+}
+// Drops snapshots older than SB_BL_SNAP_KEEP_DAYS (all sites).
+function sbPruneBacklogSnapshots(){
+    try{
+        const cut=new Date();cut.setHours(12,0,0,0);cut.setDate(cut.getDate()-SB_BL_SNAP_KEEP_DAYS);
+        const cutIso=isoDate(cut);
+        const drop=[];
+        for(let i=0;i<localStorage.length;i++){
+            const k=localStorage.key(i);
+            if(!k||k.indexOf(SB_BL_SNAP_PREFIX)!==0)continue;
+            const m=k.match(/_(\d{4}-\d{2}-\d{2})$/);
+            if(m&&m[1]<cutIso)drop.push(k);
+        }
+        drop.forEach(k=>localStorage.removeItem(k));
+        if(drop.length)dbg('[SB-DeptBacklog] pruned '+drop.length+' old snapshot(s)');
+    }catch(e){console.warn('[SB-DeptBacklog] snapshot prune failed: '+(e&&e.message));}
+}
+function sbReadBacklogSnapshot(site,iso){
+    try{
+        const raw=localStorage.getItem(sbBacklogSnapKey(site,iso));
+        if(!raw)return null;
+        const s=JSON.parse(raw);
+        return(s&&s.ib&&s.da)?s:null;
+    }catch(e){console.warn('[SB-DeptBacklog] snapshot read failed: '+(e&&e.message));return null;}
+}
+// --- Sync tab Dept Backlog (Shift Plan Targets panel, Current / Prior Day views) ---
+var SB_DEPT_CELLS={ib:['dept-ib-units','dept-ib-cases','dept-ib-days-units','dept-ib-days-cases'],da:['dept-da-units','dept-da-cases','dept-da-days-units','dept-da-days-cases']};
+function sbDeptAllIds(){return SB_DEPT_CELLS.ib.concat(SB_DEPT_CELLS.da);}
+function sbDeptNote(text){const n=document.getElementById('dept-bl-note');if(!n)return;if(text){n.textContent=text;n.style.display='';}else{n.textContent='';n.style.display='none';}}
+function sbDeptDashAll(){sbDeptAllIds().forEach(id=>{const el=document.getElementById(id);if(el){el.textContent='\u2014';el.removeAttribute('title');}});}
+// Writes a result/snapshot into the 8 cells. snapTitle set -> every cell gets that tooltip
+// (Prior Day); otherwise the days cells get the live math tooltip (Current Day).
+function sbDeptWrite(r,snapTitle){
+    const DASH='\u2014';
+    const num=(v)=>(v!=null&&isFinite(Number(v))&&Number(v)>0)?fmt(Number(v)):DASH;
+    const day=(v)=>(v!=null&&isFinite(Number(v))&&Number(v)>0)?Number(v).toFixed(2):DASH;
+    ['ib','da'].forEach(k=>{
+        const s=(r&&r[k])||{}, ids=SB_DEPT_CELLS[k];
+        const vals=[num(s.units),num(s.cases),day(s.daysUnits),day(s.daysCases)];
+        const live=[null,null,s.titleUnits||null,s.titleCases||null];
+        ids.forEach((id,i)=>{
+            const el=document.getElementById(id);if(!el)return;
+            el.textContent=vals[i];
+            const t=snapTitle||live[i];
+            if(t)el.title=t;else el.removeAttribute('title');
+        });
+    });
+}
+// Current Day: live fetch (deliberate user action), spinners while loading, memoized < 5 min.
+// The spinner ALWAYS resolves to a value or the em-dash; stale results (user switched view) are dropped.
+function fillDeptBacklogCurrent(){
+    const gen=++_sbDeptGen;
+    try{
+        sbDeptNote('');
+        const S=String((loadConfig()||{}).site||'').toUpperCase();
+        if(!S){sbDeptDashAll();console.warn('[SB-DeptBacklog] no site selected');return;}
+        const m=_sbDeptBacklogMemo;
+        if(m&&m.site===S&&m.result&&(Date.now()-m.ts)<SB_BL_MEMO_MS){
+            sbDeptWrite(m.result,null);
+            dbg('[SB-DeptBacklog] Current Day from memo ('+Math.round((Date.now()-m.ts)/1000)+'s old)');
+            return;
+        }
+        sbEnsureSpinStyle();
+        sbDeptAllIds().forEach(id=>{const el=document.getElementById(id);if(el){el.innerHTML='<span class="sb-spin" role="status" aria-label="Loading"></span>';el.removeAttribute('title');}});
+        let p;
+        if(_sbDeptBacklogInflight&&_sbDeptBacklogInflight.site===S)p=_sbDeptBacklogInflight.p;
+        else{
+            p=sbComputeBacklog(S).allP;
+            const inf={site:S,p:p};_sbDeptBacklogInflight=inf;
+            p.then(()=>{if(_sbDeptBacklogInflight===inf)_sbDeptBacklogInflight=null;},()=>{if(_sbDeptBacklogInflight===inf)_sbDeptBacklogInflight=null;});
+        }
+        p.then(r=>{
+            if(gen!==_sbDeptGen)return;          // a newer fill (other view / refetch) owns the cells
+            if(!r){sbDeptDashAll();console.warn('[SB-DeptBacklog] Current Day fetch returned nothing');return;}
+            sbDeptWrite(r,null);
+            dbg('[SB-DeptBacklog] Current Day filled for '+S);
+        }).catch(e=>{if(gen===_sbDeptGen)sbDeptDashAll();console.warn('[SB-DeptBacklog] Current Day render error: '+(e&&e.message));});
+    }catch(e){console.warn('[SB-DeptBacklog] Current Day error: '+(e&&e.message));sbDeptDashAll();}
+}
+// Prior Day: NO live fetch. Reads the snapshot for the date the Prior Day view represents
+// (fetchDayData offset 1 = local calendar yesterday).
+function fillDeptBacklogPrior(){
+    ++_sbDeptGen;                               // invalidates any in-flight Current Day write
+    try{
+        const S=String((loadConfig()||{}).site||'').toUpperCase();
+        const d=new Date();d.setHours(12,0,0,0);d.setDate(d.getDate()-1);
+        const iso=isoDate(d);
+        const lbl=d.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'});
+        const snap=S?sbReadBacklogSnapshot(S,iso):null;
+        if(!snap){
+            sbDeptDashAll();
+            sbDeptNote('No backlog snapshot saved for '+lbl+' \u2014 it\u2019s captured when EOS Wash or Current Day backlog is fetched.');
+            dbg('[SB-DeptBacklog] no Prior Day snapshot for '+S+' '+iso);
+            return;
+        }
+        let when='';
+        try{when=new Date(snap.ts).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});}catch(e){when=String(snap.ts);}
+        sbDeptNote('');
+        sbDeptWrite(snap,'Snapshot taken '+when);
+        dbg('[SB-DeptBacklog] Prior Day filled from snapshot '+S+' '+iso);
+    }catch(e){console.warn('[SB-DeptBacklog] Prior Day error: '+(e&&e.message));sbDeptDashAll();}
+}
+
 function fillEosBacklog(site){
     const S=String(site||'').toUpperCase();
     if(!S)return;
@@ -6560,51 +6761,26 @@ function fillEosBacklog(site){
     const dashDay=(id)=>{const el=document.getElementById(id);if(el){el.textContent=DASH;el.removeAttribute('title');}};
     ib.concat(da).forEach(spin);
     ibDays.concat(daDays).forEach(id=>{spin(id);const el=document.getElementById(id);if(el)el.removeAttribute('title');});
-    // Wraps a fetch so it NEVER rejects (sync throw / reject -> null); lets one promise feed both the
-    // backlog cells and the days cells without fetching twice.
-    const safeP=(fn)=>{try{return Promise.resolve(fn()).catch(()=>null);}catch(e){return Promise.resolve(null);}};
-    const ibP=safeP(()=>fetchInboundBacklog(S));
-    const daP=safeP(()=>fetchDaBacklog(S));
-    ibP.then(r=>{ if(!r){ib.forEach(dash);return;} put(ib[0],r.units); put(ib[1],r.cases); }).catch(()=>{ib.forEach(dash);});
-    daP.then(r=>{ if(!r){da.forEach(dash);return;} put(da[0],r.units); put(da[1],r.cases); }).catch(()=>{da.forEach(dash);});
-    // ALPS daily-view capacity for the shift day +0/+1/+2, both selections in parallel with the backlog fetches.
-    let dates=[];
-    try{dates=sbBacklogDayDates();}catch(e){dates=[];}
-    const ibAlpsP=safeP(()=>fetchAlpsBacklogDays(S,'inbound-joint',dates));
-    const daAlpsP=safeP(()=>fetchAlpsBacklogDays(S,'daOBDA-transferOut',dates));
-    const dayLbl=(iso)=>{try{const p=String(iso).split('-').map(Number);return new Date(p[0],p[1]-1,p[2]).toLocaleDateString('en-US',{month:'short',day:'numeric'});}catch(e){return String(iso);}};
-    // Mean of the finite >0 capacities; null when none. Warns which dates were missing.
-    const avgCap=(vals,label)=>{
-        const used=[],missing=[];
-        for(let i=0;i<dates.length;i++){
-            const v=Array.isArray(vals)?vals[i]:null;
-            if(typeof v==='number'&&isFinite(v)&&v>0)used.push({v:v,d:dates[i]});else missing.push(dates[i]);
-        }
-        if(!used.length){console.warn('[SB-BacklogDays] '+label+': no capacity values for '+JSON.stringify(dates));return null;}
-        if(missing.length)console.warn('[SB-BacklogDays] '+label+': missing capacity for '+missing.join(', ')+' \u2014 averaging '+used.length+' day(s)');
-        const avg=used.reduce((a,x)=>a+x.v,0)/used.length;
-        return{avg:avg,used:used.map(x=>x.d),missing:missing};
-    };
-    // Writes backlog/avg (2 decimals) + a tooltip with the math, else the em-dash. Null-guarded.
-    const writeDays=(id,backlog,info)=>{
+    // Shared compute (one implementation of the backlog + days math, also used by the Sync tab's
+    // Dept Backlog). Its promises NEVER reject; the snapshot/memo save happens inside it.
+    const c=sbComputeBacklog(S);
+    c.ibP.then(r=>{ if(!r){ib.forEach(dash);return;} put(ib[0],r.units); put(ib[1],r.cases); }).catch(()=>{ib.forEach(dash);});
+    c.daP.then(r=>{ if(!r){da.forEach(dash);return;} put(da[0],r.units); put(da[1],r.cases); }).catch(()=>{da.forEach(dash);});
+    // Writes the precomputed days cell (2 decimals + math tooltip), else the em-dash. Null-guarded.
+    const writeDays=(id,cell)=>{
         const el=document.getElementById(id);if(!el)return;
-        const bl=Number(backlog);
-        if(!(isFinite(bl)&&bl>0)||!info||!(info.avg>0)){el.textContent=DASH;el.removeAttribute('title');return;}
-        el.textContent=(bl/info.avg).toFixed(2);
-        el.title=fmt(bl)+' \u00f7 avg '+fmt(info.avg)+' ('+info.used.map(dayLbl).join(', ')+')'+(info.missing.length?' \u2014 missing: '+info.missing.map(dayLbl).join(', '):'');
+        if(!cell){el.textContent=DASH;el.removeAttribute('title');return;}
+        el.textContent=cell.text;el.title=cell.title;
     };
-    const doDays=(label,ids,blP,alpsP)=>{
-        Promise.all([blP,alpsP]).then(([bl,alps])=>{
-            const r=bl||{}, a=alps||{};
-            const uInfo=avgCap(a.units,label+' units');
-            const cInfo=avgCap(a.cartons,label+' cartons');
-            dbg('[SB-BacklogDays] '+label+' planId='+(a.planId||null)+' dates='+JSON.stringify(dates)+' backlogUnits='+r.units+' backlogCases='+r.cases+' avgUnitsCap='+(uInfo?uInfo.avg:null)+' avgCartonCap='+(cInfo?cInfo.avg:null));
-            writeDays(ids[0],r.units,uInfo);
-            writeDays(ids[1],r.cases,cInfo);
+    const doDays=(label,ids,daysP)=>{
+        daysP.then(d=>{
+            if(!d){ids.forEach(dashDay);return;}
+            writeDays(ids[0],d.units);
+            writeDays(ids[1],d.cases);
         }).catch(e=>{console.warn('[SB-BacklogDays] '+label+' render error: '+(e&&e.message));ids.forEach(dashDay);});
     };
-    doDays('IB',ibDays,ibP,ibAlpsP);
-    doDays('DA',daDays,daP,daAlpsP);
+    doDays('IB',ibDays,c.ibDaysP);
+    doDays('DA',daDays,c.daDaysP);
 }
 
 function renderEOSWash(data){
@@ -7661,7 +7837,7 @@ function initBoard(){
     document.getElementById('shift-select').value=config.shiftType;
     // Load targets
     const t=config.targets||{};
-    ['ib-bb-goal','ib-goal-input','ib-lp-plan-vol','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-lp-plan-vol','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','sort-vol-sort20lb','sort-vol-sort5lb','sort-vol-sortEuro','sort-vol-sortManual','sort-rate-sort20lb','sort-rate-sort5lb','sort-rate-sortEuro','sort-rate-sortManual','site-cplh-target','dept-ib-units','dept-ib-cases','dept-ib-days-units','dept-ib-days-cases','dept-ib-ipt','dept-da-units','dept-da-cases','dept-da-days-units','dept-da-days-cases','dept-da-ipt'].forEach(id=>{const el=document.getElementById(id);if(el&&t[id])el.value=t[id];});
+    ['ib-bb-goal','ib-goal-input','ib-lp-plan-vol','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-lp-plan-vol','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','sort-vol-sort20lb','sort-vol-sort5lb','sort-vol-sortEuro','sort-vol-sortManual','sort-rate-sort20lb','sort-rate-sort5lb','sort-rate-sortEuro','sort-rate-sortManual','site-cplh-target','dept-ib-ipt','dept-da-ipt'].forEach(id=>{const el=document.getElementById(id);if(el&&t[id])el.value=t[id];});
     syncSortGoalFromPaths();
     // Load settings
     const ds=config.days,ns=config.nights;
@@ -7710,7 +7886,7 @@ function initBoard(){
     document.getElementById('btn-view-current')?.addEventListener('click',()=>setDayView('current'));
     document.getElementById('btn-view-prior')?.addEventListener('click',()=>setDayView('prior'));
     document.getElementById('btn-clear-targets')?.addEventListener('click',()=>{
-        ['ib-bb-goal','ib-goal-input','ib-lp-plan-vol','ib-rate-target','ib-cplh-target','ib-density-target','ob-bb-goal','ob-goal-input','ob-lp-plan-vol','ob-rate-target','ob-cplh-target','ob-density-target','sort-goal','sort-rate-target','sort-vol-sort20lb','sort-vol-sort5lb','sort-vol-sortEuro','sort-vol-sortManual','sort-rate-sort20lb','sort-rate-sort5lb','sort-rate-sortEuro','sort-rate-sortManual','dept-ib-units','dept-ib-cases','dept-ib-days-units','dept-ib-days-cases','dept-ib-ipt','dept-da-units','dept-da-cases','dept-da-days-units','dept-da-days-cases','dept-da-ipt'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
+        ['ib-bb-goal','ib-goal-input','ib-lp-plan-vol','ib-rate-target','ib-cplh-target','ib-density-target','ob-bb-goal','ob-goal-input','ob-lp-plan-vol','ob-rate-target','ob-cplh-target','ob-density-target','sort-goal','sort-rate-target','sort-vol-sort20lb','sort-vol-sort5lb','sort-vol-sortEuro','sort-vol-sortManual','sort-rate-sort20lb','sort-rate-sort5lb','sort-rate-sortEuro','sort-rate-sortManual','dept-ib-ipt','dept-da-ipt'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
         syncSortGoalFromPaths();saveTargetsUI();updateTargetRows();
         // Clear the % column displays
         ['ib-goal-pct','ib-rate-pct','ib-cplh-pct','ib-density-pct','ob-goal-pct','ob-rate-pct','ob-cplh-pct','ob-density-pct','sort-goal-pct','sort-rate-pct'].forEach(id=>{const el=document.getElementById(id);if(el){el.textContent='\u2014';el.classList.remove('pct-good','pct-warn','pct-bad');}});
@@ -8120,7 +8296,7 @@ function syncSortGoalFromPaths(){
 }
 
 function saveTargetsUI(){
-    const t={};['ib-bb-goal','ib-goal-input','ib-lp-plan-vol','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-lp-plan-vol','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','sort-vol-sort20lb','sort-vol-sort5lb','sort-vol-sortEuro','sort-vol-sortManual','sort-rate-sort20lb','sort-rate-sort5lb','sort-rate-sortEuro','sort-rate-sortManual','site-cplh-target','dept-ib-units','dept-ib-cases','dept-ib-days-units','dept-ib-days-cases','dept-ib-ipt','dept-da-units','dept-da-cases','dept-da-days-units','dept-da-days-cases','dept-da-ipt'].forEach(id=>{t[id]=document.getElementById(id)?.value||'';});
+    const t={};['ib-bb-goal','ib-goal-input','ib-lp-plan-vol','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-lp-plan-vol','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','sort-vol-sort20lb','sort-vol-sort5lb','sort-vol-sortEuro','sort-vol-sortManual','sort-rate-sort20lb','sort-rate-sort5lb','sort-rate-sortEuro','sort-rate-sortManual','site-cplh-target','dept-ib-ipt','dept-da-ipt'].forEach(id=>{t[id]=document.getElementById(id)?.value||'';});
     config.targets=t;saveConfig(config);
     // Save LP values separately
     const lp={ibCplh:document.getElementById('lp-ib-cplh')?.value||'',obCplh:document.getElementById('lp-ob-cplh')?.value||'',siteCplh:document.getElementById('lp-site-cplh')?.value||''};
