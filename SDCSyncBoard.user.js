@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.46.0
+// @version      15.46.1
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -180,7 +180,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.46.0';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.46.1';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -3219,7 +3219,7 @@ function attemptLPFetch(site,resolve,isRetry){
                     fetchLPPageAuto(planId,'IB',sundayStr,'key','IB Total CPLH',(v)=>{results.ibCplh=v;done++;checkDone();});
                     fetchLPPageAuto(planId,'DA',sundayStr,'key','DA Bldg to Bldg Total - CPLH',(v)=>{results.obCplh=v;done++;checkDone();});
                     fetchLPPageAuto(planId,'DeratedRates',sundayStr,'lineItem','Total Building CPLH Inc Support',(v,allRows)=>{
-                        results.siteCplh=v;
+                        const deratedSite=v;
                         // Extract CTI rate from DeratedRates (Forecast + Cartons)
                         if(allRows&&allRows.length>0){
                             for(const row of allRows){
@@ -3228,8 +3228,27 @@ function attemptLPFetch(site,resolve,isRetry){
                                 }
                             }
                         }
-                        dbg('[SB-LP] DeratedRates final: CTI='+results.ctiRate+' SiteCPLH='+results.siteCplh);
-                        done+=2;checkDone();
+                        // (15.46.1, user request) SITE CPLH must come from the UNDILUTED rates (the value the
+                        // S&OP WoW page shows, e.g. 19.6), NOT DeratedRates (diluted, e.g. 18.96). Chain:
+                        // UnderatedRatesAndHours -> S&OP WoW page -> DeratedRates (last resort, warned).
+                        const finish=(val,src)=>{
+                            results.siteCplh=val;
+                            if(src==='DeratedRates')console.warn('[SB-LP] Site CPLH: undiluted source not found \u2014 using DeratedRates (diluted) '+val);
+                            else dbg('[SB-LP] Site CPLH from '+src+' = '+val+' (derated was '+deratedSite+')');
+                            dbg('[SB-LP] DeratedRates final: CTI='+results.ctiRate+' SiteCPLH='+results.siteCplh);
+                            done+=2;checkDone();
+                        };
+                        try{
+                            fetchLPPageAuto(planId,'UnderatedRatesAndHours',sundayStr,'lineItem','Total Building CPLH Inc Support',(u)=>{
+                                if(u>0){finish(u,'UnderatedRatesAndHours');return;}
+                                try{
+                                    // '&' must be URL-encoded inside the pageName query value.
+                                    fetchLPPageAuto(planId,'S%26OPWoW-Page',sundayStr,'lineItem','Total Building CPLH Inc Support',(w)=>{
+                                        if(w>0)finish(w,'S&OPWoW-Page');else finish(deratedSite,'DeratedRates');
+                                    });
+                                }catch(e2){finish(deratedSite,'DeratedRates');}
+                            });
+                        }catch(e1){finish(deratedSite,'DeratedRates');}
                     });
                     // Pick rate from UnderatedRatesAndHours (Cartons value is the diluted rate)
                     fetchLPPageAutoRate(planId,'UnderatedRatesAndHours',sundayStr,'Transfer Out Pick - Small',(v)=>{results.topRate=v;done++;checkDone();});
@@ -3299,7 +3318,7 @@ function fetchLPPageAuto(planId,pageName,sundayStr,fieldName,targetKey,callback)
                                 const matches=name===targetKey||name.includes(targetKey);
                                 if(matches&&row.date===sundayStr){
                                     // For DeratedRates/UnderatedRatesAndHours, look for Forecast + Cartons
-                                    if(pageName==='DeratedRates'||pageName==='UnderatedRatesAndHours'){
+                                    if(pageName==='DeratedRates'||pageName==='UnderatedRatesAndHours'||/OPWoW/i.test(pageName)){
                                         if(row.type!=='Forecast'||row.packType!=='Cartons')continue;
                                     }else{
                                         if(row.packType&&row.packType!=='Units')continue;
@@ -3308,7 +3327,7 @@ function fetchLPPageAuto(planId,pageName,sundayStr,fieldName,targetKey,callback)
                                 }
                             }
                             // Fallback
-                            if(val===0){for(const row of rows){const name=(row[fieldName]||'').trim();const matches=name===targetKey||name.includes(targetKey);if(matches&&row.value&&parseFloat(row.value)>0){if(pageName==='DeratedRates'||pageName==='UnderatedRatesAndHours'){if(row.type!=='Forecast'||row.packType!=='Cartons')continue;}val=parseFloat(row.value);break;}}}
+                            if(val===0){for(const row of rows){const name=(row[fieldName]||'').trim();const matches=name===targetKey||name.includes(targetKey);if(matches&&row.value&&parseFloat(row.value)>0){if(pageName==='DeratedRates'||pageName==='UnderatedRatesAndHours'||/OPWoW/i.test(pageName)){if(row.type!=='Forecast'||row.packType!=='Cartons')continue;}val=parseFloat(row.value);break;}}}
                             dbg(`[SB-LP] ${pageName} → ${targetKey} = ${val}`);
                             callback(val,rows);
                         }catch(e){console.warn('[SB-LP] S3 parse error:',pageName,e);callback(0);}
