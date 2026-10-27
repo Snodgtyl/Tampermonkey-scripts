@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Inbound Operations Copilot
 // @namespace    http://tampermonkey.net/
-// @version      9.0.0
+// @version      9.1.0
 // @description  Adds a formatted summary dashboard to Oculus transship pages with AFT pending cases, items, and case density — VRIDs link to YMS — AI-powered anomaly detection and smart trailer prioritization
 // @author       You
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/OculusTransshipDashboard.user.js
@@ -2009,6 +2009,21 @@
                         loadConfig: vals[col('loadconfig')]||(apptIdx >= 0 ? vals[apptIdx+2] : '')||'',
                         flType: vals[col('fltype')]||(apptIdx >= 0 ? vals[apptIdx+3] : '')||'',
                         priorityScore: vals[col('priorityscore')]||vals[8]||'',
+                        // Critical Unload Time: header column (Oculus 'Critical Unload Time'); positionally it sits
+                        // right after FL Type (apptIdx+4). Only accept a date-looking value so a mismatch shows blank.
+                        criticalUnloadTime: (() => {
+                            const isDate = v => /^\d{4}\/\d{2}\/\d{2}/.test(String(v||'').trim());
+                            const ci = col('criticalunloadtime');
+                            if (ci >= 0 && isDate(vals[ci])) return vals[ci].trim();
+                            // Positional: the first date in the 4 cells after FL Type (apptIdx+3). Arrival
+                            // time is further right, so it can't be picked up here. Blank when not set.
+                            if (apptIdx >= 0) {
+                                for (let k = apptIdx + 4; k <= apptIdx + 5 && k < vals.length; k++) {
+                                    if (isDate(vals[k])) return vals[k].trim();
+                                }
+                            }
+                            return '';
+                        })(),
                         arrivalTime: vals[col('arrivaltime')]||vals[11]||'',
                         singleASINPallets: vals[col('singleasinpallets')]||vals[14]||'0',
                         mixedASINPallets: vals[col('mixedasinpallets')]||vals[15]||'0',
@@ -2145,7 +2160,7 @@
             'Total Cartons': 'totalCartons',
             'Total Units': 'totalUnits',
         };
-        const hdrs = ['VRID','Map Location','Appt Status','Trailer Location','Load Config','FL Type','Priority','Source','Arrival Time','SA Pallets','SA Pallet Cases','Mixed Pallets','FL Cases','Total Cartons','Total Units','Density'];
+        const hdrs = ['VRID','Map Location','Appt Status','Trailer Location','Load Config','FL Type','Critical Unload Time','Priority','Source','Arrival Time','SA Pallets','SA Pallet Cases','Mixed Pallets','FL Cases','Total Cartons','Total Units','Density'];
         const head = hdrs.map(h => {
             if (sortableColumns[h]) {
                 const field = sortableColumns[h];
@@ -2179,6 +2194,7 @@
             <td class="${statusClass(t.apptStatus)}">${t.apptStatus}</td>
             <td>${t.trailerLocation}</td>
             <td>${t.loadConfig}</td><td>${t.flType}</td>
+            <td style="white-space:nowrap;">${t.criticalUnloadTime || '—'}</td>
             <td class="${scoreClass(t.priorityScore)}">${t.priorityScore}</td>
             <td>${t.source}</td><td>${t.arrivalTime}</td>
             <td style="text-align:right;color:#e0e0e0">${t.singleASINPallets}</td>
@@ -2885,9 +2901,21 @@
             const justArrived = trailers.filter(t => t.apptStatus === 'ARRIVED');
             const newArrivals = justArrived.filter(t => !previouslyNotified.includes(t.trailerNum));
 
+            // Only notify when the yard is running low: total cartons across in-yard trailers
+            // (ARRIVED + CHECKED_IN) below NOTIFY_YARD_CARTON_MAX. Arrivals while the yard is above
+            // the threshold are still marked as seen (below), so they don't fire later in a burst.
+            const NOTIFY_YARD_CARTON_MAX = 4000;
+            const yardCartons = trailers
+                .filter(t => t.apptStatus === 'ARRIVED' || t.apptStatus === 'CHECKED_IN')
+                .reduce((a, t) => a + (parseInt((t.totalCartons||'0').replace(/,/g,''),10) || 0), 0);
+            const yardLow = yardCartons < NOTIFY_YARD_CARTON_MAX;
+            if (newArrivals.length > 0 && !yardLow) {
+                console.log(`[OculusDash] 🔕 ${newArrivals.length} new arrival(s) not notified — yard has ${yardCartons.toLocaleString()} cartons (notify only below ${NOTIFY_YARD_CARTON_MAX.toLocaleString()})`);
+            }
+
             if (newArrivals.length > 0) {
-                // Send browser notification for each new arrival
-                for (const t of newArrivals) {
+                // Send browser notification for each new arrival (only when the yard is low)
+                for (const t of (yardLow ? newArrivals : [])) {
                     const cases = parseInt((t.totalCartons||'0').replace(/,/g,''),10) || 0;
                     const sapCount = parseInt((t.singleASINPallets||'0').replace(/,/g,''), 10) || 0;
                     const loadType = (t.loadConfig||'').toUpperCase().includes('FLOOR') ? 'Pure Case' :
@@ -2896,7 +2924,7 @@
 
                     GM_notification({
                         title: `🚛 New Trailer Arrived — ${fc.toUpperCase()}`,
-                        text: `${t.trailerNum} from ${t.source || 'Unknown'}\n${loadType} | ${cases.toLocaleString()} cases${sapNote}\nLocation: ${t.trailerLocation || 'TBD'}`,
+                        text: `${t.trailerNum} from ${t.source || 'Unknown'}\n${loadType} | ${cases.toLocaleString()} cases${sapNote}\nLocation: ${t.trailerLocation || 'TBD'}${t.criticalUnloadTime ? ' | CUT ' + t.criticalUnloadTime : ''}\nYard: ${yardCartons.toLocaleString()} cartons`,
                         timeout: 10000,
                         onclick: () => { window.focus(); }
                     });
