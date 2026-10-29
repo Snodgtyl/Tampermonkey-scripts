@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.48.3
+// @version      15.51.1
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -193,7 +193,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.48.3';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.51.1';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -7174,9 +7174,32 @@ function initEosPlanInputs(){
         el.addEventListener('change',onChange);
     }});
 }
+// (15.51.0) EOS Wash is KRB3-only. Single gate for the tab + all EOS-only work (fetch, render,
+// backlog/Atlas fills, email). Shared Sync-tab data (IPT collector, Dept Backlog, ICQA) is NOT gated.
+function sbEosEnabled(){
+    return String((loadConfig()||{}).site||'').toUpperCase()==='KRB3';
+}
+// Show/hide the EOS Wash nav button + panel (its Fetch/Email buttons live in the panel header) for
+// the current site. If EOS Wash is the active tab when it gets hidden, fall back to the Sync tab.
+// Called once in initBoard (after the nav-tab handlers are wired) and on every site-select change.
+function sbApplyEosSiteGate(){
+    const on=sbEosEnabled();
+    const navBtn=document.querySelector('.nav-tab[data-tab="eoswash"]');
+    const panel=document.getElementById('tab-eoswash');
+    if(navBtn)navBtn.style.display=on?'':'none';
+    if(on)return;
+    const wasActive=(navBtn&&navBtn.classList.contains('active'))||(panel&&panel.classList.contains('active'));
+    if(panel){panel.classList.remove('active');panel.style.display='none';}
+    if(wasActive){
+        if(navBtn)navBtn.classList.remove('active');
+        const syncBtn=document.querySelector('.nav-tab[data-tab="sync"]');
+        if(syncBtn)syncBtn.click();
+    }
+}
 // Fetch the full-shift PPR once and render the EOS Wash. Uses the same shift window as the
 // Sync tab (getShiftDates + full schedule).
 async function fetchEOSWashData(){
+    if(!sbEosEnabled())return;   // (15.51.0) KRB3-only: no EOS requests for other sites
     const statusEl=document.getElementById('eoswash-status');
     const btn=document.getElementById('btn-fetch-eoswash');
     const content=document.getElementById('eoswash-content');
@@ -7615,6 +7638,7 @@ function fillDeptBacklogPrior(){
 }
 
 function fillEosBacklog(site){
+    if(!sbEosEnabled())return;   // (15.51.0) KRB3-only EOS Wash backlog spans
     const S=String(site||'').toUpperCase();
     if(!S)return;
     const DASH='\u2014';
@@ -7689,6 +7713,7 @@ function updateAtlasThreshold(){
     });
 }
 function refreshEosAtlasFromSync(){
+    if(!sbEosEnabled())return;   // (15.51.0) KRB3-only; the Sync-tab ATLAS cells are untouched
     try{
         eosFillFromSync('eos-q-bincol-thr','atlas-binc-threshold');
         eosFillFromSync('eos-q-shipfail-thr','atlas-shipfm-threshold');
@@ -7700,6 +7725,7 @@ function refreshEosAtlasFromSync(){
 }
 
 function renderEOSWash(data){
+    if(!sbEosEnabled())return;   // (15.51.0) KRB3-only (covers theme toggle / LP-plan re-render paths)
     const content=document.getElementById('eoswash-content');if(!content)return;
     const ppr=(data&&data.ppr)||{};
     const caseVols=(data&&data.caseVols)||{};
@@ -7798,7 +7824,7 @@ function renderEOSWash(data){
     const bg=(pct)=>{if(pct==null||isNaN(pct)||pct===0)return '';if(pct>=100)return `background:${dc.goodBg};color:${dc.goodTxt};`;if(pct>=95)return `background:${dc.warnBg};color:${dc.warnTxt};`;return `background:${dc.badBg};color:${dc.badTxt};`;};
     // (15.47.0, user request) Hours Variance = "TBD" for these paths until a better plan exists.
     // One-line edit to change. Keyed by PPR line-item name (2nd element of the row tuples).
-    const HV_TBD_PATHS=new Set(['Transfer Out - Fluid Load','Transfer Out Dock','Transfer Out Support','TO Lead/PA']);
+    const HV_TBD_PATHS=new Set(['Transfer Out - Fluid Load','Transfer Out Dock','Transfer Out Support','TO Lead/PA','Case Stow to Reserve']);   // (15.51.1) + Case Stow to Reserve
     const hvTbdCell=()=>'<td title="Hours Variance TBD for this path"><span style="opacity:0.55;">TBD</span></td>';
     // (15.47.0) Hours Variance cell color = % of LP hours used:
     //   pctUsed = actualHours / lpHours * 100, lpHours = LP volume / LP rate (same base as the variance).
@@ -8267,6 +8293,19 @@ function renderEOSWash(data){
         <div style="font-size:10px;color:#888;margin-top:6px;">Plan values are read from the Sync tab targets.</div>
     </section>`;
 
+    // (15.50.0) Highlights: two manual free-text rows (Success Story, Safety) placed between Shift
+    // Accuracy and INBOUND. Textareas reuse the Bridge note styling/auto-grow (eos-bridge-ta) and
+    // persist via the normal .eos-manual save (keyed by id), so Get Data re-renders restore them.
+    // The email's onclone step swaps every textarea in #eoswash-content, so these wrap in the image.
+    const hlNote=(id,ph)=>`<textarea class="support-input eos-manual eos-bridge-ta eos-highlight-ta" id="${id}" placeholder="${ph}" rows="2" style="width:100%;box-sizing:border-box;background:#ffffcc;color:#000;border:1px solid #999;border-radius:3px;resize:vertical;white-space:pre-wrap;word-wrap:break-word;font-family:inherit;text-align:left;"></textarea>`;
+    const highlightsHTML=`<section class="eoswash-section eos-highlights-section">
+        <h3>Highlights</h3>
+        <table class="metrics-table eos-highlights-table"><tbody>
+        <tr><td style="text-align:left;font-weight:600;width:160px;white-space:nowrap;">Success Story</td><td style="text-align:left;width:auto;min-width:0;">${hlNote('eos-hl-success','Enter a success story\u2026')}</td></tr>
+        <tr><td style="text-align:left;font-weight:600;width:160px;white-space:nowrap;">Safety</td><td style="text-align:left;width:auto;min-width:0;">${hlNote('eos-hl-safety','Enter a safety note\u2026')}</td></tr>
+        </tbody></table>
+    </section>`;
+
     // INBOUND (blue) and OUTBOUND (orange): each has a volume table + a compact support group.
     // SUPPORT/THROUGHPUT (purple): site-level indirect (Non-FC, Admin) + the THROUGHPUT total.
     const ibTotal=totalRow('IB TOTAL',IB_ROWS.map(r=>r[1]),IB_VOL_ROWS,ibPlan,ibCplh,'');
@@ -8356,7 +8395,7 @@ function renderEOSWash(data){
         <div style="margin-top:8px;"><button id="eos-safety-add" class="btn btn-small" style="background:#2e7d32;color:#fff;border-color:#2e7d32;">+ Add Row</button> <button id="eos-safety-remove" class="btn btn-small" style="background:#c62828;color:#fff;border-color:#c62828;">\u2212 Remove Row</button></div>
     </section>`;
 
-    content.innerHTML=accuracyHTML+processHTML+backlogHTML+qualityHTML+safetyHTML;
+    content.innerHTML=accuracyHTML+highlightsHTML+processHTML+backlogHTML+qualityHTML+safetyHTML;
 
     // Wire the Safety "+ Add Row" button (adds one more leader row, persists the new count).
     { const addBtn=document.getElementById('eos-safety-add'); if(addBtn)addBtn.addEventListener('click',addEosSafetyRow);
@@ -8467,7 +8506,9 @@ function renderEOSWash(data){
 
 // Capture the EOS Wash as an image, copy it to the clipboard, and open an email addressed to
 // the site's boss ({SITE}-boss@amazon.com). The user pastes the image into the email body.
+// (15.49.0) KRB3 emails CC site leadership; body has "Inbound EOS" / "Outbound EOS" labels.
 function emailEOSWash(){
+    if(!sbEosEnabled())return;   // (15.51.0) KRB3-only (button is hidden with the tab for other sites)
     const content=document.getElementById('eoswash-content');
     const btn=document.getElementById('btn-email-eoswash');
     if(!content||content.innerHTML.trim()===''){alert('Fetch the EOS Wash first, then email.');return;}
@@ -8475,6 +8516,13 @@ function emailEOSWash(){
     const config=loadConfig();
     const site=(config.site||'').toUpperCase();
     const to=site?`${site}-boss@amazon.com`:'';
+    // (15.49.0) Per-site CC. KRB3 = site leadership (Site Leader + Sr. Ops Manager). Other sites
+    // have no entry, so their email keeps no CC exactly as before. Hardcoded (no Settings field),
+    // so no saved value can override it. Comma-separated per the .eml (RFC 5322) address-list rule.
+    const EOS_EMAIL_CC={
+        KRB3:['Damien Baker <damibake@amazon.com>','Pablo Ucros <ucros@amazon.com>']
+    };
+    const cc=(EOS_EMAIL_CC[site]||[]).join(', ');
     const shift=config.shiftType||'';
     const dateStr=new Date().toLocaleDateString();
     const subject=`${site} EOS Wash \u2013 ${shift} \u2013 ${dateStr}`;
@@ -8519,15 +8567,22 @@ function emailEOSWash(){
             const b64=dataUrl.split(',')[1];
             const cid='eoswash_'+Date.now();
             const boundary='----=_SB_'+Date.now();
+            // (15.49.0) "Inbound EOS" / "Outbound EOS" section labels at the top of the body, each
+            // followed by a blank line where the Inbound (Dock / Stow Area Readiness) and Outbound
+            // (Dock / Pick Area Readiness) tables are pasted, then the EOS Wash text + image.
             const htmlBody=''+
                 '<html><body style="font-family:Calibri,Arial,sans-serif;font-size:11pt;">'+
-                'KRB team,<br><br>Please see the '+site+' EOS Wash below.<br><br>'+
+                'KRB team,<br><br>'+
+                '<b>Inbound EOS</b><br><br><br>'+
+                '<b>Outbound EOS</b><br><br><br>'+
+                'Please see the '+site+' EOS Wash below.<br><br>'+
                 '<img src="cid:'+cid+'" style="max-width:100%;"><br><br>'+
                 'Thank you,<br></body></html>';
             // CRLF line endings are required by the .eml (RFC 822) format.
             const CRLF='\r\n';
             const eml=[
                 'To: '+to,
+                ...(cc?['Cc: '+cc]:[]),       // (15.49.0) only emitted when the site has a CC list
                 'Subject: '+subject,
                 'X-Unsent: 1',                 // tells Outlook this is an unsent draft to open in compose
                 'Content-Type: multipart/related; boundary="'+boundary+'"',
@@ -8853,7 +8908,7 @@ function initBoard(){
         try{localStorage.setItem(SLACK_SOS_KEY,sos);localStorage.setItem(SLACK_JOB_BALANCE_KEY,jb);localStorage.setItem(SLACK_FASTSTART_KEY,fs);localStorage.setItem(METRICS_URL_KEY,mu);}catch(e){}
         const note=document.getElementById('slack-save-note');if(note){note.textContent='\u2713 Saved (this browser only)';setTimeout(()=>{note.textContent='';},2500);}
     });
-    sel.onchange=e=>{config.site=e.target.value;if(SITE_SCHEDULES[config.site]){config.days=SITE_SCHEDULES[config.site].days;config.nights=SITE_SCHEDULES[config.site].nights;}saveConfig(config);sbPublishBoardSite(config.site);refreshSettingsInputs();currentMetrics=null;clearBoard();updatePeriodDots();};
+    sel.onchange=e=>{config.site=e.target.value;if(SITE_SCHEDULES[config.site]){config.days=SITE_SCHEDULES[config.site].days;config.nights=SITE_SCHEDULES[config.site].nights;}saveConfig(config);sbPublishBoardSite(config.site);refreshSettingsInputs();currentMetrics=null;clearBoard();updatePeriodDots();sbApplyEosSiteGate();};
     document.getElementById('shift-select').onchange=e=>{config.shiftType=e.target.value;saveConfig(config);currentMetrics=null;clearBoard();updatePeriodDots();doFetch();};
     document.querySelectorAll('.target-input').forEach(inp=>{inp.addEventListener('input',updateTargetRows);inp.addEventListener('change',()=>{saveTargetsUI();if(currentMetrics)renderTargets(currentMetrics);});});
     document.querySelectorAll('.nav-tab').forEach(tab=>tab.onclick=()=>{
@@ -8876,7 +8931,7 @@ function initBoard(){
         }
         // EOS Wash tab: NO auto-fetch — the user clicks "Fetch EOS Wash" themselves. Prompt in the
         // empty content area instead.
-        if(tab.dataset.tab==='eoswash'){
+        if(tab.dataset.tab==='eoswash'&&sbEosEnabled()){
             const et=document.getElementById('eoswash-content');
             if(et&&et.innerHTML.trim()===''){et.innerHTML='<div style="padding:20px;font-size:14px;color:#666;">Click <strong>\u25B6 Fetch EOS Wash</strong> to load.</div>';}
         }
@@ -8901,6 +8956,7 @@ function initBoard(){
             if(vc&&vc.innerHTML.trim()===''){vc.innerHTML='<div style="padding:20px;font-size:14px;color:#666;">Click <strong>\u25B6 Fetch VRETs</strong> to load.</div>';}
         }
     });
+    sbApplyEosSiteGate();   // (15.51.0) hide EOS Wash tab unless the board site is KRB3
     const sup=loadSupport();Object.keys(sup).forEach(id=>{const el=document.getElementById(id);if(el)el.value=sup[id];});
     document.querySelectorAll('.support-input,.callout-textarea').forEach(el=>el.addEventListener('change',()=>{const d={};document.querySelectorAll('.support-input,.callout-textarea').forEach(e=>{d[e.id]=e.value;});saveSupport(d);}));
     renderActions();updatePeriodDots();setInterval(updatePeriodDots,60000);
