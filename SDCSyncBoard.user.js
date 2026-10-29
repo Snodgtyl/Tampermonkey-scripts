@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.46.3
+// @version      15.47.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
 // @downloadURL  https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
 // @match        https://fclm-portal.amazon.com/*
 // @match        https://oculus.qubit.amazon.dev/transship/*
+// @match        https://portal.sandop.a2z.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -29,6 +30,7 @@
 // @connect      afttransshipmenthub-fe.aka.amazon.com
 // @connect      afttransshipmenthub.aka.amazon.com
 // @connect      oculus.qubit.amazon.dev
+// @connect      portal.sandop.a2z.com
 // @connect      hooks.slack.com
 // @connect      raw.githubusercontent.com
 // @run-at       document-idle
@@ -50,6 +52,16 @@ try{
         try{ if(localStorage.getItem('syncboard_debug')==='1')console.log('[SB-IB-Collector] SDC Sync Board loaded on Oculus page — starting collector'); }catch(_){ }
         try{ sbRunOculusCollector(); }catch(e){ try{console.warn('[SB-IB-Collector] fatal (ignored):',e&&e.message);}catch(_){ } }
         return; // Oculus path is fully handled by the collector — do NOT build the FCLM board.
+    }
+}catch(e){ /* if location is unreadable, fall through to FCLM behavior */ }
+// (15.47.0) SandOP Network Viewer: same-origin IPT collector (Forecasted Days of End Transfer In/Out
+// Backlog) -> GM storage sb_ipt_v1_<SITE>; RETURN before any FCLM bootstrapping.
+// TDZ: runs before `const SB_DEBUG` — never call dbg() here.
+try{
+    if(window.location.hostname==='portal.sandop.a2z.com'){
+        try{ if(localStorage.getItem('syncboard_debug')==='1')console.log('[SB-IPT-Collector] SDC Sync Board loaded on SandOP — starting collector'); }catch(_){ }
+        try{ sbRunSandopIptCollector(); }catch(e){ try{console.warn('[SB-IPT-Collector] fatal (ignored):',e&&e.message);}catch(_){ } }
+        return; // SandOP path is fully handled by the collector — do NOT build the FCLM board.
     }
 }catch(e){ /* if location is unreadable, fall through to FCLM behavior */ }
 
@@ -180,7 +192,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.46.3';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.47.0';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -581,8 +593,22 @@ function parseFnRollup(html){
     for(const row of rows){
         if(Array.from(row.querySelectorAll('th,td')).some(c=>/pallet\s*transfer\s*in/i.test(c.textContent.trim())))foundPTI=true;
         if(foundPTI){const cellTexts=Array.from(row.querySelectorAll('td')).map(c=>c.textContent.trim());
-            if(cellTexts.includes('Total')){const nums=[];cellTexts.forEach(c=>{const v=parseFloat(c.replace(/,/g,''));if(!isNaN(v))nums.push(v);});if(nums.length>=6)palletCases=Math.round(nums[5]);break;}}
+            if(cellTexts.includes('Total')){
+                // (15.46.4) Read by COLUMN POSITION, keeping blank cells. The old code dropped blanks
+                // before indexing, so a period with an empty column (e.g. no EACH units in P2) shifted
+                // the values left and missed CASE UNIT (P2 showed 0 while Total was right).
+                // td.numeric layout (same as the tfoot): [Hours, Jobs, JPH, EACH UNIT, EACH UPH, CASE UNIT, ...].
+                const numCells=Array.from(row.querySelectorAll('td.numeric'));
+                if(numCells.length>=6){
+                    palletCases=Math.round(parseFloat(numCells[5].textContent.replace(/,/g,''))||0);
+                }else{
+                    const nums=[];cellTexts.forEach(c=>{const v=parseFloat(c.replace(/,/g,''));if(!isNaN(v))nums.push(v);});if(nums.length>=6)palletCases=Math.round(nums[5]);
+                }
+                break;}}
     }
+    // Fallback: the palletStow report's grand-total tfoot CASE UNIT (cells[5], positional) when the
+    // Pallet Transfer In row gave nothing (e.g. that period's function row is laid out differently).
+    if(palletCases===0&&caseUnits>0&&foundPTI)palletCases=caseUnits;
     // TransshipPalletVerified cases: pallets that were loaded/verified but NOT counted by Fluid
     // Load. They live under the "Transfer Out" function's Total row (the TransshipPalletVerified
     // Case-UNIT column, e.g. 856 cases / 7 pallets in the sample). Parse that row and take its
@@ -1623,6 +1649,286 @@ function sbRunOculusCollector(){
     }catch(e){console.warn('[SB-IB-Collector] fatal',e&&e.message);}
 }
 
+// ── SANDOP IPT COLLECTOR (same-origin DOM scrape, 15.47.0) ─────────────────
+// Runs ONLY on portal.sandop.a2z.com (see the RUN-CONTEXT BRANCH at the top of the IIFE). Reads
+// the S&OP Network Viewer table rows whose Metric is EXACTLY (whitespace-normalized):
+//   IB: "Forecasted Days of End Transfer In Backlog"   (Inbound view)
+//   DA: "Forecasted Days of End Transfer Out Backlog"  (Outbound view)
+// Each data cell is mapped to its header date column ("MM-DD", year inferred as the nearest year
+// to today, so Dec/Jan rollover works); value = the cell's title (full precision) else its text.
+// Site = the site code heading for that table (e.g. "KRB3"). Merged into GM storage
+// sb_ipt_v1_<SITE> = JSON {ib:{'YYYY-MM-DD':n},da:{...},ibTs,daTs} (keeps ~21 days; the other
+// direction is never wiped). Self-contained: references only browser + GM APIs and its own locals
+// (this runs before the board's top-level consts exist — TDZ — so no dbg()/SB_DEBUG/FCLM globals).
+// NEVER throws. Logs under [SB-IPT-Collector].
+function sbRunSandopIptCollector(){
+    const dbgOn=(()=>{try{return localStorage.getItem('syncboard_debug')==='1';}catch(e){return false;}})();
+    const log=(...a)=>{if(dbgOn)console.log('[SB-IPT-Collector]',...a);};
+    try{
+        if(typeof GM_setValue!=='function'||typeof GM_getValue!=='function'){console.warn('[SB-IPT-Collector] GM storage unavailable — cannot store');return;}
+        const norm=(s)=>String(s==null?'':s).replace(/\s+/g,' ').trim();
+        const METRIC={ib:'Forecasted Days of End Transfer In Backlog',da:'Forecasted Days of End Transfer Out Backlog'};
+        const SITE_RE=/^[A-Z]{3,4}\d$/;
+        const DATE_RE=/^(\d{2})-(\d{2})$/;
+        const BADGE_ID='sb-ipt-badge';
+        const KEEP_DAYS=21;
+        const isoOf=(d)=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+        // MM-DD -> YYYY-MM-DD using the candidate year (last/this/next) closest to today. Equivalent
+        // to "> ~6 months ahead => previous year, > ~6 months behind => next year". Invalid -> null.
+        const inferIso=(mm,dd)=>{
+            if(!(mm>=1&&mm<=12&&dd>=1&&dd<=31))return null;
+            const now=new Date();now.setHours(12,0,0,0);
+            let best=null,bestDiff=Infinity;
+            [now.getFullYear()-1,now.getFullYear(),now.getFullYear()+1].forEach(y=>{
+                const c=new Date(y,mm-1,dd,12,0,0,0);
+                if(c.getMonth()!==mm-1||c.getDate()!==dd)return;   // e.g. 02-30
+                const diff=Math.abs(c.getTime()-now.getTime());
+                if(diff<bestDiff){bestDiff=diff;best=c;}
+            });
+            return best?isoOf(best):null;
+        };
+        // rowspan/colspan-expanded grid: grid[r][c] = the cell covering that slot.
+        const buildGrid=(table)=>{
+            const rows=Array.from(table.rows||[]);
+            const grid=[];
+            rows.forEach((tr,r)=>{
+                grid[r]=grid[r]||[];
+                let c=0;
+                Array.from(tr.cells||[]).forEach(cell=>{
+                    while(grid[r][c])c++;
+                    const rs=Math.min(Math.max(1,parseInt(cell.getAttribute('rowspan'),10)||1),rows.length-r);
+                    const cs=Math.min(Math.max(1,parseInt(cell.getAttribute('colspan'),10)||1),200);
+                    for(let i=0;i<rs;i++){grid[r+i]=grid[r+i]||[];for(let j=0;j<cs;j++)grid[r+i][c+j]=cell;}
+                    c+=cs;
+                });
+            });
+            return {rows:rows,grid:grid};
+        };
+        // The header row with >= 3 distinct "MM-DD" cells -> {col: iso} (first column of each cell).
+        const dateColsOf=(g)=>{
+            for(let r=0;r<g.grid.length;r++){
+                const row=g.grid[r]||[];
+                const map={};const seen=new Set();
+                for(let c=0;c<row.length;c++){
+                    const cell=row[c];
+                    if(!cell||seen.has(cell))continue;
+                    const m=DATE_RE.exec(norm(cell.textContent));
+                    if(!m)continue;
+                    const iso=inferIso(parseInt(m[1],10),parseInt(m[2],10));
+                    if(!iso)continue;
+                    seen.add(cell);map[c]=iso;
+                }
+                if(seen.size>=3)return map;
+            }
+            return null;
+        };
+        // STRICT equality only (never includes/startsWith): protects against similar rows such as
+        // "Forecasted Days of End Onsite Transfer In Backlog" or a truncated "...Transfer In B...".
+        const metricOf=(cell)=>{
+            if(!cell)return null;
+            const names=[norm(cell.textContent),norm(cell.getAttribute&&cell.getAttribute('title'))];
+            const tEl=cell.querySelector&&cell.querySelector('[title]');
+            if(tEl)names.push(norm(tEl.getAttribute('title')));
+            if(names.indexOf(METRIC.ib)!==-1)return 'ib';
+            if(names.indexOf(METRIC.da)!==-1)return 'da';
+            return null;
+        };
+        const valueOf=(cell)=>{
+            const t=cell.getAttribute&&cell.getAttribute('title');
+            let v=(t!=null&&t!=='')?parseFloat(String(t).replace(/,/g,'')):NaN;
+            if(!isFinite(v)){
+                const s=norm(cell.textContent).replace(/,/g,'');
+                v=/^-?\d+(\.\d+)?$/.test(s)?parseFloat(s):NaN;
+            }
+            return isFinite(v)?v:null;
+        };
+        // Angular sticky-header fallback: the date header may live in a separate PRECEDING table.
+        const findSepDates=(table)=>{
+            let anc=table.parentElement;
+            for(let i=0;i<5&&anc;i++,anc=anc.parentElement){
+                const prev=Array.from(anc.querySelectorAll('table')).filter(t=>t!==table&&!t.contains(table)&&!table.contains(t)&&(t.compareDocumentPosition(table)&Node.DOCUMENT_POSITION_FOLLOWING));
+                for(let k=prev.length-1;k>=0;k--){const d=dateColsOf(buildGrid(prev[k]));if(d)return d;}
+            }
+            return null;
+        };
+        // -> [{dir, vals:{iso:number}}] for every target metric row in this table.
+        const extract=(table)=>{
+            const g=buildGrid(table);
+            const hits=[];
+            g.rows.forEach((tr,r)=>{
+                const cells=Array.from(tr.cells||[]);
+                for(let i=0;i<Math.min(3,cells.length);i++){
+                    const dir=metricOf(cells[i]);
+                    if(dir){hits.push({dir:dir,r:r,tr:tr,labelIdx:i});break;}
+                }
+            });
+            if(!hits.length)return [];
+            const own=dateColsOf(g);
+            const sep=own?null:findSepDates(table);
+            if(!own)log(sep?'date header found in a separate preceding table (right-aligned mapping)':'metric row found but no MM-DD date header');
+            return hits.map(h=>{
+                const vals={};
+                const labelCell=h.tr.cells[h.labelIdx];
+                if(own){
+                    const row=g.grid[h.r]||[];
+                    Object.keys(own).forEach(k=>{
+                        const c=parseInt(k,10);const cell=row[c];
+                        if(!cell||cell===labelCell||cell.parentElement!==h.tr)return;
+                        const v=valueOf(cell);if(v!=null)vals[own[c]]=v;
+                    });
+                }else if(sep){
+                    const isos=Object.keys(sep).map(k=>parseInt(k,10)).sort((a,b)=>a-b).map(c=>sep[c]);
+                    const data=Array.from(h.tr.cells).slice(h.labelIdx+1);
+                    const n=Math.min(isos.length,data.length);
+                    for(let i=0;i<n;i++){
+                        const v=valueOf(data[data.length-n+i]);
+                        if(v!=null)vals[isos[isos.length-n+i]]=v;
+                    }
+                }
+                return {dir:h.dir,vals:vals};
+            });
+        };
+        // Site code candidates: elements whose OWN text is a site code (e.g. "KRB3"), plus selected
+        // <option>s. Headings are preferred when picking the code for a table.
+        const directText=(el)=>{let s='';el.childNodes.forEach(n=>{if(n.nodeType===3)s+=n.nodeValue+' ';});return norm(s);};
+        const HEADING_SEL='h1,h2,h3,h4,h5,h6,caption,strong,b,[class*="title"],[class*="header"],[class*="heading"]';
+        const siteCandidates=()=>{
+            const out=[];
+            const badge=document.getElementById(BADGE_ID);
+            document.querySelectorAll('h1,h2,h3,h4,h5,h6,caption,strong,b,span,div,a,li,button,label,td,th,p').forEach(el=>{
+                if(badge&&badge.contains(el))return;
+                const txt=directText(el);
+                if(SITE_RE.test(txt))out.push({el:el,code:txt,heading:el.matches(HEADING_SEL),selected:false});
+            });
+            document.querySelectorAll('select').forEach(sel=>{
+                try{const o=sel.selectedOptions&&sel.selectedOptions[0];const txt=o?norm(o.textContent):'';if(SITE_RE.test(txt))out.push({el:sel,code:txt,heading:false,selected:true});}catch(e){}
+            });
+            return out;
+        };
+        const siteFor=(table,cands)=>{
+            // (1) inside this table's caption/thead (never its data rows)
+            const own=cands.filter(c=>{if(!table.contains(c.el))return false;const tb=c.el.closest&&c.el.closest('tbody');return !(tb&&table.contains(tb));});
+            if(own.length&&new Set(own.map(c=>c.code)).size===1)return own[0].code;
+            // (2) the LAST heading preceding the table (handles several tables, each with its heading)
+            const before=cands.filter(c=>!table.contains(c.el)&&(c.el.compareDocumentPosition(table)&Node.DOCUMENT_POSITION_FOLLOWING));
+            const hb=before.filter(c=>c.heading);
+            if(hb.length)return hb[hb.length-1].code;
+            // (3) a single selected site in a dropdown
+            const sel=cands.filter(c=>c.selected);
+            if(sel.length&&new Set(sel.map(c=>c.code)).size===1)return sel[0].code;
+            // (4) the last preceding candidate of any kind
+            if(before.length)return before[before.length-1].code;
+            // (5) exactly one distinct code on the page (selected-site chip)
+            const all=new Set(cands.filter(c=>!table.contains(c.el)).map(c=>c.code));
+            if(all.size===1)return Array.from(all)[0];
+            return null;
+        };
+        // Merge into sb_ipt_v1_<SITE>; never wipes the other direction (prunes both to KEEP_DAYS).
+        const merge=(site,dir,vals)=>{
+            const key='sb_ipt_v1_'+site;
+            let obj=null;
+            try{const raw=GM_getValue(key,null);obj=(typeof raw==='string')?JSON.parse(raw):raw;}catch(e){obj=null;}
+            if(!obj||typeof obj!=='object')obj={};
+            ['ib','da'].forEach(k=>{if(!obj[k]||typeof obj[k]!=='object')obj[k]={};obj[k+'Ts']=Number(obj[k+'Ts'])||0;});
+            const before=JSON.stringify(obj[dir]);
+            Object.assign(obj[dir],vals);
+            const cut=new Date();cut.setHours(12,0,0,0);cut.setDate(cut.getDate()-KEEP_DAYS);
+            const cutIso=isoOf(cut);
+            ['ib','da'].forEach(k=>{Object.keys(obj[k]).forEach(d=>{if(!/^\d{4}-\d{2}-\d{2}$/.test(d)||d<cutIso)delete obj[k][d];});});
+            // Skip redundant writes (scan runs every few seconds): unchanged values + fresh timestamp.
+            if(JSON.stringify(obj[dir])===before&&(Date.now()-obj[dir+'Ts'])<5*60*1000)return false;
+            obj[dir+'Ts']=Date.now();
+            GM_setValue(key,JSON.stringify(obj));
+            return true;
+        };
+        // Small dismissible status badge so the user knows the capture happened.
+        let dismissed=false;
+        const captured={};   // {SITE:{ib:bool,da:bool}} captured during this page session
+        const showBadge=()=>{
+            if(dismissed||!document.body)return;
+            const parts=Object.keys(captured).sort().map(s=>{
+                const c=captured[s];
+                return s+' '+[c.ib?'IB':'',c.da?'DA':''].filter(Boolean).join('/');
+            });
+            if(!parts.length)return;
+            const text='SDC Sync Board \u00b7 IPT saved: '+parts.join('; ');
+            let b=document.getElementById(BADGE_ID);
+            if(!b){
+                b=document.createElement('div');
+                b.id=BADGE_ID;
+                b.setAttribute('role','status');
+                b.setAttribute('aria-live','polite');
+                b.style.cssText='position:fixed;right:12px;bottom:12px;z-index:2147483646;background:#232f3e;color:#fff;font:12px/1.3 Arial,sans-serif;padding:6px 10px;border-radius:6px;box-shadow:0 2px 6px rgba(0,0,0,.3);display:flex;align-items:center;gap:8px;';
+                const span=document.createElement('span');
+                span.className='sb-ipt-badge-text';
+                const btn=document.createElement('button');
+                btn.type='button';
+                btn.setAttribute('aria-label','Dismiss IPT saved notice');
+                btn.textContent='\u00d7';
+                btn.style.cssText='background:transparent;color:#fff;border:1px solid rgba(255,255,255,.5);border-radius:3px;font-size:13px;line-height:1;cursor:pointer;padding:1px 5px;';
+                btn.addEventListener('click',()=>{try{dismissed=true;const x=document.getElementById(BADGE_ID);if(x&&x.parentNode)x.parentNode.removeChild(x);}catch(e){}});
+                b.appendChild(span);b.appendChild(btn);
+                document.body.appendChild(b);
+            }
+            const span=b.querySelector('.sb-ipt-badge-text');
+            if(span&&span.textContent!==text)span.textContent=text;
+        };
+        let lastScan=Date.now();
+        const scan=()=>{
+            lastScan=Date.now();
+            if(!document.body)return;
+            const bodyText=document.body.textContent||'';
+            if(bodyText.indexOf('Forecasted Days of End Transfer')===-1)return;   // cheap pre-check
+            let cands=null;
+            document.querySelectorAll('table').forEach(table=>{
+                try{
+                    const res=extract(table);
+                    if(!res.length)return;
+                    if(!cands)cands=siteCandidates();
+                    const site=siteFor(table,cands);
+                    if(!site){log('metric row found but no site code resolved — table skipped');return;}
+                    res.forEach(h=>{
+                        const n=Object.keys(h.vals).length;
+                        if(!n){log(site+' '+h.dir+': metric row found but no dated values');return;}
+                        const wrote=merge(site,h.dir,h.vals);
+                        captured[site]=captured[site]||{ib:false,da:false};
+                        captured[site][h.dir]=true;
+                        log(site+' '+h.dir+': '+n+' dated value(s)'+(wrote?' stored':' unchanged')+' '+JSON.stringify(h.vals));
+                    });
+                }catch(e){console.warn('[SB-IPT-Collector] table scan error (ignored):',e&&e.message);}
+            });
+            showBadge();
+        };
+        // Debounced (~1.5s) on DOM changes; never starved by a constantly-mutating page (max ~8s).
+        let timer=null;
+        const schedule=()=>{
+            try{
+                clearTimeout(timer);
+                const wait=(Date.now()-lastScan>8000)?0:1500;
+                timer=setTimeout(()=>{try{scan();}catch(e){console.warn('[SB-IPT-Collector] scan threw (ignored):',e&&e.message);}},wait);
+            }catch(e){console.warn('[SB-IPT-Collector] schedule threw (ignored):',e&&e.message);}
+        };
+        let tries=0;
+        const start=()=>{
+            try{
+                const root=document.body||document.documentElement;
+                if(!document.body&&tries++<20){setTimeout(start,500);return;}
+                new MutationObserver((muts)=>{
+                    try{
+                        const b=document.getElementById(BADGE_ID);
+                        if(b&&muts.every(m=>b.contains(m.target)))return;   // ignore our own badge updates
+                        schedule();
+                    }catch(e){console.warn('[SB-IPT-Collector] observer threw (ignored):',e&&e.message);}
+                }).observe(root,{childList:true,subtree:true,characterData:true});
+                setInterval(schedule,10000);
+                schedule();
+                log('collector running');
+            }catch(e){console.warn('[SB-IPT-Collector] start failed:',e&&e.message);}
+        };
+        start();
+    }catch(e){console.warn('[SB-IPT-Collector] fatal',e&&e.message);}
+}
+
 // ── Direct Oculus GraphQL client (FCLM side) ──────────────────────────────
 // Oculus's own frontend talks to POST /api/graphql inside an encrypted envelope (RSA-OAEP
 // SHA-256 wraps a per-request AES-GCM-256 key+IV; response = b64(ciphertext||iv[12])).
@@ -2625,6 +2931,8 @@ function renderAtlasMetrics(byName){
     // ATLAS defect values/thresholds just rendered - refresh the SYNC Actions banner so an
     // over-threshold defect (Bin Collision / Ship Failed Moves) shows up as an action to classify.
     if(typeof updateActionRequired==='function')updateActionRequired();
+    // (15.47.0) Mirror the fresh ATLAS DPMO/threshold into the EOS Wash Atlas Breakdown (no-op if not rendered).
+    if(typeof refreshEosAtlasFromSync==='function')refreshEosAtlasFromSync();
 }
 
 // === ICQA: OpenSearch raw Bin Collision COUNT (separate from the ATLAS DPMO) ===
@@ -3215,7 +3523,8 @@ function attemptLPFetch(site,resolve,isRetry){
                         lpTransferInSupport:0,lpCaseStowToReserve:0,lpRsrSupport:0,lpPalletTransferIn:0,lpIbLeadPa:0,lpIbProblemSolve:0,
                         lpToFluidLoad:0,lpToDock:0,lpToSupport:0,lpToLeadPa:0,lpToProblemSolve:0,
                         _planId:planId,_sundayStr:sundayStr};
-                    const checkDone=()=>{if(done>=21){saveLPValues(results);resolve(results);}};
+                    let lpFinished=false;   // (15.47.0) one-shot: never save/resolve twice
+                    const checkDone=()=>{if(!lpFinished&&done>=21){lpFinished=true;saveLPValues(results);resolve(results);}};
                     fetchLPPageAuto(planId,'IB',sundayStr,'key','IB Total CPLH',(v)=>{results.ibCplh=v;done++;checkDone();});
                     fetchLPPageAuto(planId,'DA',sundayStr,'key','DA Bldg to Bldg Total - CPLH',(v)=>{results.obCplh=v;done++;checkDone();});
                     fetchLPPageAuto(planId,'DeratedRates',sundayStr,'lineItem','Total Building CPLH Inc Support',(v,allRows)=>{
@@ -3250,8 +3559,31 @@ function attemptLPFetch(site,resolve,isRetry){
                             });
                         }catch(e1){finish(deratedSite,'DeratedRates');}
                     });
-                    // Pick rate from UnderatedRatesAndHours (Cartons value is the diluted rate)
-                    fetchLPPageAutoRate(planId,'UnderatedRatesAndHours',sundayStr,'Transfer Out Pick - Small',(v)=>{results.topRate=v;done++;checkDone();});
+                    // (15.47.0) Per-path LP rates = DILUTED rates by path (GalaxyBI DeratedRates), Forecast +
+                    // Cartons, this week's Sunday, EXACT line-item match. Fallback: UnderatedRatesAndHours
+                    // (exact). Each page's rows are fetched ONCE (fetchLPPageAuto passes all rows to the
+                    // callback; the sentinel key matches no row). These promises never reject:
+                    // fetchLPPageAuto always calls back (callback(0) without rows on any error).
+                    const lpRowsOf=(page)=>new Promise((res)=>{try{fetchLPPageAuto(planId,page,sundayStr,'lineItem','\u0000sb-rows-only',(v,rows)=>res(Array.isArray(rows)?rows:[]));}catch(e){res([]);}});
+                    const pickLpRate=(rows,item)=>{for(const r of (rows||[])){if((r.lineItem||'').trim()===item&&r.date===sundayStr&&r.type==='Forecast'&&r.packType==='Cartons'){const v=parseFloat(r.value)||0;if(v>0)return v;}}return 0;};
+                    const drRowsP=lpRowsOf('DeratedRates');
+                    const urRowsP=lpRowsOf('UnderatedRatesAndHours');
+                    // TOP (Transfer Out Pick) rate: DeratedRates 'Transfer Out Pick - Total' then
+                    // 'Transfer Out Pick - Small'; fallback = the pre-15.47.0 UnderatedRatesAndHours call.
+                    // settleTop runs exactly once (flag) so `done` is incremented exactly once for TOP.
+                    let topSettled=false;
+                    const settleTop=(v,src)=>{if(topSettled)return;topSettled=true;results.topRate=v;dbg('[SB-LP RATE] TOP => '+v+' (src '+src+')');done++;checkDone();};
+                    drRowsP.then(dr=>{
+                        const vt=pickLpRate(dr,'Transfer Out Pick - Total');
+                        const v=vt>0?vt:pickLpRate(dr,'Transfer Out Pick - Small');
+                        if(v>0){settleTop(v,'DeratedRates ('+(vt>0?'Transfer Out Pick - Total':'Transfer Out Pick - Small')+')');return;}
+                        try{
+                            fetchLPPageAutoRate(planId,'UnderatedRatesAndHours',sundayStr,'Transfer Out Pick - Small',(u)=>{
+                                console.warn('[SB-LP RATE] "Transfer Out Pick - Small" not in DeratedRates \u2014 using UnderatedRatesAndHours '+u);
+                                settleTop(u,'UnderatedRatesAndHours');
+                            });
+                        }catch(e){settleTop(0,'error');}
+                    }).catch(()=>settleTop(0,'error'));
                     fetchLPPageAutoRate(planId,'Density',sundayStr,'Case Transfer In',(v)=>{results.ibDensityLP=v;done++;checkDone();});
                     fetchLPPageAutoRate(planId,'Density',sundayStr,'DA Bldg to Bldg Transfer TOTAL',(v)=>{results.obDensityLP=v;done++;checkDone();});
                     // BB Goals: Week Capacity (Cartons) for today's day from IB and DA
@@ -3259,28 +3591,35 @@ function attemptLPFetch(site,resolve,isRetry){
                     fetchBBGoalFromLP(planId,'DA',sundayStr,(v)=>{results.obBBGoal=v;done++;checkDone();});
                     // VRET (Vendor Returns) goal: Week Capacity for today's day from the Vendor Returns group.
                     fetchVretGoalFromLP(planId,sundayStr,(v)=>{results.vretGoal=v;done++;checkDone();});
-                    // PROCESS-PATH LP RATES: from UnderatedRatesAndHours (same page as TOP rate),
-                    // the Forecast+Cartons value for the current week's Sunday, matched by line item.
-                    // Feeds the EOS Wash "LP Rate" column (+ Hours Variance next). Confirmed KRB3 wk
-                    // 10/4: Transfer In Support=140, Case Stow to Reserve=81, RSR Support=950.
-                    // The names below are GalaxyBI line-item names (NOT the wash display labels).
-                    // Any that come back 0 => the name is wrong; the loud [SB-LP RATE] log tells you
-                    // which, so you can give me the exact GalaxyBI line-item name to correct it.
-                    // Each wraps the callback to log the resolved value.
-                    const lpRate=(lineItem,field)=>fetchLPPageAutoRate(planId,'UnderatedRatesAndHours',sundayStr,lineItem,(v)=>{
-                        results[field]=v;console.warn('[SB-LP RATE] "'+lineItem+'" => '+v+(v>0?'':' (0 — line-item name may be wrong)'));done++;checkDone();
-                    });
-                    lpRate('Transfer In Support','lpTransferInSupport');
-                    lpRate('Case Stow to Reserve','lpCaseStowToReserve');
-                    lpRate('RSR Support','lpRsrSupport');
-                    lpRate('Pallet Transfer In','lpPalletTransferIn');
-                    lpRate('IB Lead/PA','lpIbLeadPa');
-                    lpRate('IB Problem Solve','lpIbProblemSolve');
-                    lpRate('Transfer Out - Fluid Load','lpToFluidLoad');
-                    lpRate('Transfer Out Dock','lpToDock');
-                    lpRate('Transfer Out Support','lpToSupport');
-                    lpRate('TO Lead/PA','lpToLeadPa');
-                    lpRate('TO Problem Solve','lpToProblemSolve');
+                    // PROCESS-PATH LP RATES (15.47.0): DeratedRates (DILUTED rates by path) first, the
+                    // Forecast+Cartons value for the current week's Sunday, matched EXACTLY by line item;
+                    // fallback UnderatedRatesAndHours (exact) with a console.warn. Feeds the EOS Wash
+                    // "LP Rate" column + Hours Variance. The names below are GalaxyBI line-item names
+                    // (NOT the wash display labels). Any that come back 0 in both pages => the name is
+                    // wrong; the [SB-LP RATE] warn tells you which.
+                    // settlePath runs exactly once per field (flag) so each path increments `done` once.
+                    const LP_PATH_RATES=[
+                        ['Transfer In Support','lpTransferInSupport'],['Case Stow to Reserve','lpCaseStowToReserve'],
+                        ['RSR Support','lpRsrSupport'],['Pallet Transfer In','lpPalletTransferIn'],
+                        ['IB Lead/PA','lpIbLeadPa'],['IB Problem Solve','lpIbProblemSolve'],
+                        ['Transfer Out - Fluid Load','lpToFluidLoad'],['Transfer Out Dock','lpToDock'],
+                        ['Transfer Out Support','lpToSupport'],['TO Lead/PA','lpToLeadPa'],['TO Problem Solve','lpToProblemSolve']];
+                    const pathSettled={};
+                    const settlePath=(item,field,v,src)=>{
+                        if(pathSettled[field])return;pathSettled[field]=true;results[field]=v;
+                        dbg('[SB-LP RATE] "'+item+'" => '+v+' (src '+src+')');
+                        if(!(v>0))console.warn('[SB-LP RATE] "'+item+'" => 0 in DeratedRates and UnderatedRatesAndHours (line-item name may be wrong)');
+                        done++;checkDone();
+                    };
+                    Promise.all([drRowsP,urRowsP]).then(([dr,ur])=>{
+                        LP_PATH_RATES.forEach(([item,field])=>{try{
+                            const d=pickLpRate(dr,item);
+                            if(d>0){settlePath(item,field,d,'DeratedRates');return;}
+                            const u=pickLpRate(ur,item);
+                            console.warn('[SB-LP RATE] "'+item+'" not in DeratedRates \u2014 using UnderatedRatesAndHours '+u);
+                            settlePath(item,field,u,'UnderatedRatesAndHours');
+                        }catch(e){settlePath(item,field,0,'error');}});
+                    }).catch(()=>{LP_PATH_RATES.forEach(([item,field])=>settlePath(item,field,0,'error'));});
                 }catch(e){console.warn('[SB-LP] Parse error:',e);resolve(null);}
             },
             onerror:function(e){
@@ -4589,13 +4928,13 @@ function buildHTML(){return `
 <td><span id="dept-ib-cases" class="dept-val">&mdash;</span></td>
 <td><span id="dept-ib-days-units" class="dept-val">&mdash;</span></td>
 <td><span id="dept-ib-days-cases" class="dept-val">&mdash;</span></td>
-<td><input type="text" id="dept-ib-ipt" class="dept-input"></td></tr>
+<td><span id="dept-ib-ipt" class="dept-val">&mdash;</span></td></tr>
 <tr><td>DA Backlog</td>
 <td><span id="dept-da-units" class="dept-val">&mdash;</span></td>
 <td><span id="dept-da-cases" class="dept-val">&mdash;</span></td>
 <td><span id="dept-da-days-units" class="dept-val">&mdash;</span></td>
 <td><span id="dept-da-days-cases" class="dept-val">&mdash;</span></td>
-<td><input type="text" id="dept-da-ipt" class="dept-input"></td></tr>
+<td><span id="dept-da-ipt" class="dept-val">&mdash;</span></td></tr>
 </tbody></table>
 <div id="dept-bl-note" class="dept-note" style="display:none;"></div></div>
 </div><!-- /targets-panel-top -->
@@ -6693,6 +7032,48 @@ function sbReadBacklogSnapshot(site,iso){
         return(s&&s.ib&&s.da)?s:null;
     }catch(e){console.warn('[SB-DeptBacklog] snapshot read failed: '+(e&&e.message));return null;}
 }
+// (15.47.0) IPT Backlog (SandOP Network Viewer, captured by sbRunSandopIptCollector into GM storage
+// sb_ipt_v1_<SITE> = {ib:{'YYYY-MM-DD':n},da:{...},ibTs,daTs}). Read for ONE date: default = the
+// shift START date (getShiftDates().startDate — a Nights shift read at 03:00 uses the date it
+// started). Missing date -> null (caller shows an em-dash; never substitutes another date).
+function sbShiftIso(){try{return isoDate(getShiftDates(loadConfig()).startDate);}catch(e){return isoDate(new Date());}}
+function getIptValues(site,iso){
+    const out={ib:null,da:null};
+    try{
+        const S=String(site||'').toUpperCase();
+        const date=iso||sbShiftIso();
+        if(!S||typeof GM_getValue!=='function')return out;
+        const raw=GM_getValue('sb_ipt_v1_'+S,null);
+        let obj=null;
+        try{obj=(typeof raw==='string')?JSON.parse(raw):raw;}catch(e){obj=null;}
+        ['ib','da'].forEach(dir=>{
+            const v=obj&&obj[dir]&&obj[dir][date];
+            if(typeof v==='number'&&isFinite(v))out[dir]={val:v,date:date,ts:(obj[dir+'Ts']||0)};
+        });
+        dbg('[SB-IPT] '+S+' '+date+' ib='+(out.ib?out.ib.val:'\u2014')+' da='+(out.da?out.da.val:'\u2014'));
+    }catch(e){console.warn('[SB-IPT] read failed: '+(e&&e.message));}
+    return out;
+}
+function sbIptWriteCell(id,dir,entry,site){
+    const el=document.getElementById(id);if(!el)return;
+    if(entry){
+        el.textContent=entry.val.toFixed(2);
+        let when='unknown';
+        try{if(entry.ts)when=new Date(entry.ts).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});}catch(e){}
+        el.title='SandOP Network Viewer \u00b7 Forecasted Days of End Transfer '+(dir==='ib'?'In':'Out')+' Backlog \u00b7 '+entry.date+' \u00b7 captured '+when;
+    }else{
+        el.textContent='\u2014';
+        el.title='Open S&OP Network Viewer (portal.sandop.a2z.com) for '+(site||'your site')+', view Inbound then Outbound, to capture IPT';
+    }
+}
+function sbFillIptCells(ibId,daId,iso){
+    try{
+        const S=String((loadConfig()||{}).site||'').toUpperCase();
+        const r=getIptValues(S,iso);
+        sbIptWriteCell(ibId,'ib',r.ib,S);
+        sbIptWriteCell(daId,'da',r.da,S);
+    }catch(e){console.warn('[SB-IPT] fill failed: '+(e&&e.message));}
+}
 // --- Sync tab Dept Backlog (Shift Plan Targets panel, Current / Prior Day views) ---
 var SB_DEPT_CELLS={ib:['dept-ib-units','dept-ib-cases','dept-ib-days-units','dept-ib-days-cases'],da:['dept-da-units','dept-da-cases','dept-da-days-units','dept-da-days-cases']};
 function sbDeptAllIds(){return SB_DEPT_CELLS.ib.concat(SB_DEPT_CELLS.da);}
@@ -6723,6 +7104,7 @@ function fillDeptBacklogCurrent(){
     try{
         sbDeptNote('');
         const S=String((loadConfig()||{}).site||'').toUpperCase();
+        sbFillIptCells('dept-ib-ipt','dept-da-ipt',sbShiftIso());   // (15.47.0) IPT for the shift date
         if(!S){sbDeptDashAll();console.warn('[SB-DeptBacklog] no site selected');return;}
         const m=_sbDeptBacklogMemo;
         if(m&&m.site===S&&m.result&&(Date.now()-m.ts)<SB_BL_MEMO_MS){
@@ -6755,6 +7137,7 @@ function fillDeptBacklogPrior(){
         const S=String((loadConfig()||{}).site||'').toUpperCase();
         const d=new Date();d.setHours(12,0,0,0);d.setDate(d.getDate()-1);
         const iso=isoDate(d);
+        sbFillIptCells('dept-ib-ipt','dept-da-ipt',iso);   // (15.47.0) IPT for the Prior Day view's date
         const lbl=d.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'});
         const snap=S?sbReadBacklogSnapshot(S,iso):null;
         if(!snap){
@@ -6806,6 +7189,54 @@ function fillEosBacklog(site){
     };
     doDays('IB',ibDays,c.ibDaysP);
     doDays('DA',daDays,c.daDaysP);
+}
+
+// (15.47.0) EOS Wash Atlas Breakdown: THRESHOLD and DPMO are READ-ONLY copies of the Sync ICQA
+// ATLAS cells (atlas-*-threshold / atlas-*-value). Both panels share the same #sb-root DOM, so we
+// read those cells directly. Called by renderEOSWash and after every renderAtlasMetrics (Get Data /
+// cache fallback). No-op when the EOS Wash isn't rendered.
+function eosFillFromSync(eosId,syncId){
+    const dispEl=document.getElementById(eosId);const srcEl=document.getElementById(syncId);
+    if(!dispEl)return;
+    const t=srcEl?(srcEl.textContent||'').trim():'';
+    dispEl.textContent=(t&&t!=='\u2014'&&!isNaN(parseFloat(t.replace(/,/g,''))))?t:'\u2014';
+}
+// Red DPMO cell + reveal the reason note row when DPMO is OVER the pulled threshold. Both values are
+// read from the read-only spans' textContent; an em-dash / non-numeric value never flags over.
+function updateAtlasThreshold(){
+    const specs=[
+        {inp:'eos-q-bincol-dpmo',  thr:'eos-q-bincol-thr',  note:'eos-q-bincol-note-row'},
+        {inp:'eos-q-shipfail-dpmo',thr:'eos-q-shipfail-thr',note:'eos-q-shipfail-note-row'}
+    ];
+    specs.forEach(s=>{
+        const el=document.getElementById(s.inp);
+        const thrEl=document.getElementById(s.thr);
+        const noteRow=document.getElementById(s.note);
+        if(!el)return;
+        const dpmo=parseFloat((el.textContent||'').replace(/,/g,''));
+        const thresh=thrEl?parseFloat((thrEl.textContent||'').replace(/,/g,'')):NaN;
+        const over=Number.isFinite(dpmo)&&Number.isFinite(thresh)&&dpmo>thresh;
+        if(over){
+            el.style.background='#f8d7da';
+            el.style.color='#842029';
+            el.style.border='1px solid #c62828';
+        }else{
+            el.style.background='';
+            el.style.color='';
+            el.style.border='';
+        }
+        if(noteRow)noteRow.style.display=over?'':'none';
+    });
+}
+function refreshEosAtlasFromSync(){
+    try{
+        eosFillFromSync('eos-q-bincol-thr','atlas-binc-threshold');
+        eosFillFromSync('eos-q-shipfail-thr','atlas-shipfm-threshold');
+        eosFillFromSync('eos-q-bincol-dpmo','atlas-binc-value');
+        eosFillFromSync('eos-q-shipfail-dpmo','atlas-shipfm-value');
+        ['eos-q-bincol-dpmo','eos-q-shipfail-dpmo'].forEach(id=>{const el=document.getElementById(id);if(el)el.title='Auto-filled from Sync tab ICQA (ATLAS DPMO)';});
+        updateAtlasThreshold();
+    }catch(e){console.warn('[SB-EOS Atlas] refresh failed: '+(e&&e.message));}
 }
 
 function renderEOSWash(data){
@@ -6905,7 +7336,28 @@ function renderEOSWash(data){
     const dash=()=>'<span style="opacity:0.4;">\u2014</span>';
     // Cell background by good/warn/bad. dir='high' => higher is better (rate, %); 'low' => lower is better.
     const bg=(pct)=>{if(pct==null||isNaN(pct)||pct===0)return '';if(pct>=100)return `background:${dc.goodBg};color:${dc.goodTxt};`;if(pct>=95)return `background:${dc.warnBg};color:${dc.warnTxt};`;return `background:${dc.badBg};color:${dc.badTxt};`;};
-    const varBg=(v)=>{if(v==null||isNaN(v)||v===0)return '';return v>=0?`background:${dc.goodBg};color:${dc.goodTxt};`:`background:${dc.badBg};color:${dc.badTxt};`;};
+    // (15.47.0, user request) Hours Variance = "TBD" for these paths until a better plan exists.
+    // One-line edit to change. Keyed by PPR line-item name (2nd element of the row tuples).
+    const HV_TBD_PATHS=new Set(['Transfer Out - Fluid Load','Transfer Out Dock','Transfer Out Support','TO Lead/PA']);
+    const hvTbdCell=()=>'<td title="Hours Variance TBD for this path"><span style="opacity:0.55;">TBD</span></td>';
+    // (15.47.0) Hours Variance cell color = % of LP hours used:
+    //   pctUsed = actualHours / lpHours * 100, lpHours = LP volume / LP rate (same base as the variance).
+    // GREEN when HV_GREEN_MIN <= pctUsed <= HV_GREEN_MAX, RED otherwise (over 102.5% or under 100%).
+    // No color when inputs are missing. Flip/adjust the rule HERE only.
+    const HV_GREEN_MIN=100, HV_GREEN_MAX=102.5;
+    const hvColor=(pct)=>{
+        if(pct==null||!isFinite(pct))return '';
+        return (pct>=HV_GREEN_MIN&&pct<=HV_GREEN_MAX)?`background:${dc.goodBg};color:${dc.goodTxt};`:`background:${dc.badBg};color:${dc.badTxt};`;
+    };
+    // p = hoursVarianceParts(...) result or null. Shows the signed variance (+ = under-spent hours,
+    // - = over-spent), 2 decimals, with an "LP hrs · actual hrs · % of LP hours" tooltip.
+    const hvCell=(p)=>{
+        if(!p)return '<td>'+dash()+'</td>';
+        const txt=(p.variance>0?'+':'')+fv(p.variance,2);
+        const pct=(p.lpHrs>0&&p.actHrs>0)?(p.actHrs/p.lpHrs)*100:null;
+        const title='LP hrs '+fv(p.lpHrs,2)+' \u00b7 actual hrs '+fv(p.actHrs,2)+' \u00b7 '+(pct==null?'\u2014':pct.toFixed(1)+'%')+' of LP hours';
+        return `<td style="${hvColor(pct)}" title="${title}">${txt}</td>`;
+    };
     // Hours Variance cell color: GREEN when the actual rate is within 3% of the LP rate (close to
     // perfectly aligned), RED otherwise. gapPct = |actual - LP| / LP * 100. Returns a style string.
     const varBand=(actRate,lpRate)=>{
@@ -6925,13 +7377,19 @@ function renderEOSWash(data){
     // (true): ((LP_volume/LP_rate)*shiftHours) - actualHours, shiftHours=eosShift.block (10 KRB3).
     // + = used FEWER hours than plan (good). Returns null (blank cell) when LP_volume or LP_rate
     // is 0/unavailable, so the cell shows a dash, never 0/NaN.
-    function hoursVariance(dept,lpRate,actualHours,useShiftMultiplier){
+    // (15.47.0) Parts form (lpVol, lpHrs, actHrs, variance) so the cell color/tooltip use the same base.
+    function hoursVarianceParts(dept,lpRate,actualHours){
         const lpVol=(dept==='ib')?gv('ib-lp-plan-vol'):(dept==='ob')?gv('ob-lp-plan-vol'):gv('ib-lp-plan-vol')+gv('ob-lp-plan-vol');
         if(!(lpVol>0)||!(lpRate>0))return null;
         // (15.46.2, user spec) ONE rule for every row: (dept LP volume / row LP rate) - actual hours.
-        // The old Formula B shift-hours multiplier is retired (useShiftMultiplier is ignored).
-        const base=lpVol/lpRate;
-        return base-((actualHours!=null)?actualHours:0);
+        // The old Formula B shift-hours multiplier is retired.
+        const lpHrs=lpVol/lpRate;
+        const actHrs=(actualHours!=null&&isFinite(actualHours))?Number(actualHours):0;
+        return {lpVol:lpVol,lpHrs:lpHrs,actHrs:actHrs,variance:lpHrs-actHrs};
+    }
+    function hoursVariance(dept,lpRate,actualHours,useShiftMultiplier){
+        const p=hoursVarianceParts(dept,lpRate,actualHours);
+        return p?p.variance:null;
     }
 
     // Volume rows are now driven by the per-row hasVol flag (3rd array element), so the Set is
@@ -7044,8 +7502,12 @@ function renderEOSWash(data){
         // hours. IB rows use the IB LP volume, DA rows the DA LP volume. e.g. Pallet Transfer In
         // 6060/425.5 = 14.25 - 1.25 = +13.00. Sign-colored (green = fewer hours than plan).
         const rowDept=IB_ROWS.some(r=>r[1]===pprName)?'ib':'ob';
-        const rowVar=isPctRow?hoursVar:hoursVariance(rowDept,lpRateVal,hrs,false);
-        const varCell=`<td style="${varBg(rowVar)}">${rowVar!=null?fv(rowVar,2):dash()}</td>`;
+        // (15.47.0) Same inputs as before (CTI/TOP: section dept + ctiLpRate/topLpRate + hvHrs;
+        // others: rowDept + lpRateVal + hrs), colored by % of LP hours; TBD paths show "TBD".
+        const rowParts=isPctRow
+            ? hoursVarianceParts(pprName==='Case Transfer In'?'ib':'ob',pprName==='Case Transfer In'?ctiLpRate:topLpRate,hvHrs)
+            : hoursVarianceParts(rowDept,lpRateVal,hrs);
+        const varCell=HV_TBD_PATHS.has(pprName)?hvTbdCell():hvCell(rowParts);
         return `<tr>
             <td style="text-align:left;">${label}</td>
             <td>${vol!=null?fv(vol):dash()}</td>
@@ -7101,7 +7563,7 @@ function renderEOSWash(data){
         // (15.46.2, user spec) Use THIS section's LP volume only (IB TOTAL -> IB LP vol, DA TOTAL ->
         // DA LP vol), not the combined IB+DA. e.g. IB 6060 / LP CPLH 25 = 242.4 - 180 = +62.4.
         const totDept=(label.indexOf('IB')===0)?'ib':'ob';
-        const totVar=hoursVariance(totDept,cplhGoal,hrs,false);
+        const totParts=hoursVarianceParts(totDept,cplhGoal,hrs);
         // TOTAL row's LP Rate column = the section's LP CPLH goal (the same cplhGoal the % is
         // measured against), so the column is populated for the totals too.
         return `<tr class="${cls}" style="font-weight:700;border-top:2px solid #000;">
@@ -7111,7 +7573,7 @@ function renderEOSWash(data){
             <td>${rate>0?fv(rate,2):dash()}</td>
             <td>${cplhGoal>0?fv(cplhGoal,2):dash()}</td>
             <td style="${bg(cplhPct)}">${cplhPct>0?cplhPct.toFixed(1)+'%':dash()}</td>
-            <td style="${varBg(totVar)}">${totVar!=null?fv(totVar,2):dash()}</td>
+            ${hvCell(totParts)}
             ${bridge(slug(label))}
         </tr>`;
     }
@@ -7140,16 +7602,19 @@ function renderEOSWash(data){
         // site LP CPLH, minus actual throughput hours: (IB_LP + OB_LP)/siteLpCplh - tHrs.
         // + = used FEWER hours than plan (good). Reuses the shared hoursVariance helper with
         // dept='total' (sums both LP volumes) and no shift multiplier. Blank if inputs unavailable.
-        const hv=hoursVariance('total',siteLpCplh,tHrs,false);
+        const hvParts=hoursVarianceParts('total',siteLpCplh,tHrs);
+        const hv=hvParts?hvParts.variance:null;
         dbg('[SB-EOS throughput] 12hrVol='+vol+' 12hrHrs='+tHrs+' rate(siteCPLH)='+rate.toFixed(2)+' shiftVol='+shiftVol+' siteLpCplh='+siteLpCplh+' => %toLP='+pct.toFixed(1)+'% hoursVar='+(hv==null?'n/a':hv.toFixed(2)));
         return `<tr style="font-weight:700;border-top:3px solid #000;background:rgba(123,31,162,0.10);">
             <td style="text-align:left;">THROUGHPUT</td><td>${vol>0?fv(vol):dash()}</td><td>${tHrs>0?fv(tHrs,2):dash()}</td><td>${rate>0?fv(rate,2):dash()}</td>
             <td>${siteLpCplh>0?fv(siteLpCplh,2):dash()}</td>
             <td style="${bg(pct)}">${pct>0?pct.toFixed(1)+'%':dash()}</td>
-            <td style="${varBg(hv)}">${hv!=null?fv(hv,2):dash()}</td>${bridge('throughput')}
+            ${hvCell(hvParts)}${bridge('throughput')}
         </tr>`;
     }
 
+    // (15.47.0) Source is now GalaxyBI DeratedRates (DILUTED rates by path) first, with an
+    // UnderatedRatesAndHours fallback (see attemptLPFetch). Older note:
     // Per-support-function LP RATE, from GalaxyBI UnderatedRatesAndHours (Forecast+Cartons value
     // for the current week's Sunday, fetched in attemptLPFetch and cached in loadLPValues()). Keyed
     // by the PPR line-item name. One consistent value per week. Confirmed KRB3 wk 10/4: Transfer In
@@ -7238,13 +7703,13 @@ function renderEOSWash(data){
         // e.g. Transfer In Support 6060/128 = 47.34 - 50.56 = -3.21.
         const svMap=SUP_VAR[pprName];
         const sv={dept:svMap?svMap.dept:(IB_ROWS.some(r=>r[1]===pprName)?'ib':'ob')};
-        const hoursVar=hoursVariance(sv.dept,lpRate,hrs,false);
+        const hvParts=hoursVarianceParts(sv.dept,lpRate,hrs);
         return `<tr>
             <td style="text-align:left;">${label}</td>
             <td>${hrs!=null?fv(hrs,2):dash()}</td>
             <td>${actRate>0?fv(actRate,1):dash()}</td>
             ${lpCell}
-            <td style="${varBg(hoursVar)}">${hoursVar!=null?fv(hoursVar,2):dash()}</td>
+            ${HV_TBD_PATHS.has(pprName)?hvTbdCell():hvCell(hvParts)}
             ${bridge(slug(label))}
         </tr>`;
     }
@@ -7362,8 +7827,8 @@ function renderEOSWash(data){
     const backlogHTML=`<section class="eoswash-section">
         <h3>Backlog</h3>
         <table class="metrics-table"><thead><tr><th style="text-align:left;">Dept</th><th>Units</th><th>Cases</th><th>Days in Units</th><th>Days in Cases</th><th>IPT Backlog</th></tr></thead><tbody>
-        <tr><td style="text-align:left;">Inbound Backlog</td><td><span id="eos-bl-ib-units" style="font-weight:700;">\u2014</span></td><td><span id="eos-bl-ib-cases" style="font-weight:700;">\u2014</span></td><td><span id="eos-bl-ib-dunits" style="font-weight:700;">\u2014</span></td><td><span id="eos-bl-ib-dcases" style="font-weight:700;">\u2014</span></td><td rowspan="2" style="vertical-align:middle;">${inp('eos-bl-ipt')}</td></tr>
-        <tr><td style="text-align:left;">DA Backlog</td><td><span id="eos-bl-da-units" style="font-weight:700;">\u2014</span></td><td><span id="eos-bl-da-cases" style="font-weight:700;">\u2014</span></td><td><span id="eos-bl-da-dunits" style="font-weight:700;">\u2014</span></td><td><span id="eos-bl-da-dcases" style="font-weight:700;">\u2014</span></td></tr>
+        <tr><td style="text-align:left;">Inbound Backlog</td><td><span id="eos-bl-ib-units" style="font-weight:700;">\u2014</span></td><td><span id="eos-bl-ib-cases" style="font-weight:700;">\u2014</span></td><td><span id="eos-bl-ib-dunits" style="font-weight:700;">\u2014</span></td><td><span id="eos-bl-ib-dcases" style="font-weight:700;">\u2014</span></td><td><span id="eos-bl-ib-ipt" style="font-weight:700;">\u2014</span></td></tr>
+        <tr><td style="text-align:left;">DA Backlog</td><td><span id="eos-bl-da-units" style="font-weight:700;">\u2014</span></td><td><span id="eos-bl-da-cases" style="font-weight:700;">\u2014</span></td><td><span id="eos-bl-da-dunits" style="font-weight:700;">\u2014</span></td><td><span id="eos-bl-da-dcases" style="font-weight:700;">\u2014</span></td><td><span id="eos-bl-da-ipt" style="font-weight:700;">\u2014</span></td></tr>
         </tbody></table>
     </section>`;
 
@@ -7380,9 +7845,9 @@ function renderEOSWash(data){
           <div class="eos-q-card eos-q-atlas">
             <div class="eos-q-card-head">\u26A0\uFE0F Atlas Breakdown <span class="eos-q-sub">DPMO \u00b7 lower is better</span></div>
             <table class="eos-q-table"><thead><tr><th style="text-align:left;">Metric</th><th>Threshold</th><th>DPMO</th></tr></thead><tbody>
-            <tr><td style="text-align:left;font-weight:600;">Bin Collisions</td><td><span id="eos-q-bincol-thr" style="font-weight:700;">\u2014</span></td><td>${inp('eos-q-bincol-dpmo')}</td></tr>
+            <tr><td style="text-align:left;font-weight:600;">Bin Collisions</td><td><span id="eos-q-bincol-thr" style="font-weight:700;">\u2014</span></td><td><span id="eos-q-bincol-dpmo" style="font-weight:700;display:inline-block;padding:2px 6px;border-radius:3px;">\u2014</span></td></tr>
             <tr id="eos-q-bincol-note-row" style="display:none;"><td colspan="3" style="text-align:left;">${pileNote('eos-q-bincol-note','Explain why Bin Collisions DPMO is over threshold\u2026')}</td></tr>
-            <tr><td style="text-align:left;font-weight:600;">Ship Failed Moves</td><td><span id="eos-q-shipfail-thr" style="font-weight:700;">\u2014</span></td><td>${inp('eos-q-shipfail-dpmo')}</td></tr>
+            <tr><td style="text-align:left;font-weight:600;">Ship Failed Moves</td><td><span id="eos-q-shipfail-thr" style="font-weight:700;">\u2014</span></td><td><span id="eos-q-shipfail-dpmo" style="font-weight:700;display:inline-block;padding:2px 6px;border-radius:3px;">\u2014</span></td></tr>
             <tr id="eos-q-shipfail-note-row" style="display:none;"><td colspan="3" style="text-align:left;">${pileNote('eos-q-shipfail-note','Explain why Ship Failed Moves DPMO is over threshold\u2026')}</td></tr>
             </tbody></table>
           </div>
@@ -7435,7 +7900,8 @@ function renderEOSWash(data){
     // so the initBoard-time listener doesn't cover them).
     // The four Backlog "Days in Units/Cases" cells were manual inputs before 15.42.0; they are now
     // computed read-only spans. Purge any stale saved values so nothing restores into them.
-    { const staleIds=['eos-bl-ib-dunits','eos-bl-ib-dcases','eos-bl-da-dunits','eos-bl-da-dcases'];
+    // (15.47.0) IPT Backlog (eos-bl-ipt) and the Atlas DPMO cells are now read-only auto-filled spans too.
+    { const staleIds=['eos-bl-ib-dunits','eos-bl-ib-dcases','eos-bl-da-dunits','eos-bl-da-dcases','eos-bl-ipt','eos-q-bincol-dpmo','eos-q-shipfail-dpmo'];
       const s0=loadSupport();
       if(staleIds.some(k=>Object.prototype.hasOwnProperty.call(s0,k))){staleIds.forEach(k=>{delete s0[k];});saveSupport(s0);} }
     const sup=loadSupport();
@@ -7458,56 +7924,11 @@ function renderEOSWash(data){
         }
     });
 
-    // Atlas Breakdown THRESHOLDS are READ-ONLY display values pulled from the Sync-tab ICQA panel,
-    // which computes them live (atlas-binc-threshold / atlas-shipfm-threshold). Both panels share
-    // the same #sb-root DOM so we read those cells directly and write them into the display spans.
-    // Not editable — they're set values, not manual inputs. Shows a dash until ICQA has loaded.
-    {
-        const fillThr=(eosId,syncId)=>{
-            const dispEl=document.getElementById(eosId);const srcEl=document.getElementById(syncId);
-            if(!dispEl||!srcEl)return;
-            const t=(srcEl.textContent||'').trim();
-            dispEl.textContent=(t&&t!=='\u2014'&&!isNaN(parseFloat(t.replace(/,/g,''))))?t:'\u2014';
-        };
-        fillThr('eos-q-bincol-thr','atlas-binc-threshold');
-        fillThr('eos-q-shipfail-thr','atlas-shipfm-threshold');
-    }
-
-    // --- Atlas thresholds: red DPMO cell + reveal a reason note when DPMO is OVER the pulled
-    // threshold. Mirrors updatePilesThreshold, but the threshold here is READ from the read-only
-    // display span (populated by fillThr above). If the span shows an em-dash / non-numeric
-    // (threshold not loaded), treat threshold as unavailable and do NOT flag over. ---
-    const ATLAS_OK_BG='#ffffcc';   // normal eos-manual yellow
-    function updateAtlasThreshold(){
-        const specs=[
-            {inp:'eos-q-bincol-dpmo',  thr:'eos-q-bincol-thr',  note:'eos-q-bincol-note-row'},
-            {inp:'eos-q-shipfail-dpmo',thr:'eos-q-shipfail-thr',note:'eos-q-shipfail-note-row'}
-        ];
-        specs.forEach(s=>{
-            const el=document.getElementById(s.inp);
-            const thrEl=document.getElementById(s.thr);
-            const noteRow=document.getElementById(s.note);
-            if(!el)return;
-            const dpmo=parseFloat((el.value||'').toString().replace(/,/g,''));
-            const thresh=thrEl?parseFloat((thrEl.textContent||'').replace(/,/g,'')):NaN;
-            const over=Number.isFinite(dpmo)&&Number.isFinite(thresh)&&dpmo>thresh;
-            if(over){
-                el.style.background='#f8d7da';
-                el.style.color='#842029';
-                el.style.borderColor='#c62828';
-            }else{
-                el.style.background=ATLAS_OK_BG;
-                el.style.color='#000';
-                el.style.borderColor='#999';
-            }
-            if(noteRow)noteRow.style.display=over?'':'none';
-        });
-    }
-    ['eos-q-bincol-dpmo','eos-q-shipfail-dpmo'].forEach(id=>{
-        const el=document.getElementById(id);
-        if(el)el.addEventListener('input',updateAtlasThreshold);
-    });
-    updateAtlasThreshold(); // initial state reflects pulled thresholds + any persisted DPMO value
+    // (15.47.0) Atlas Breakdown THRESHOLD + DPMO are read-only copies of the Sync-tab ICQA ATLAS
+    // cells; refreshEosAtlasFromSync fills them and runs updateAtlasThreshold (red + reason row).
+    refreshEosAtlasFromSync();
+    // (15.47.0) IPT Backlog (SandOP Network Viewer capture) for the shift START date.
+    sbFillIptCells('eos-bl-ib-ipt','eos-bl-da-ipt',sbShiftIso());
 
     // --- Piles thresholds: red cell + reveal a reason note when value is OVER the threshold ---
     // Per-row threshold (value STRICTLY over it is "over"): IB PS / DA PS / Sort PS = 0 (any value
@@ -7868,7 +8289,7 @@ function initBoard(){
     document.getElementById('shift-select').value=config.shiftType;
     // Load targets
     const t=config.targets||{};
-    ['ib-bb-goal','ib-goal-input','ib-lp-plan-vol','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-lp-plan-vol','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','sort-vol-sort20lb','sort-vol-sort5lb','sort-vol-sortEuro','sort-vol-sortManual','sort-rate-sort20lb','sort-rate-sort5lb','sort-rate-sortEuro','sort-rate-sortManual','site-cplh-target','dept-ib-ipt','dept-da-ipt'].forEach(id=>{const el=document.getElementById(id);if(el&&t[id])el.value=t[id];});
+    ['ib-bb-goal','ib-goal-input','ib-lp-plan-vol','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-lp-plan-vol','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','sort-vol-sort20lb','sort-vol-sort5lb','sort-vol-sortEuro','sort-vol-sortManual','sort-rate-sort20lb','sort-rate-sort5lb','sort-rate-sortEuro','sort-rate-sortManual','site-cplh-target'].forEach(id=>{const el=document.getElementById(id);if(el&&t[id])el.value=t[id];});
     syncSortGoalFromPaths();
     // Load settings
     const ds=config.days,ns=config.nights;
@@ -7917,7 +8338,7 @@ function initBoard(){
     document.getElementById('btn-view-current')?.addEventListener('click',()=>setDayView('current'));
     document.getElementById('btn-view-prior')?.addEventListener('click',()=>setDayView('prior'));
     document.getElementById('btn-clear-targets')?.addEventListener('click',()=>{
-        ['ib-bb-goal','ib-goal-input','ib-lp-plan-vol','ib-rate-target','ib-cplh-target','ib-density-target','ob-bb-goal','ob-goal-input','ob-lp-plan-vol','ob-rate-target','ob-cplh-target','ob-density-target','sort-goal','sort-rate-target','sort-vol-sort20lb','sort-vol-sort5lb','sort-vol-sortEuro','sort-vol-sortManual','sort-rate-sort20lb','sort-rate-sort5lb','sort-rate-sortEuro','sort-rate-sortManual','dept-ib-ipt','dept-da-ipt'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
+        ['ib-bb-goal','ib-goal-input','ib-lp-plan-vol','ib-rate-target','ib-cplh-target','ib-density-target','ob-bb-goal','ob-goal-input','ob-lp-plan-vol','ob-rate-target','ob-cplh-target','ob-density-target','sort-goal','sort-rate-target','sort-vol-sort20lb','sort-vol-sort5lb','sort-vol-sortEuro','sort-vol-sortManual','sort-rate-sort20lb','sort-rate-sort5lb','sort-rate-sortEuro','sort-rate-sortManual'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
         syncSortGoalFromPaths();saveTargetsUI();updateTargetRows();
         // Clear the % column displays
         ['ib-goal-pct','ib-rate-pct','ib-cplh-pct','ib-density-pct','ob-goal-pct','ob-rate-pct','ob-cplh-pct','ob-density-pct','sort-goal-pct','sort-rate-pct'].forEach(id=>{const el=document.getElementById(id);if(el){el.textContent='\u2014';el.classList.remove('pct-good','pct-warn','pct-bad');}});
@@ -7939,8 +8360,6 @@ function initBoard(){
     sel.onchange=e=>{config.site=e.target.value;if(SITE_SCHEDULES[config.site]){config.days=SITE_SCHEDULES[config.site].days;config.nights=SITE_SCHEDULES[config.site].nights;}saveConfig(config);refreshSettingsInputs();currentMetrics=null;clearBoard();updatePeriodDots();};
     document.getElementById('shift-select').onchange=e=>{config.shiftType=e.target.value;saveConfig(config);currentMetrics=null;clearBoard();updatePeriodDots();doFetch();};
     document.querySelectorAll('.target-input').forEach(inp=>{inp.addEventListener('input',updateTargetRows);inp.addEventListener('change',()=>{saveTargetsUI();if(currentMetrics)renderTargets(currentMetrics);});});
-    // Dept Backlog inputs are manual-only; just persist them on change (no metric re-render).
-    document.querySelectorAll('.dept-input').forEach(inp=>inp.addEventListener('change',saveTargetsUI));
     document.querySelectorAll('.nav-tab').forEach(tab=>tab.onclick=()=>{
         document.querySelectorAll('.nav-tab').forEach(t=>t.classList.remove('active'));
         // Clear any leftover inline display (an older build set style.display inline, which
@@ -8327,7 +8746,7 @@ function syncSortGoalFromPaths(){
 }
 
 function saveTargetsUI(){
-    const t={};['ib-bb-goal','ib-goal-input','ib-lp-plan-vol','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-lp-plan-vol','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','sort-vol-sort20lb','sort-vol-sort5lb','sort-vol-sortEuro','sort-vol-sortManual','sort-rate-sort20lb','sort-rate-sort5lb','sort-rate-sortEuro','sort-rate-sortManual','site-cplh-target','dept-ib-ipt','dept-da-ipt'].forEach(id=>{t[id]=document.getElementById(id)?.value||'';});
+    const t={};['ib-bb-goal','ib-goal-input','ib-lp-plan-vol','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-lp-plan-vol','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','sort-vol-sort20lb','sort-vol-sort5lb','sort-vol-sortEuro','sort-vol-sortManual','sort-rate-sort20lb','sort-rate-sort5lb','sort-rate-sortEuro','sort-rate-sortManual','site-cplh-target'].forEach(id=>{t[id]=document.getElementById(id)?.value||'';});
     config.targets=t;saveConfig(config);
     // Save LP values separately
     const lp={ibCplh:document.getElementById('lp-ib-cplh')?.value||'',obCplh:document.getElementById('lp-ob-cplh')?.value||'',siteCplh:document.getElementById('lp-site-cplh')?.value||''};
