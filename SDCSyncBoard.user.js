@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.48.2
+// @version      15.48.3
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -193,7 +193,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.48.2';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.48.3';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -8482,7 +8482,36 @@ function emailEOSWash(){
     if(btn){btn.disabled=true;btn.textContent='\u23F3 Capturing...';}
     // Give the browser a tick, then capture.
     setTimeout(()=>{
-        html2canvas(content,{backgroundColor:isDark?'#1a1a2e':'#ffffff',scale:1,useCORS:true,logging:false,windowWidth:content.scrollWidth,windowHeight:content.scrollHeight}).then(canvas=>{
+        // (15.48.3) html2canvas paints a <textarea> value as ONE unwrapped, clipped line, so long
+        // Bridge / reason notes were cut off in the emailed image. In the CLONED document only (the
+        // live board is untouched), swap each textarea for a div with the same box styling whose
+        // text wraps (pre-wrap + break-word) and keeps line breaks (\n -> <br>) at the cell width.
+        const srcTas=Array.from(content.querySelectorAll('textarea'));
+        const wrapNotesInClone=(clonedDoc)=>{
+            const cRoot=clonedDoc.getElementById('eoswash-content');
+            if(!cRoot)return;
+            Array.from(cRoot.querySelectorAll('textarea')).forEach((cta,i)=>{
+                const src=srcTas[i];
+                const cs=src?window.getComputedStyle(src):null;
+                const div=clonedDoc.createElement('div');
+                // Text nodes only (no innerHTML) so note text is never parsed as HTML.
+                String(src?src.value:cta.value).split('\n').forEach((line,j)=>{
+                    if(j>0)div.appendChild(clonedDoc.createElement('br'));
+                    div.appendChild(clonedDoc.createTextNode(line));
+                });
+                if(cs){
+                    ['fontFamily','fontSize','fontWeight','lineHeight','color','backgroundColor',
+                     'borderTop','borderRight','borderBottom','borderLeft','borderRadius',
+                     'paddingTop','paddingRight','paddingBottom','paddingLeft','textAlign'].forEach(p=>{div.style[p]=cs[p];});
+                    div.style.minHeight=src.offsetHeight+'px';
+                }
+                div.style.width='100%';div.style.maxWidth='100%';div.style.boxSizing='border-box';
+                div.style.whiteSpace='pre-wrap';div.style.wordWrap='break-word';
+                div.style.overflowWrap='anywhere';div.style.wordBreak='break-word';
+                cta.parentNode.replaceChild(div,cta);
+            });
+        };
+        html2canvas(content,{backgroundColor:isDark?'#1a1a2e':'#ffffff',scale:1,useCORS:true,logging:false,windowWidth:content.scrollWidth,windowHeight:content.scrollHeight,onclone:wrapNotesInClone}).then(canvas=>{
             // Build an .eml file (standard email format) with the EOS Wash image embedded inline
             // in the HTML body. Opening the .eml launches the DESKTOP Outlook app with a new
             // message already addressed, subjected, and containing the image — ready to send.
