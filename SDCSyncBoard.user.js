@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.47.0
+// @version      15.47.1
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -12,6 +12,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_deleteValue
 // @connect      fc-benchmarking.amazon.com
 // @connect      adapt-iad.amazon.com
 // @connect      galaxybi.aka.corp.amazon.com
@@ -192,7 +193,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.47.0';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.47.1';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -1656,7 +1657,10 @@ function sbRunOculusCollector(){
 //   DA: "Forecasted Days of End Transfer Out Backlog"  (Outbound view)
 // Each data cell is mapped to its header date column ("MM-DD", year inferred as the nearest year
 // to today, so Dec/Jan rollover works); value = the cell's title (full precision) else its text.
-// Site = the site code heading for that table (e.g. "KRB3"). Merged into GM storage
+// Site = the site code heading for that table (e.g. "KRB3"). (15.47.1) Visible tables only; site
+// resolved from the nearest heading above each table (never the site filter list); when the FCLM
+// board's site (GM sb_board_site) is known, only that site's table is stored; first table per
+// site+direction per scan wins. Merged into GM storage
 // sb_ipt_v1_<SITE> = JSON {ib:{'YYYY-MM-DD':n},da:{...},ibTs,daTs} (keeps ~21 days; the other
 // direction is never wiped). Self-contained: references only browser + GM APIs and its own locals
 // (this runs before the board's top-level consts exist — TDZ — so no dbg()/SB_DEBUG/FCLM globals).
@@ -1788,39 +1792,77 @@ function sbRunSandopIptCollector(){
                 return {dir:h.dir,vals:vals};
             });
         };
-        // Site code candidates: elements whose OWN text is a site code (e.g. "KRB3"), plus selected
-        // <option>s. Headings are preferred when picking the code for a table.
+        // (15.47.1) Site resolution is PER TABLE and LOCAL: the site code heading (e.g. "KRB3", next
+        // to the table's download button) sits directly above each table. The site FILTER (checkbox /
+        // option list, chips, dropdowns) also contains bare site codes and must never be used.
         const directText=(el)=>{let s='';el.childNodes.forEach(n=>{if(n.nodeType===3)s+=n.nodeValue+' ';});return norm(s);};
-        const HEADING_SEL='h1,h2,h3,h4,h5,h6,caption,strong,b,[class*="title"],[class*="header"],[class*="heading"]';
-        const siteCandidates=()=>{
-            const out=[];
-            const badge=document.getElementById(BADGE_ID);
-            document.querySelectorAll('h1,h2,h3,h4,h5,h6,caption,strong,b,span,div,a,li,button,label,td,th,p').forEach(el=>{
-                if(badge&&badge.contains(el))return;
-                const txt=directText(el);
-                if(SITE_RE.test(txt))out.push({el:el,code:txt,heading:el.matches(HEADING_SEL),selected:false});
-            });
-            document.querySelectorAll('select').forEach(sel=>{
-                try{const o=sel.selectedOptions&&sel.selectedOptions[0];const txt=o?norm(o.textContent):'';if(SITE_RE.test(txt))out.push({el:sel,code:txt,heading:false,selected:true});}catch(e){}
-            });
-            return out;
+        // Rendered + laid out (hidden Angular clones / collapsed panels / closed dropdowns -> false).
+        const isVisible=(el)=>{
+            try{
+                if(!el||!el.getClientRects||el.getClientRects().length===0)return false;
+                if(el.offsetParent!==null)return true;
+                return getComputedStyle(el).position==='fixed';
+            }catch(e){return false;}
         };
-        const siteFor=(table,cands)=>{
-            // (1) inside this table's caption/thead (never its data rows)
-            const own=cands.filter(c=>{if(!table.contains(c.el))return false;const tb=c.el.closest&&c.el.closest('tbody');return !(tb&&table.contains(tb));});
-            if(own.length&&new Set(own.map(c=>c.code)).size===1)return own[0].code;
-            // (2) the LAST heading preceding the table (handles several tables, each with its heading)
-            const before=cands.filter(c=>!table.contains(c.el)&&(c.el.compareDocumentPosition(table)&Node.DOCUMENT_POSITION_FOLLOWING));
-            const hb=before.filter(c=>c.heading);
-            if(hb.length)return hb[hb.length-1].code;
-            // (3) a single selected site in a dropdown
-            const sel=cands.filter(c=>c.selected);
-            if(sel.length&&new Set(sel.map(c=>c.code)).size===1)return sel[0].code;
-            // (4) the last preceding candidate of any kind
-            if(before.length)return before[before.length-1].code;
-            // (5) exactly one distinct code on the page (selected-site chip)
-            const all=new Set(cands.filter(c=>!table.contains(c.el)).map(c=>c.code));
-            if(all.size===1)return Array.from(all)[0];
+        const FILTER_SEL='input,select,option,label,textarea,[role="listbox"],[role="option"],[role="menu"],[role="menuitem"],[role="menuitemcheckbox"],[role="checkbox"],[role="combobox"],[role="tree"],[role="treeitem"],[class*="filter" i],[class*="dropdown" i],[class*="checkbox" i],[class*="multiselect" i],[class*="multi-select" i],[class*="listbox" i]';
+        const isFilterEl=(el)=>{
+            try{
+                if(el.closest(FILTER_SEL))return true;
+                // A code sitting next to a checkbox/radio (e.g. <li><input type=checkbox> KRB3</li>).
+                let p=el.parentElement;
+                for(let i=0;i<2&&p;i++,p=p.parentElement){
+                    if(p.querySelector(':scope > input[type="checkbox"],:scope > input[type="radio"]'))return true;
+                }
+            }catch(e){}
+            return false;
+        };
+        // el's own text is a site code, it is visible, and it is not part of the filter UI, the
+        // badge, or any table's data rows.
+        const siteCodeOf=(el)=>{
+            if(!el||el.nodeType!==1)return null;
+            const txt=directText(el);
+            if(!SITE_RE.test(txt))return null;
+            const badge=document.getElementById(BADGE_ID);
+            if(badge&&badge.contains(el))return null;
+            if(el.closest('tbody'))return null;
+            if(isFilterEl(el)||!isVisible(el))return null;
+            return txt;
+        };
+        const isDownload=(el)=>{
+            try{
+                const t=norm(el.textContent);
+                const s=(t.length<=40?t:'')+' '+(el.getAttribute('title')||'')+' '+(el.getAttribute('aria-label')||'')+' '+(el.getAttribute('mattooltip')||'')+' '+(typeof el.className==='string'?el.className:'')+(el.hasAttribute('download')?' download':'');
+                return /download|export|get_app|csv/i.test(s);
+            }catch(e){return false;}
+        };
+        // A download control within 3 ancestor levels of the heading (never an ancestor holding the table).
+        const hasDownloadNear=(el,table)=>{
+            let p=el.parentElement;
+            for(let i=0;i<3&&p&&!p.contains(table);i++,p=p.parentElement){
+                if(Array.from(p.querySelectorAll('button,a,[role="button"],mat-icon,i,[class*="icon" i]')).some(isDownload))return true;
+            }
+            return false;
+        };
+        // -> {code, how} | null. (1) the table's own caption/thead; (2) walk up the ancestors and, at
+        // each level, take the NEAREST preceding sibling/descendant whose own text is a site code,
+        // preferring one adjacent to a download button. First level with any candidate wins.
+        const siteFor=(table)=>{
+            const own=[];
+            table.querySelectorAll('caption,caption *,thead,thead *').forEach(el=>{const c=siteCodeOf(el);if(c)own.push(c);});
+            if(own.length&&new Set(own).size===1)return {code:own[0],how:'caption'};
+            let node=table;
+            for(let lvl=0;lvl<15&&node&&node!==document.body&&node!==document.documentElement;lvl++,node=node.parentElement){
+                const found=[];   // nearest first
+                for(let sib=node.previousElementSibling;sib;sib=sib.previousElementSibling){
+                    const els=[sib].concat(Array.from(sib.querySelectorAll('*')));
+                    for(let k=els.length-1;k>=0;k--){const c=siteCodeOf(els[k]);if(c)found.push({el:els[k],code:c});}
+                    if(found.length)break;   // nearest sibling block with a code; never reach past it
+                }
+                if(!found.length)continue;
+                const dl=found.find(f=>hasDownloadNear(f.el,table));
+                if(dl)return {code:dl.code,how:'heading+download'};
+                return {code:found[0].code,how:'heading'};
+            }
             return null;
         };
         // Merge into sb_ipt_v1_<SITE>; never wipes the other direction (prunes both to KEEP_DAYS).
@@ -1873,30 +1915,91 @@ function sbRunSandopIptCollector(){
             const span=b.querySelector('.sb-ipt-badge-text');
             if(span&&span.textContent!==text)span.textContent=text;
         };
+        // (15.47.1) Board site published by the FCLM board (GM sb_board_site); '' when unknown.
+        const readBoardSite=()=>{
+            try{const s=norm(GM_getValue('sb_board_site','')).toUpperCase();return SITE_RE.test(s)?s:'';}catch(e){return '';}
+        };
+        const warned={};   // site|dir -> duplicate-table warning already printed this page session
+        // (15.47.1) One-time cleanup: 15.47.0 stored another site's values under sb_ipt_v1_SDF4.
+        // Deferred until the board site is known; skipped (but marked done) when SDF4 IS the board site.
+        const cleanupSdf4=()=>{
+            try{
+                if(GM_getValue('sb_ipt_cleanup_sdf4_v1',false))return;
+                const bs=readBoardSite();
+                if(!bs)return;
+                if(bs!=='SDF4'){
+                    if(typeof GM_deleteValue==='function')GM_deleteValue('sb_ipt_v1_SDF4');
+                    else GM_setValue('sb_ipt_v1_SDF4',JSON.stringify({ib:{},da:{},ibTs:0,daTs:0}));
+                    log('cleanup: removed bad sb_ipt_v1_SDF4 (board site is '+bs+')');
+                }
+                GM_setValue('sb_ipt_cleanup_sdf4_v1',true);
+            }catch(e){console.warn('[SB-IPT-Collector] SDF4 cleanup failed (ignored):',e&&e.message);}
+        };
         let lastScan=Date.now();
         const scan=()=>{
+            cleanupSdf4();
             lastScan=Date.now();
             if(!document.body)return;
             const bodyText=document.body.textContent||'';
             if(bodyText.indexOf('Forecasted Days of End Transfer')===-1)return;   // cheap pre-check
-            let cands=null;
+            // (15.47.1) VISIBLE tables only (hidden clones / other views never count).
+            const found=[];   // [{table, res}] in document order
             document.querySelectorAll('table').forEach(table=>{
                 try{
+                    if(!isVisible(table))return;
                     const res=extract(table);
-                    if(!res.length)return;
-                    if(!cands)cands=siteCandidates();
-                    const site=siteFor(table,cands);
-                    if(!site){log('metric row found but no site code resolved — table skipped');return;}
-                    res.forEach(h=>{
-                        const n=Object.keys(h.vals).length;
-                        if(!n){log(site+' '+h.dir+': metric row found but no dated values');return;}
+                    if(res.length)found.push({table:table,res:res});
+                }catch(e){console.warn('[SB-IPT-Collector] table scan error (ignored):',e&&e.message);}
+            });
+            // The FCLM board publishes its site; when known, ONLY that site's table is accepted
+            // (SandOP forgets its site filter on reload and shows other default sites first; the
+            // observer + interval keep rescanning, so the table is captured once the filter changes).
+            const boardSite=readBoardSite();
+            if(!found.length){if(boardSite)log('no '+boardSite+' table visible yet — select '+boardSite+' in the SandOP site filter');return;}
+            const taken={};   // site|dir -> true: first matching table per site+direction per pass
+            let boardSeen=false;
+            const todayIso=isoOf(new Date());
+            found.forEach(f=>{
+                try{
+                    let r=siteFor(f.table);
+                    if(!r){
+                        // Fallback to the board site ONLY for the single visible metric table AND when
+                        // the board site is the only (non-filter, visible) site code on the page — so a
+                        // default site that SandOP loads first is never written under the board site.
+                        let pageCodes=null;
+                        if(boardSite&&found.length===1){
+                            pageCodes=new Set();
+                            document.body.querySelectorAll('*').forEach(el=>{const c=siteCodeOf(el);if(c)pageCodes.add(c);});
+                        }
+                        if(pageCodes&&pageCodes.size===1&&pageCodes.has(boardSite)){
+                            r={code:boardSite,how:'board-site fallback'};
+                            log('no site code found near the only visible metric table — FALLING BACK to board site '+boardSite);
+                        }else{log('metric row found but no site code resolved — table skipped');return;}
+                    }
+                    const site=r.code;
+                    if(boardSite&&site!==boardSite){log(site+' ('+r.how+'): not the board site '+boardSite+' — table skipped');return;}
+                    if(site===boardSite)boardSeen=true;
+                    f.res.forEach(h=>{
+                        const isos=Object.keys(h.vals).sort();
+                        const n=isos.length;
+                        if(!n){log(site+' '+h.dir+' ('+r.how+'): metric row found but no dated values');return;}
+                        const key=site+'|'+h.dir;
+                        if(taken[key]){
+                            if(!warned[key]){warned[key]=true;console.warn('[SB-IPT-Collector] '+site+' '+h.dir+': additional matching table ignored (first table this pass wins)');}
+                            return;
+                        }
+                        taken[key]=true;
                         const wrote=merge(site,h.dir,h.vals);
                         captured[site]=captured[site]||{ib:false,da:false};
                         captured[site][h.dir]=true;
-                        log(site+' '+h.dir+': '+n+' dated value(s)'+(wrote?' stored':' unchanged')+' '+JSON.stringify(h.vals));
+                        // "Most recent" = latest date not after today (else the earliest date).
+                        const past=isos.filter(d=>d<=todayIso);
+                        const last=past.length?past[past.length-1]:isos[0];
+                        log(site+' '+h.dir+' ('+r.how+'): '+n+' values, '+last+'='+h.vals[last]+(wrote?' (stored)':' (unchanged)'));
                     });
                 }catch(e){console.warn('[SB-IPT-Collector] table scan error (ignored):',e&&e.message);}
             });
+            if(boardSite&&!boardSeen)log('no '+boardSite+' table visible yet — select '+boardSite+' in the SandOP site filter');
             showBadge();
         };
         // Debounced (~1.5s) on DOM changes; never starved by a constantly-mutating page (max ~8s).
@@ -7036,6 +7139,9 @@ function sbReadBacklogSnapshot(site,iso){
 // sb_ipt_v1_<SITE> = {ib:{'YYYY-MM-DD':n},da:{...},ibTs,daTs}). Read for ONE date: default = the
 // shift START date (getShiftDates().startDate — a Nights shift read at 03:00 uses the date it
 // started). Missing date -> null (caller shows an em-dash; never substitutes another date).
+// (15.47.1) Publish the board's site to GM storage so the SandOP collector only stores that site's
+// table (called on board load, site change, and Get Data). Never throws.
+function sbPublishBoardSite(site){try{const S=String(site||'').toUpperCase();if(S&&typeof GM_setValue==='function')GM_setValue('sb_board_site',S);}catch(e){console.warn('[SB-IPT] board site publish failed: '+(e&&e.message));}}
 function sbShiftIso(){try{return isoDate(getShiftDates(loadConfig()).startDate);}catch(e){return isoDate(new Date());}}
 function getIptValues(site,iso){
     const out={ib:null,da:null};
@@ -8286,6 +8392,7 @@ function initBoard(){
     const sel=document.getElementById('site-select');
     SITES.forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=s;sel.appendChild(o);});
     sel.value=config.site;
+    sbPublishBoardSite(config.site);
     document.getElementById('shift-select').value=config.shiftType;
     // Load targets
     const t=config.targets||{};
@@ -8357,7 +8464,7 @@ function initBoard(){
         try{localStorage.setItem(SLACK_SOS_KEY,sos);localStorage.setItem(SLACK_JOB_BALANCE_KEY,jb);localStorage.setItem(SLACK_FASTSTART_KEY,fs);localStorage.setItem(METRICS_URL_KEY,mu);}catch(e){}
         const note=document.getElementById('slack-save-note');if(note){note.textContent='\u2713 Saved (this browser only)';setTimeout(()=>{note.textContent='';},2500);}
     });
-    sel.onchange=e=>{config.site=e.target.value;if(SITE_SCHEDULES[config.site]){config.days=SITE_SCHEDULES[config.site].days;config.nights=SITE_SCHEDULES[config.site].nights;}saveConfig(config);refreshSettingsInputs();currentMetrics=null;clearBoard();updatePeriodDots();};
+    sel.onchange=e=>{config.site=e.target.value;if(SITE_SCHEDULES[config.site]){config.days=SITE_SCHEDULES[config.site].days;config.nights=SITE_SCHEDULES[config.site].nights;}saveConfig(config);sbPublishBoardSite(config.site);refreshSettingsInputs();currentMetrics=null;clearBoard();updatePeriodDots();};
     document.getElementById('shift-select').onchange=e=>{config.shiftType=e.target.value;saveConfig(config);currentMetrics=null;clearBoard();updatePeriodDots();doFetch();};
     document.querySelectorAll('.target-input').forEach(inp=>{inp.addEventListener('input',updateTargetRows);inp.addEventListener('change',()=>{saveTargetsUI();if(currentMetrics)renderTargets(currentMetrics);});});
     document.querySelectorAll('.nav-tab').forEach(tab=>tab.onclick=()=>{
@@ -8544,7 +8651,7 @@ async function doFetch(isRetry){
     // (or nothing). So treat ONLY string args as retries -> ping fires on genuine clicks only.
     const _realRetry=(typeof isRetry==='string');
     if(!_realRetry)trackUsage('getData');   // usage ping FIRST, before anything can throw/abort
-    config=loadConfig();config.site=document.getElementById('site-select').value;config.shiftType=document.getElementById('shift-select').value;saveConfig(config);
+    config=loadConfig();config.site=document.getElementById('site-select').value;config.shiftType=document.getElementById('shift-select').value;saveConfig(config);sbPublishBoardSite(config.site);
     // Invalidate the day caches so they re-fetch for the (possibly new) site/day. Note which day
     // view is currently showing so we can refresh it after this fetch.
     const curDayVisible=document.getElementById('spt-current-view')?.style.display!=='none';
