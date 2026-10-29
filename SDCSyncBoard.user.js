@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.47.1
+// @version      15.48.2
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -193,7 +193,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.47.1';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.48.2';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -1672,6 +1672,12 @@ function sbRunSandopIptCollector(){
         if(typeof GM_setValue!=='function'||typeof GM_getValue!=='function'){console.warn('[SB-IPT-Collector] GM storage unavailable — cannot store');return;}
         const norm=(s)=>String(s==null?'':s).replace(/\s+/g,' ').trim();
         const METRIC={ib:'Forecasted Days of End Transfer In Backlog',da:'Forecasted Days of End Transfer Out Backlog'};
+        // (15.48.2) Tolerant matching: lower-case, ALL whitespace / zero-width chars removed, so
+        // nbsp, casing, and labels split across elements ("...of End</span><span>Transfer Out...")
+        // still match. "Onsite Transfer In Backlog" does NOT contain these, so it stays excluded.
+        const squash=(s)=>String(s==null?'':s).replace(/[\s\u200b-\u200d\u2060\ufeff]+/g,'').toLowerCase();
+        const LOOSE={ib:'daysofendtransferinbacklog',da:'daysofendtransferoutbacklog'};
+        const LOOSE_ANY='daysofendtransfer';
         const SITE_RE=/^[A-Z]{3,4}\d$/;
         const DATE_RE=/^(\d{2})-(\d{2})$/;
         const BADGE_ID='sb-ipt-badge';
@@ -1737,6 +1743,22 @@ function sbRunSandopIptCollector(){
             if(names.indexOf(METRIC.da)!==-1)return 'da';
             return null;
         };
+        // (15.48.2) TOLERANT fallback, used only for a direction with NO strict match on the page
+        // (see scan): case/space-insensitive "contains". Cells whose squashed text is long (a cell
+        // holding a nested table / whole panel) are ignored. -> {dir, len} | null.
+        const metricLoose=(cell)=>{
+            if(!cell)return null;
+            const raw=[cell.textContent,cell.getAttribute&&cell.getAttribute('title')];
+            const tEl=cell.querySelector&&cell.querySelector('[title]');
+            if(tEl)raw.push(tEl.getAttribute('title'));
+            for(let i=0;i<raw.length;i++){
+                const q=squash(raw[i]);
+                if(!q||q.length>120)continue;
+                if(q.indexOf(LOOSE.ib)!==-1)return {dir:'ib',len:q.length};
+                if(q.indexOf(LOOSE.da)!==-1)return {dir:'da',len:q.length};
+            }
+            return null;
+        };
         const valueOf=(cell)=>{
             const t=cell.getAttribute&&cell.getAttribute('title');
             let v=(t!=null&&t!=='')?parseFloat(String(t).replace(/,/g,'')):NaN;
@@ -1755,17 +1777,102 @@ function sbRunSandopIptCollector(){
             }
             return null;
         };
-        // -> [{dir, vals:{iso:number}}] for every target metric row in this table.
+        // Body rows of a table (tbody rows; all rows when there is no tbody).
+        const bodyRowsOf=(t)=>{
+            const a=[];
+            Array.from(t.tBodies||[]).forEach(b=>{Array.from(b.rows||[]).forEach(x=>a.push(x));});
+            return a.length?a:Array.from(t.rows||[]);
+        };
+        // (15.48.2) Frozen/pinned label column: the label row lives in one <table> and its value
+        // cells in a SIBLING <table> of the same grid. Row matched by vertical position (same top),
+        // else by body-row index. Used ONLY when the label row itself yielded no values.
+        // Guards (never read another site's / another grid's panel):
+        //  (a) the candidate carries NO target-metric label (a frozen value table has no labels;
+        //      another site's metric table does);
+        //  (b) siteFor(candidate) is null or the same code as siteFor(table);
+        //  (c) row-index fallback only when both tables have the same body-row count;
+        //  and the climb stops at the FIRST ancestor level holding any other visible table.
+        const hasMetricLabel=(t)=>{
+            const rows=Array.from(t.rows||[]);
+            for(let r=0;r<rows.length;r++){
+                const cells=Array.from(rows[r].cells||[]);
+                for(let i=0;i<Math.min(6,cells.length);i++){
+                    if(metricOf(cells[i])||metricLoose(cells[i]))return true;
+                }
+            }
+            return false;
+        };
+        const partnerVals=(table,tr)=>{
+            const out={};
+            try{
+                const top=tr.getBoundingClientRect().top;
+                const ownRows=bodyRowsOf(table);
+                const idx=ownRows.indexOf(tr);
+                const sf=siteFor(table);
+                const ownSite=sf?sf.code:null;
+                let anc=table.parentElement;
+                for(let i=0;i<5&&anc;i++,anc=anc.parentElement){
+                    const others=Array.from(anc.querySelectorAll('table')).filter(t=>t!==table&&!t.contains(table)&&!table.contains(t)&&isVisible(t));
+                    if(!others.length)continue;
+                    for(let k=0;k<others.length;k++){
+                        const t=others[k];
+                        if(hasMetricLabel(t))continue;
+                        const sf2=siteFor(t);
+                        if(sf2&&sf2.code!==ownSite)continue;
+                        const g2=buildGrid(t);
+                        const own2=dateColsOf(g2);
+                        const sep2=own2?null:findSepDates(t);
+                        if(!own2&&!sep2)continue;
+                        const rows2=bodyRowsOf(t);
+                        let how='position';
+                        let row2=rows2.find(x=>{const rc=x.getBoundingClientRect();return rc.height>0&&Math.abs(rc.top-top)<3;});
+                        if(!row2&&idx>=0&&rows2.length===ownRows.length){row2=rows2[idx];how='row index';}
+                        if(!row2)continue;
+                        if(own2){
+                            const row=g2.grid[g2.rows.indexOf(row2)]||[];
+                            Object.keys(own2).forEach(key=>{
+                                const c=parseInt(key,10);const cell=row[c];
+                                if(!cell||cell.parentElement!==row2)return;
+                                const v=valueOf(cell);if(v!=null)out[own2[c]]=v;
+                            });
+                        }else{
+                            const isos=Object.keys(sep2).map(x=>parseInt(x,10)).sort((a,b)=>a-b).map(c=>sep2[c]);
+                            const data=Array.from(row2.cells||[]);
+                            const n=Math.min(isos.length,data.length);
+                            for(let j=0;j<n;j++){
+                                const v=valueOf(data[data.length-n+j]);
+                                if(v!=null)out[isos[isos.length-n+j]]=v;
+                            }
+                        }
+                        if(Object.keys(out).length){log('values read from a sibling table of the same grid (row matched by '+how+')');return out;}
+                    }
+                    break;   // (c') first ancestor level with any other visible table: never climb further
+                }
+            }catch(e){}
+            return out;
+        };
+        // -> [{dir, vals:{iso:number}, loose}] for every target metric row in this table.
+        // Strict rows exactly as before (first 3 cells); per direction with no strict row in this
+        // table, the best (shortest-label) TOLERANT row in the first 6 cells is added (loose:true).
         const extract=(table)=>{
             const g=buildGrid(table);
             const hits=[];
+            const loose={};
             g.rows.forEach((tr,r)=>{
                 const cells=Array.from(tr.cells||[]);
                 for(let i=0;i<Math.min(3,cells.length);i++){
                     const dir=metricOf(cells[i]);
-                    if(dir){hits.push({dir:dir,r:r,tr:tr,labelIdx:i});break;}
+                    if(dir){hits.push({dir:dir,r:r,tr:tr,labelIdx:i});return;}
+                }
+                for(let i=0;i<Math.min(6,cells.length);i++){
+                    const lm=metricLoose(cells[i]);
+                    if(lm){
+                        if(!loose[lm.dir]||lm.len<loose[lm.dir].len)loose[lm.dir]={dir:lm.dir,r:r,tr:tr,labelIdx:i,len:lm.len,loose:true};
+                        return;
+                    }
                 }
             });
+            ['ib','da'].forEach(d=>{if(loose[d]&&!hits.some(h=>h.dir===d))hits.push(loose[d]);});
             if(!hits.length)return [];
             const own=dateColsOf(g);
             const sep=own?null:findSepDates(table);
@@ -1789,7 +1896,8 @@ function sbRunSandopIptCollector(){
                         if(v!=null)vals[isos[isos.length-n+i]]=v;
                     }
                 }
-                return {dir:h.dir,vals:vals};
+                const out=Object.keys(vals).length?vals:partnerVals(table,h.tr);
+                return {dir:h.dir,vals:out,loose:!!h.loose};
             });
         };
         // (15.47.1) Site resolution is PER TABLE and LOCAL: the site code heading (e.g. "KRB3", next
@@ -1864,6 +1972,123 @@ function sbRunSandopIptCollector(){
                 return {code:found[0].code,how:'heading'};
             }
             return null;
+        };
+        // (15.48.2) Div-based grids (ARIA role=grid/row/gridcell, ag-grid, ui-grid). Only roots that
+        // are not <table>s and hold no <table> (those go through the table path), outermost only.
+        const GRID_SEL='[role="grid"],[role="treegrid"],[role="table"],.ag-root-wrapper,.ui-grid';
+        const ROW_SEL='[role="row"],.ag-row,.ui-grid-row';
+        const CELL_SEL='[role="gridcell"],[role="cell"],[role="rowheader"],.ag-cell,.ui-grid-cell';
+        const HEAD_SEL='[role="columnheader"],.ag-header-cell,.ui-grid-header-cell';
+        const gridRoots=()=>{
+            const c=Array.from(document.querySelectorAll(GRID_SEL)).filter(el=>el.tagName!=='TABLE'&&!el.closest('table')&&!el.querySelector('table')&&isVisible(el));
+            return c.filter(el=>!c.some(o=>o!==el&&o.contains(el)));
+        };
+        const rowKey=(row)=>row.getAttribute('row-index')||row.getAttribute('aria-rowindex')||row.getAttribute('row-id');
+        const cellsOf=(row)=>{const a=Array.from(row.querySelectorAll(CELL_SEL));return a.length?a:Array.from(row.children);};
+        const dateIsoOf=(el)=>{
+            const els=[el].concat(Array.from(el.querySelectorAll('*')));
+            for(let i=0;i<els.length;i++){
+                const m=DATE_RE.exec(norm(els[i].textContent));
+                if(m){const iso=inferIso(parseInt(m[1],10),parseInt(m[2],10));if(iso)return iso;}
+            }
+            return null;
+        };
+        // -> [{dir, vals, loose}]. Header dates by column header cells (>= 3 distinct). Values from
+        // the label row plus every row of the same grid with the same row-index/aria-rowindex/row-id
+        // or the same vertical position (pinned + center containers); cell -> date by col-id, else by
+        // the header whose horizontal span contains the cell's center.
+        const extractDiv=(root)=>{
+            const heads=[];
+            root.querySelectorAll(HEAD_SEL).forEach(h=>{
+                if(!isVisible(h))return;
+                const iso=dateIsoOf(h);if(!iso)return;
+                const rc=h.getBoundingClientRect();
+                heads.push({iso:iso,colId:h.getAttribute('col-id')||'',l:rc.left,r:rc.right});
+            });
+            const rows=Array.from(root.querySelectorAll(ROW_SEL)).filter(r=>!r.querySelector(HEAD_SEL)&&isVisible(r));
+            const strict=[];const loose={};
+            rows.forEach(row=>{
+                const cells=cellsOf(row);
+                for(let i=0;i<cells.length;i++){const d=metricOf(cells[i]);if(d){strict.push({dir:d,row:row,label:cells[i]});return;}}
+                for(let i=0;i<cells.length;i++){
+                    const lm=metricLoose(cells[i]);
+                    if(lm){if(!loose[lm.dir]||lm.len<loose[lm.dir].len)loose[lm.dir]={dir:lm.dir,row:row,label:cells[i],len:lm.len,loose:true};return;}
+                }
+            });
+            const hits=strict.slice();
+            ['ib','da'].forEach(d=>{if(loose[d]&&!strict.some(h=>h.dir===d))hits.push(loose[d]);});
+            if(!hits.length)return [];
+            if(new Set(heads.map(h=>h.iso)).size<3){
+                log('grid: metric row found but no MM-DD column headers');
+                return hits.map(h=>({dir:h.dir,vals:{},loose:!!h.loose}));
+            }
+            return hits.map(h=>{
+                const key=rowKey(h.row);
+                const top=h.row.getBoundingClientRect().top;
+                const group=rows.filter(x=>{
+                    if(x===h.row)return true;
+                    if(key!=null&&rowKey(x)===key)return true;
+                    const rc=x.getBoundingClientRect();
+                    return rc.height>0&&Math.abs(rc.top-top)<3;
+                });
+                const vals={};
+                group.forEach(row=>{
+                    cellsOf(row).forEach(c=>{
+                        if(c===h.label||c.contains(h.label)||h.label.contains(c))return;
+                        const v=valueOf(c);if(v==null)return;
+                        const cid=c.getAttribute('col-id');
+                        let hd=cid?heads.find(x=>x.colId&&x.colId===cid):null;
+                        if(!hd){const rc=c.getBoundingClientRect();const cx=(rc.left+rc.right)/2;hd=heads.find(x=>cx>=x.l&&cx<=x.r);}
+                        if(hd)vals[hd.iso]=v;
+                    });
+                });
+                return {dir:h.dir,vals:vals,loose:!!h.loose};
+            });
+        };
+        // (15.48.2) Throttled (~10s) diagnostics, printed only when a scan accepted nothing.
+        let lastDiag=0;
+        const clip=(s,n)=>{s=norm(s);return s.length>n?s.slice(0,n)+'\u2026':s;};
+        const labelsOf=(cells,acc)=>{
+            cells.forEach(c=>{const s=norm(c.textContent);if(s.length<=200&&/backlog|forecast/i.test(s)&&acc.size<8)acc.add(clip(s,70));});
+        };
+        const diag=(boardSite,why)=>{
+            try{
+                if(!dbgOn||Date.now()-lastDiag<10000)return;
+                lastDiag=Date.now();
+                const tables=Array.from(document.querySelectorAll('table'));
+                const vis=tables.filter(isVisible);
+                const roots=gridRoots();
+                const bodySq=squash(document.body.textContent);
+                log('diag ('+why+'): boardSite='+(boardSite||'(empty \u2014 board site unknown \u2014 open the Sync Board on FCLM first)')+' | page='+location.pathname+location.hash);
+                log('diag: looking for ib="'+METRIC.ib+'" and da="'+METRIC.da+'" (exact, then case/space-insensitive contains) | page text contains: transfer-in-backlog='+(bodySq.indexOf(LOOSE.ib)!==-1)+', transfer-out-backlog='+(bodySq.indexOf(LOOSE.da)!==-1));
+                log('diag: tables='+tables.length+' visible='+vis.length+' | role=grid elements='+document.querySelectorAll('[role="grid"],[role="treegrid"]').length+' | visible div-grids='+roots.length+' | ag-grid rows='+document.querySelectorAll('.ag-row').length+' | iframes='+document.querySelectorAll('iframe').length);
+                vis.slice(0,12).forEach((t,i)=>{
+                    let site='none';try{const r=siteFor(t);if(r)site=r.code+' ('+r.how+')';}catch(e){}
+                    const acc=new Set();
+                    Array.from(t.rows||[]).forEach(tr=>labelsOf(Array.from(tr.cells||[]).slice(0,3),acc));
+                    log('diag: visible table #'+(i+1)+' rows='+(t.rows?t.rows.length:0)+' site='+site+' labels='+(acc.size?JSON.stringify(Array.from(acc)):'(none with backlog/forecast)'));
+                });
+                roots.slice(0,6).forEach((g,i)=>{
+                    let site='none';try{const r=siteFor(g);if(r)site=r.code+' ('+r.how+')';}catch(e){}
+                    const acc=new Set();
+                    g.querySelectorAll(ROW_SEL).forEach(row=>labelsOf(cellsOf(row).slice(0,3),acc));
+                    log('diag: visible div-grid #'+(i+1)+' <'+g.tagName.toLowerCase()+' class="'+clip(typeof g.className==='string'?g.className:'',60)+'"> site='+site+' labels='+(acc.size?JSON.stringify(Array.from(acc)):'(none with backlog/forecast)'));
+                });
+                // Where the label text actually lives (innermost elements), per direction.
+                ['ib','da'].forEach(d=>{
+                    if(bodySq.indexOf(LOOSE[d])===-1)return;
+                    const where=[];
+                    const all=document.body.querySelectorAll('*');
+                    for(let i=0;i<all.length&&where.length<3;i++){
+                        const el=all[i];
+                        if(squash(el.textContent).indexOf(LOOSE[d])===-1)continue;
+                        if(Array.from(el.children).some(ch=>squash(ch.textContent).indexOf(LOOSE[d])!==-1))continue;
+                        const inT=el.closest('table')?'table':(el.closest(GRID_SEL)||el.closest(ROW_SEL))?'div-grid':'no table/grid';
+                        where.push('<'+el.tagName.toLowerCase()+(el.className&&typeof el.className==='string'?' class="'+clip(el.className,40)+'"':'')+'> "'+clip(el.textContent,60)+'" in '+inT+', visible='+isVisible(el));
+                    }
+                    log('diag: '+d+' label text found at: '+(where.length?where.join(' | '):'(not found as element text)'));
+                });
+            }catch(e){console.warn('[SB-IPT-Collector] diag threw (ignored):',e&&e.message);}
         };
         // Merge into sb_ipt_v1_<SITE>; never wipes the other direction (prunes both to KEEP_DAYS).
         const merge=(site,dir,vals)=>{
@@ -1940,10 +2165,24 @@ function sbRunSandopIptCollector(){
             cleanupSdf4();
             lastScan=Date.now();
             if(!document.body)return;
-            const bodyText=document.body.textContent||'';
-            if(bodyText.indexOf('Forecasted Days of End Transfer')===-1)return;   // cheap pre-check
+            // The FCLM board publishes its site; when known, ONLY that site's table is accepted
+            // (SandOP forgets its site filter on reload and shows other default sites first; the
+            // observer + interval keep rescanning, so the table is captured once the filter changes).
+            const boardSite=readBoardSite();
+            const hint=()=>{
+                if(boardSite)log('no '+boardSite+' table visible yet — select '+boardSite+' in the SandOP site filter');
+                else log('no matching table visible yet — board site unknown — open the Sync Board on FCLM first');
+            };
+            // (15.48.2) Tolerant pre-check (case / nbsp / split-label safe; also title attributes).
+            // Superset of the old exact 'Forecasted Days of End Transfer' text check.
+            let pre=squash(document.body.textContent).indexOf(LOOSE_ANY)!==-1;
+            if(!pre){
+                const tl=document.body.querySelectorAll('[title]');
+                for(let i=0;i<tl.length&&!pre;i++){if(squash(tl[i].getAttribute('title')).indexOf(LOOSE_ANY)!==-1)pre=true;}
+            }
+            if(!pre){if(dbgOn&&Date.now()-lastDiag>=10000)hint();diag(boardSite,'no "Days of End Transfer" text on page');return;}
             // (15.47.1) VISIBLE tables only (hidden clones / other views never count).
-            const found=[];   // [{table, res}] in document order
+            const found=[];   // [{table, res}] in document order (tables first, then div grids)
             document.querySelectorAll('table').forEach(table=>{
                 try{
                     if(!isVisible(table))return;
@@ -1951,11 +2190,22 @@ function sbRunSandopIptCollector(){
                     if(res.length)found.push({table:table,res:res});
                 }catch(e){console.warn('[SB-IPT-Collector] table scan error (ignored):',e&&e.message);}
             });
-            // The FCLM board publishes its site; when known, ONLY that site's table is accepted
-            // (SandOP forgets its site filter on reload and shows other default sites first; the
-            // observer + interval keep rescanning, so the table is captured once the filter changes).
-            const boardSite=readBoardSite();
-            if(!found.length){if(boardSite)log('no '+boardSite+' table visible yet — select '+boardSite+' in the SandOP site filter');return;}
+            // (15.48.2) Div-based grids (after tables, so a table match always wins the dedupe).
+            try{
+                gridRoots().forEach(root=>{
+                    try{const res=extractDiv(root);if(res.length)found.push({table:root,res:res});}
+                    catch(e){console.warn('[SB-IPT-Collector] grid scan error (ignored):',e&&e.message);}
+                });
+            }catch(e){console.warn('[SB-IPT-Collector] grid scan error (ignored):',e&&e.message);}
+            // (15.48.2) Tolerant (loose) rows only count for a direction that has NO exact-label row
+            // anywhere on the page, so an exact match (today's inbound path) behaves exactly as before.
+            const strictDirs={};
+            found.forEach(f=>f.res.forEach(h=>{if(!h.loose)strictDirs[h.dir]=true;}));
+            for(let i=found.length-1;i>=0;i--){
+                found[i].res=found[i].res.filter(h=>!(h.loose&&strictDirs[h.dir]));
+                if(!found[i].res.length)found.splice(i,1);
+            }
+            if(!found.length){hint();diag(boardSite,'no visible table/grid with a target metric row');return;}
             const taken={};   // site|dir -> true: first matching table per site+direction per pass
             let boardSeen=false;
             const todayIso=isoOf(new Date());
@@ -1989,6 +2239,7 @@ function sbRunSandopIptCollector(){
                             return;
                         }
                         taken[key]=true;
+                        if(h.loose)log(site+' '+h.dir+': exact label not found — using tolerant (case/space-insensitive) label match');
                         const wrote=merge(site,h.dir,h.vals);
                         captured[site]=captured[site]||{ib:false,da:false};
                         captured[site][h.dir]=true;
@@ -1999,7 +2250,10 @@ function sbRunSandopIptCollector(){
                     });
                 }catch(e){console.warn('[SB-IPT-Collector] table scan error (ignored):',e&&e.message);}
             });
-            if(boardSite&&!boardSeen)log('no '+boardSite+' table visible yet — select '+boardSite+' in the SandOP site filter');
+            const anyTaken=Object.keys(taken).length>0;
+            if(boardSite&&!boardSeen)hint();
+            else if(!boardSite&&!anyTaken)hint();
+            if(!anyTaken)diag(boardSite,'metric rows found but nothing accepted');
             showBadge();
         };
         // Debounced (~1.5s) on DOM changes; never starved by a constantly-mutating page (max ~8s).
@@ -2016,13 +2270,19 @@ function sbRunSandopIptCollector(){
             try{
                 const root=document.body||document.documentElement;
                 if(!document.body&&tries++<20){setTimeout(start,500);return;}
+                // (15.48.2) Also attribute flips (Angular ng-hide / tab aria-selected / hidden) so an
+                // Inbound -> Outbound view switch that only toggles visibility triggers a rescan;
+                // plus hashchange/popstate. All go through the debounced schedule() (>=1.5s quiet,
+                // <=~8s busy), so the observer cannot spin.
                 new MutationObserver((muts)=>{
                     try{
                         const b=document.getElementById(BADGE_ID);
                         if(b&&muts.every(m=>b.contains(m.target)))return;   // ignore our own badge updates
                         schedule();
                     }catch(e){console.warn('[SB-IPT-Collector] observer threw (ignored):',e&&e.message);}
-                }).observe(root,{childList:true,subtree:true,characterData:true});
+                }).observe(root,{childList:true,subtree:true,characterData:true,attributes:true,attributeFilter:['class','style','hidden','aria-hidden','aria-selected','aria-expanded']});
+                window.addEventListener('hashchange',schedule);
+                window.addEventListener('popstate',schedule);
                 setInterval(schedule,10000);
                 schedule();
                 log('collector running');
@@ -3662,9 +3922,10 @@ function attemptLPFetch(site,resolve,isRetry){
                             });
                         }catch(e1){finish(deratedSite,'DeratedRates');}
                     });
-                    // (15.47.0) Per-path LP rates = DILUTED rates by path (GalaxyBI DeratedRates), Forecast +
-                    // Cartons, this week's Sunday, EXACT line-item match. Fallback: UnderatedRatesAndHours
-                    // (exact). Each page's rows are fetched ONCE (fetchLPPageAuto passes all rows to the
+                    // Row helpers for the TOP rate (DeratedRates -> UnderatedRatesAndHours, unchanged) and the
+                    // per-path rates (15.48.0: S&OPWoW-Page diluted -> UnderatedRatesAndHours, see below).
+                    // pickLpRate = Forecast + Cartons, this week's Sunday, EXACT line-item match.
+                    // Each page's rows are fetched ONCE (fetchLPPageAuto passes all rows to the
                     // callback; the sentinel key matches no row). These promises never reject:
                     // fetchLPPageAuto always calls back (callback(0) without rows on any error).
                     const lpRowsOf=(page)=>new Promise((res)=>{try{fetchLPPageAuto(planId,page,sundayStr,'lineItem','\u0000sb-rows-only',(v,rows)=>res(Array.isArray(rows)?rows:[]));}catch(e){res([]);}});
@@ -3694,12 +3955,13 @@ function attemptLPFetch(site,resolve,isRetry){
                     fetchBBGoalFromLP(planId,'DA',sundayStr,(v)=>{results.obBBGoal=v;done++;checkDone();});
                     // VRET (Vendor Returns) goal: Week Capacity for today's day from the Vendor Returns group.
                     fetchVretGoalFromLP(planId,sundayStr,(v)=>{results.vretGoal=v;done++;checkDone();});
-                    // PROCESS-PATH LP RATES (15.47.0): DeratedRates (DILUTED rates by path) first, the
-                    // Forecast+Cartons value for the current week's Sunday, matched EXACTLY by line item;
-                    // fallback UnderatedRatesAndHours (exact) with a console.warn. Feeds the EOS Wash
-                    // "LP Rate" column + Hours Variance. The names below are GalaxyBI line-item names
-                    // (NOT the wash display labels). Any that come back 0 in both pages => the name is
-                    // wrong; the [SB-LP RATE] warn tells you which.
+                    // PROCESS-PATH LP RATES (15.48.0): the DILUTED rate by path from the GalaxyBI
+                    // S&OPWoW-Page (same plan + &site= filter as every other LP page; rows are further
+                    // narrowed to the current site if they carry a site field). Fallback: the existing
+                    // UnderatedRatesAndHours Forecast+Cartons value (exact line item, this week's Sunday).
+                    // DeratedRates is NOT used for per-path rates (15.47.0 logs: every path missing there).
+                    // Feeds the EOS Wash "LP Rate" column + Hours Variance. The names below are GalaxyBI
+                    // line-item names (NOT the wash display labels).
                     // settlePath runs exactly once per field (flag) so each path increments `done` once.
                     const LP_PATH_RATES=[
                         ['Transfer In Support','lpTransferInSupport'],['Case Stow to Reserve','lpCaseStowToReserve'],
@@ -3711,17 +3973,23 @@ function attemptLPFetch(site,resolve,isRetry){
                     const settlePath=(item,field,v,src)=>{
                         if(pathSettled[field])return;pathSettled[field]=true;results[field]=v;
                         dbg('[SB-LP RATE] "'+item+'" => '+v+' (src '+src+')');
-                        if(!(v>0))console.warn('[SB-LP RATE] "'+item+'" => 0 in DeratedRates and UnderatedRatesAndHours (line-item name may be wrong)');
+                        if(!(v>0))console.warn('[SB-LP RATE] "'+item+'" => 0 in S&OPWoW-Page (diluted) and UnderatedRatesAndHours (line-item name may be wrong)');
                         done++;checkDone();
                     };
-                    Promise.all([drRowsP,urRowsP]).then(([dr,ur])=>{
+                    const wowRowsP=lpRowsOf('S%26OPWoW-Page');
+                    Promise.all([wowRowsP,urRowsP]).then(([wowAll,ur])=>{
+                        const wow=sbWowSiteRows(wowAll,loadConfig().site);
+                        dbg('[SB-LP RATE] S&OPWoW-Page rows: '+wowAll.length+' total, '+wow.length+' for site '+String(loadConfig().site||'').toUpperCase());
+                        let missing=false;
                         LP_PATH_RATES.forEach(([item,field])=>{try{
-                            const d=pickLpRate(dr,item);
-                            if(d>0){settlePath(item,field,d,'DeratedRates');return;}
+                            const d=sbPickWowDilutedRate(wow,item,sundayStr);
+                            if(d>0){settlePath(item,field,d,'S&OPWoW-Page diluted');return;}
+                            missing=true;
                             const u=pickLpRate(ur,item);
-                            console.warn('[SB-LP RATE] "'+item+'" not in DeratedRates \u2014 using UnderatedRatesAndHours '+u);
+                            console.warn('[SB-LP RATE] "'+item+'" no diluted rate on S&OPWoW-Page \u2014 using UnderatedRatesAndHours '+u);
                             settlePath(item,field,u,'UnderatedRatesAndHours');
                         }catch(e){settlePath(item,field,0,'error');}});
+                        if(missing)sbDumpWowLayoutOnce(wowAll,wow);
                     }).catch(()=>{LP_PATH_RATES.forEach(([item,field])=>settlePath(item,field,0,'error'));});
                 }catch(e){console.warn('[SB-LP] Parse error:',e);resolve(null);}
             },
@@ -3734,6 +4002,90 @@ function attemptLPFetch(site,resolve,isRetry){
                 reauthAndRetry('reports timeout');
             }
         });
+}
+
+// (15.48.0) S&OPWoW-Page "diluted rates by path" helpers. The page's exact JSON layout couldn't be
+// inspected offline, so these are tolerant: long rows ({lineItem, type/column, date, value}) or wide
+// rows ({lineItem, "Diluted Rate": n}). Function declarations + var => hoisted, no TDZ risk.
+var SB_WOW_DUMP_LOGGED=false;   // one-shot guard for the layout dump below
+var SB_WOW_LABEL_KEYS=['lineItem','processPath','path','label','name','rowLabel','row','lineItemName'];
+var SB_WOW_SITE_KEYS=['site','siteId','siteCode','siteName','warehouseId','warehouse','fc','node','location'];
+var SB_WOW_DIL_RE=/dilut|derat/i;
+var SB_WOW_UNDIL_RE=/un-?dilut|un-?derat|non-?dilut|non-?derat/i;
+function sbWowNorm(s){return String(s==null?'':s).toLowerCase().replace(/[\s\-\u2013\u2014_]+/g,' ').trim();}
+function sbWowIsDil(s){const t=String(s==null?'':s);return SB_WOW_DIL_RE.test(t)&&!SB_WOW_UNDIL_RE.test(t);}
+function sbWowLabelOf(r){for(const k of SB_WOW_LABEL_KEYS){if(r&&r[k]!=null&&String(r[k]).trim()!=='')return String(r[k]).trim();}return '';}
+function sbWowSiteOf(r){for(const k of SB_WOW_SITE_KEYS){if(r&&r[k]!=null&&String(r[k]).trim()!=='')return String(r[k]).trim().toUpperCase();}return '';}
+// Narrow rows to the current site (the GalaxyBI view needs the KRB3 filter). Rows without any site
+// field are assumed already site-filtered by the &site= request param. If rows ARE site-tagged but
+// none match, return [] so the caller falls back rather than using another site's rates.
+function sbWowSiteRows(rows,site){
+    rows=Array.isArray(rows)?rows:[];
+    const cur=String(site||'').trim().toUpperCase();
+    if(!cur)return rows;
+    const tagged=rows.filter(r=>sbWowSiteOf(r));
+    if(!tagged.length)return rows;
+    return rows.filter(r=>{const s=sbWowSiteOf(r);return s===cur||s.indexOf(cur)===0;});
+}
+// Diluted per-path rate from S&OPWoW-Page rows. 0 if not found (caller falls back).
+function sbPickWowDilutedRate(rows,item,sundayStr){
+    const want=sbWowNorm(item);
+    if(!want||!Array.isArray(rows)||!rows.length)return 0;
+    // 1) rows for this path: exact label, else normalized label, else label = path + diluted suffix.
+    let cand=rows.filter(r=>{
+        if(!r||typeof r!=='object')return false;
+        const n=sbWowNorm(sbWowLabelOf(r));
+        return n===want||(n.indexOf(want)===0&&sbWowIsDil(sbWowLabelOf(r)));
+    });
+    if(!cand.length)return 0;
+    // 2) weekly value like every other LP rate: prefer this week's Sunday when rows carry a date.
+    const dated=cand.filter(r=>r.date!=null&&String(r.date).slice(0,10)===sundayStr);
+    if(dated.length)cand=dated;
+    else{
+        // daily-dated rows: use today's date (local YYYY-MM-DD) when present
+        const d=new Date(),todayStr=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+        const today=cand.filter(r=>r.date!=null&&String(r.date).slice(0,10)===todayStr);
+        if(today.length)cand=today;
+    }
+    const skip=new Set(SB_WOW_LABEL_KEYS.concat(SB_WOW_SITE_KEYS,['value','date']));
+    let best=0,bestScore=-1;
+    for(const r of cand){
+        const labelDil=sbWowIsDil(sbWowLabelOf(r));
+        let v=0;
+        // long form: some descriptor field (type/column/metric/key...) says "diluted"/"derated"
+        const descDil=Object.keys(r).some(k=>!skip.has(k)&&typeof r[k]==='string'&&sbWowIsDil(r[k]));
+        if(descDil||labelDil)v=parseFloat(r.value)||0;
+        // wide form: a column NAME says "diluted"/"derated"
+        if(!(v>0)){for(const k of Object.keys(r)){if(!skip.has(k)&&sbWowIsDil(k)){const n=parseFloat(r[k]);if(n>0){v=n;break;}}}}
+        if(!(v>0))continue;
+        const pt=r.packType!=null?String(r.packType):'';
+        const score=(pt==='Cartons'?2:(pt?0:1))+(Object.keys(r).some(k=>typeof r[k]==='string'&&/forecast/i.test(r[k]))?1:0);
+        if(score>bestScore){bestScore=score;best=v;}
+    }
+    return best;
+}
+// One-shot compact dump of the S&OPWoW-Page layout (keys, distinct descriptor values, row labels)
+// so the parser can be finalized. Only via dbg (localStorage syncboard_debug=1).
+function sbDumpWowLayoutOnce(allRows,siteRows){
+    if(SB_WOW_DUMP_LOGGED||!SB_DEBUG)return;
+    SB_WOW_DUMP_LOGGED=true;
+    try{
+        const rows=Array.isArray(allRows)?allRows:[];
+        const tr=(s)=>{s=String(s==null?'':s);return s.length>40?s.slice(0,40)+'\u2026':s;};
+        const keys=[];rows.slice(0,500).forEach(r=>{if(r&&typeof r==='object')Object.keys(r).forEach(k=>{if(keys.indexOf(k)<0)keys.push(k);});});
+        const distinct={};
+        keys.slice(0,30).forEach(k=>{
+            if(k==='value')return;
+            const seen=[];
+            for(const r of rows){if(!r||r[k]==null||typeof r[k]==='object')continue;const s=tr(r[k]);if(seen.indexOf(s)<0){seen.push(s);if(seen.length>=15)break;}}
+            distinct[k]=seen;
+        });
+        const labels=[];for(const r of (Array.isArray(siteRows)?siteRows:[])){const l=tr(sbWowLabelOf(r));if(l&&labels.indexOf(l)<0){labels.push(l);if(labels.length>=60)break;}}
+        dbg('[SB-LP WOW DUMP] rows='+rows.length+' siteRows='+(Array.isArray(siteRows)?siteRows.length:0)+' keys='+JSON.stringify(keys.slice(0,40)));
+        dbg('[SB-LP WOW DUMP] distinct values per key (first 15): '+JSON.stringify(distinct));
+        dbg('[SB-LP WOW DUMP] row labels (first 60): '+JSON.stringify(labels));
+        dbg('[SB-LP WOW DUMP] sample rows: '+JSON.stringify(rows.slice(0,3)).slice(0,1500));
+    }catch(e){dbg('[SB-LP WOW DUMP] failed: '+e);}
 }
 
 function fetchLPPageAuto(planId,pageName,sundayStr,fieldName,targetKey,callback){
@@ -3752,7 +4104,9 @@ function fetchLPPageAuto(planId,pageName,sundayStr,fieldName,targetKey,callback)
                 GM_xmlhttpRequest({method:'GET',url:s3Url,headers:{'Accept':'*/*'},
                     onload:function(s3Resp){
                         try{
-                            const rows=JSON.parse(s3Resp.responseText);
+                            let rows=JSON.parse(s3Resp.responseText);
+                            // (15.48.0) S&OPWoW-Page only: tolerate an object wrapper ({rows:[...]} etc.).
+                            if(!Array.isArray(rows)&&/OPWoW/i.test(pageName)){const a=(rows&&typeof rows==='object')?Object.values(rows).find(Array.isArray):null;dbg('[SB-LP] '+pageName+' payload not an array; keys='+JSON.stringify(rows&&typeof rows==='object'?Object.keys(rows).slice(0,20):typeof rows));rows=a||[];}
                             dbg('[SB-LP]',pageName,'data:',rows.length,'rows');
                             let val=0;
                             for(const row of rows){
@@ -7546,9 +7900,15 @@ function renderEOSWash(data){
         // computable actual rate AND the matching Sync LP RATE target is set, derive
         // % to LP = actualRate / lpRate * 100. These are the per-path stow/pick RATE targets
         // (ctiLpRate / topLpRate) — the same values the Sync tab colors its rate cells against —
-        // NOT the CPLH targets. A real PPR ratio always wins.
+        // NOT the CPLH targets.
+        // (15.48.1 fix) For CTI / TOP the "% to LP" cell sits next to the row's displayed Rate and
+        // LP Rate (ctiLpRate / topLpRate), so it MUST equal Rate / LP Rate * 100 whenever both are
+        // known. Previously the PPR ratioToPlan won, which is measured on PPR's own volume/plan
+        // basis (not the case rate vs the GalaxyBI LP rate shown) and gave e.g. 116.0% for CTI
+        // while the row showed 43.07 / 47.9 (= 89.9%). PPR ratio is now only the fallback when the
+        // row has no LP rate / actual rate.
         let lpFromCplh=false;let fbTarget=0;
-        if(!lpIsNA&&pctLP===0&&rate>0){
+        if(!lpIsNA&&rate>0){
             fbTarget=(pprName==='Case Transfer In')?ctiLpRate:(pprName==='Transfer Out Pick - Total')?topLpRate:0;
             if(fbTarget>0){pctLP=(rate/fbTarget)*100;lpFromCplh=true;}
         }
