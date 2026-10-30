@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.53.1
+// @version      15.53.2
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -193,7 +193,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.53.1';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.53.2';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -8652,41 +8652,75 @@ function renderEOSWash(data){
     window.scrollTo(0,0);
 }
 
-// (15.53.1) Capture-only control flattening, called from the onclone of EVERY html2canvas capture
-// (EOS Wash email + Snip). html2canvas paints form controls badly: an <input>'s text is offset and
-// clipped at the bottom, its height/padding inflate the row, a <textarea> paints as one unwrapped
-// line, and a <select> may not show the chosen option. Inside the CLONED subtree only, each visible
-// text-like <input>, <select> (selected option's text) and <textarea> is swapped for a plain
-// <span>/<div> showing its value as typed: cell font (inherited), the control's own highlight /
-// text colours, subtle 1px border, padding 2px 6px, line-height normal, NO fixed / min height, so
-// short manual cells sit at the same row height as the neighbouring computed cells. Empty controls
-// render blank (no box). Values are read from the LIVE controls (cloneNode doesn't reliably carry
-// typed/select/textarea values), paired by querySelectorAll index, else by id. Checkbox / radio /
-// button / hidden inputs and controls that aren't displayed are left as-is. The live DOM is never
-// modified. Also hides the Safety "+ Add PA" / × and "+ Add Row" / "− Remove Row" buttons and
-// keeps extra PA names stacked one per line.
+// (15.53.1 / 15.53.2) Capture-only control flattening — the ONE place form controls are swapped
+// for text in an html2canvas capture (EOS Wash email + Snip; the older 15.48.3 / 15.50.0 textarea
+// swaps were folded into this in 15.53.1). html2canvas paints form controls badly: an <input>'s
+// text is offset and clipped, a <textarea> paints its text as one unwrapped (often blank) line, and
+// a <select> may not show the chosen option. Inside the CLONED subtree only, each text-like
+// <input>, <select> (selected option's text) and <textarea> is swapped for a plain <span>/<div>
+// showing its value as typed: cell font (inherited), the control's own highlight / text colours,
+// subtle 1px border, padding 2px 6px, line-height normal, NO fixed / min height, so rows grow only
+// as needed and Bridge / Highlights notes wrap. contenteditable elements keep their node but get
+// the live text + wrapping styles. Empty controls render blank (no box).
+// (15.53.2) Bridge / Highlights textareas came out blank: the clone was paired to its live control
+// by querySelectorAll index / id, which is fragile, and any textarea left unswapped is painted by
+// html2canvas as an (almost) empty box. Now sbTagControlsForCapture runs on the LIVE root right before html2canvas: it stamps
+// every control with a unique data-sb-cap="N" and records N -> its live value. The stamp is cloned
+// with the node, so onclone looks each cloned control up by N and uses the LIVE value from the map
+// (never the clone's .value). sbUntagControlsForCapture removes the stamps from the live DOM in a
+// finally (success or error). Checkbox / radio / button / hidden inputs and controls that are
+// themselves display:none / visibility:hidden are left as-is. Also hides the Safety "+ Add PA" / ×
+// and "+ Add Row" / "− Remove Row" buttons and keeps extra PA names stacked one per line.
 const SB_CAPTURE_TEXT_TYPES=new Set(['','text','number','date','time','datetime-local','month','week','email','search','tel','url']);
-function sbFlattenControlsForCapture(liveRoot,cloneRoot){
-    if(!liveRoot||!cloneRoot)return;
-    const doc=cloneRoot.ownerDocument;
-    const SEL='input,select,textarea';
-    const live=Array.from(liveRoot.querySelectorAll(SEL));
-    const clones=Array.from(cloneRoot.querySelectorAll(SEL));
-    const byIndex=live.length===clones.length;
-    const imp=(el,prop,val)=>{if(val)el.style.setProperty(prop,val,'important');};
-    clones.forEach((c,i)=>{
+const SB_CAP_ATTR='data-sb-cap';
+const SB_CAP_SEL='input,select,textarea,[contenteditable]:not([contenteditable="false"])';
+function sbTagControlsForCapture(liveRoot){
+    const map=new Map();
+    if(!liveRoot)return map;
+    let n=0;
+    liveRoot.querySelectorAll(SB_CAP_SEL).forEach(el=>{
         try{
-            let src=byIndex?live[i]:null;
-            if(!src||src.tagName!==c.tagName||(c.id&&src.id!==c.id))src=c.id?(live.find(e=>e.id===c.id)||null):null;
-            if(!src||!c.parentNode)return;   // can't pair it with its live control: leave the clone as-is
-            const tag=src.tagName;
-            if(tag==='INPUT'&&!SB_CAPTURE_TEXT_TYPES.has(String(src.getAttribute('type')||'').toLowerCase()))return;
-            if(!(src.offsetWidth||src.offsetHeight||src.getClientRects().length))return;   // not displayed
+            const tag=el.tagName;
             let val='';
-            if(tag==='SELECT'){const o=src.options[src.selectedIndex];val=o?o.text:'';}
-            else val=String(src.value==null?'':src.value);
-            const isTa=tag==='TEXTAREA';
+            if(tag==='SELECT'){const o=el.options[el.selectedIndex];val=o?o.text:'';}
+            else if(tag==='INPUT'||tag==='TEXTAREA')val=String(el.value==null?'':el.value);
+            else val=String(el.innerText!=null?el.innerText:(el.textContent||''));
+            const k=String(++n);
+            el.setAttribute(SB_CAP_ATTR,k);
+            map.set(k,{el,tag,val});
+        }catch(e){}
+    });
+    return map;
+}
+function sbUntagControlsForCapture(capMap){
+    try{if(capMap)capMap.forEach(({el})=>{try{el.removeAttribute(SB_CAP_ATTR);}catch(e){}});}catch(e){}
+    // Sweep too, in case a control was re-rendered/moved mid-capture.
+    try{document.querySelectorAll('['+SB_CAP_ATTR+']').forEach(el=>el.removeAttribute(SB_CAP_ATTR));}catch(e){}
+}
+function sbFlattenControlsForCapture(capMap,cloneRoot){
+    if(!capMap||!cloneRoot)return;
+    const doc=cloneRoot.ownerDocument;
+    const imp=(el,prop,val)=>{if(val)el.style.setProperty(prop,val,'important');};
+    const wrap=(s)=>{s.whiteSpace='pre-wrap';s.overflowWrap='break-word';s.wordBreak='break-word';};
+    Array.from(cloneRoot.querySelectorAll('['+SB_CAP_ATTR+']')).forEach(c=>{
+        try{
+            const entry=capMap.get(c.getAttribute(SB_CAP_ATTR));
+            c.removeAttribute(SB_CAP_ATTR);
+            if(!entry||!c.parentNode)return;   // not one of ours: leave the clone as-is
+            const src=entry.el,tag=entry.tag,val=entry.val;
+            if(tag!==c.tagName)return;
             const cs=window.getComputedStyle(src);
+            if(cs.display==='none'||cs.visibility==='hidden')return;   // the control itself is hidden
+            if(tag!=='INPUT'&&tag!=='SELECT'&&tag!=='TEXTAREA'){
+                // contenteditable (e.g. an expanded Bridge note): keep the node, use the live text, wrap.
+                c.removeAttribute('contenteditable');
+                c.textContent=val;
+                const s=c.style;wrap(s);
+                s.height='auto';s.maxHeight='none';s.minHeight='0';s.overflow='visible';
+                return;
+            }
+            if(tag==='INPUT'&&!SB_CAPTURE_TEXT_TYPES.has(String(src.getAttribute('type')||'').toLowerCase()))return;
+            const isTa=tag==='TEXTAREA';
             const box=doc.createElement(isTa?'div':'span');
             box.textContent=val;   // text only (never parsed as HTML); pre-wrap keeps line breaks
             const s=box.style;
@@ -8694,11 +8728,11 @@ function sbFlattenControlsForCapture(liveRoot,cloneRoot){
             s.boxSizing='border-box';
             s.width=src.offsetWidth>0?src.offsetWidth+'px':(isTa?'100%':'auto');
             s.maxWidth='100%';s.minWidth='0';
-            s.height='auto';s.minHeight='0';s.margin='0';
+            s.height='auto';s.minHeight='0';s.maxHeight='none';s.overflow='visible';s.margin='0';
             s.verticalAlign='middle';
             s.fontFamily='inherit';s.fontSize='inherit';s.fontWeight='inherit';s.fontStyle='inherit';
             s.lineHeight='normal';
-            s.whiteSpace='pre-wrap';s.overflowWrap='anywhere';s.wordBreak='break-word';
+            wrap(s);   // break-word (not "anywhere") so html2canvas 1.4.1 also splits long words
             // Inputs follow the cell's alignment (numbers centred like the computed cells) unless
             // the control set its own; notes keep the textarea's own (left) alignment.
             const ta=cs.textAlign;
@@ -8754,11 +8788,18 @@ function emailEOSWash(){
         // (15.48.3 / 15.50.0 / 15.53.0 / 15.53.1) In the CLONED document only (the live board is
         // untouched), every manual input / textarea / select becomes plain wrapping text and the
         // Safety Add PA / × / Add Row / Remove Row buttons are hidden. See sbFlattenControlsForCapture.
+        // (15.53.2) Stamp the LIVE controls + snapshot their values first; the stamps are removed
+        // in the finally below whether the capture succeeds or fails.
+        let capMap=null;
+        try{capMap=sbTagControlsForCapture(content);}catch(e){console.warn('[SB-EOS] capture tag failed:',e);}
         const flattenEosClone=(clonedDoc)=>{
-            try{sbFlattenControlsForCapture(content,clonedDoc.getElementById('eoswash-content'));}
+            try{sbFlattenControlsForCapture(capMap,clonedDoc.getElementById('eoswash-content'));}
             catch(e){console.warn('[SB-EOS] capture flatten failed:',e);}
         };
-        html2canvas(content,{backgroundColor:isDark?'#1a1a2e':'#ffffff',scale:1,useCORS:true,logging:false,windowWidth:content.scrollWidth,windowHeight:content.scrollHeight,onclone:flattenEosClone}).then(canvas=>{
+        let capPromise;
+        try{capPromise=html2canvas(content,{backgroundColor:isDark?'#1a1a2e':'#ffffff',scale:1,useCORS:true,logging:false,windowWidth:content.scrollWidth,windowHeight:content.scrollHeight,onclone:flattenEosClone});}
+        catch(e){capPromise=Promise.reject(e);}
+        capPromise.finally(()=>sbUntagControlsForCapture(capMap)).then(canvas=>{
             // Build an .eml file (standard email format) with the EOS Wash image embedded inline
             // in the HTML body. Opening the .eml launches the DESKTOP Outlook app with a new
             // message already addressed, subjected, and containing the image — ready to send.
@@ -9216,11 +9257,18 @@ function doSnip(){
         style.textContent='#sb-root,#sb-root *{color:#000 !important;}#sb-root .pct-good{color:#2e7d32 !important;}#sb-root .pct-warn{color:#e65100 !important;}#sb-root .pct-bad{color:#c62828 !important;}#sb-root .row-fast td{color:#e65100 !important;}#sb-root .goal-title{color:#333 !important;}#sb-root .goal-stats{color:#333 !important;}#sb-root .goal-stats strong{color:#000 !important;}#sb-root .fclm-timestamp{color:#333 !important;}#sb-root .meta-text{color:#333 !important;}#sb-root .target-input{color:#000 !important;padding:4px 6px !important;font-size:13px !important;line-height:1.3 !important;}#sb-root .table-input{color:#000 !important;}#sb-root .panel-title{color:#333 !important;}#sb-root .tg-compact h4{color:#1565c0 !important;}#sb-root .tg-compact:last-child h4{color:#2e7d32 !important;}#sb-root .fixed-target{color:#2e7d32 !important;}#sb-root .row-hc td{color:#666 !important;}#sb-root .section-header h2{color:#000 !important;}#sb-root .metrics-table .bold{color:#000 !important;}#sb-root .nav-tab{color:#333 !important;}#sb-root .nav-tab.active{color:#fff !important;}#sb-root .target-table td{padding:4px 6px !important;line-height:1.4 !important;}#sb-root *{animation:none !important;}#sb-root .metrics-section,#sb-root .sync-right,#sb-root .sync-right>*,#sb-root .sync-right *{opacity:1 !important;transform:none !important;}#sb-root .sync-right{position:static !important;max-height:none !important;overflow:visible !important;top:auto !important;}';
     }
     document.head.appendChild(style);
-    // (15.53.1) Textareas / inputs / selects are flattened to plain text in the html2canvas CLONE
+    // (15.53.1 / 15.53.2) Textareas / inputs / selects are flattened to plain text in the html2canvas CLONE
     // (sbFlattenControlsForCapture) instead of swapping live textareas, so the live board's
     // controls are never detached or replaced during a Snip.
+    // (15.53.2) Live controls are stamped (data-sb-cap) + their values snapshotted right before the
+    // capture; the stamps are removed in the finally whether it succeeds or fails.
     setTimeout(()=>{
-        html2canvas(root,{backgroundColor:isDark?'#1a1a2e':'#ffffff',scale:1.5,useCORS:true,logging:false,scrollX:0,scrollY:0,windowWidth:root.scrollWidth,width:root.scrollWidth,windowHeight:root.scrollHeight,height:root.scrollHeight,onclone:(cd)=>{try{sbFlattenControlsForCapture(root,cd.getElementById('sb-root'));}catch(e){console.warn('[SB] snip flatten failed:',e);}}}).then(canvas=>{
+        let capMap=null;
+        try{capMap=sbTagControlsForCapture(root);}catch(e){console.warn('[SB] snip tag failed:',e);}
+        let capPromise;
+        try{capPromise=html2canvas(root,{backgroundColor:isDark?'#1a1a2e':'#ffffff',scale:1.5,useCORS:true,logging:false,scrollX:0,scrollY:0,windowWidth:root.scrollWidth,width:root.scrollWidth,windowHeight:root.scrollHeight,height:root.scrollHeight,onclone:(cd)=>{try{sbFlattenControlsForCapture(capMap,cd.getElementById('sb-root'));}catch(e){console.warn('[SB] snip flatten failed:',e);}}});}
+        catch(e){capPromise=Promise.reject(e);}
+        capPromise.finally(()=>sbUntagControlsForCapture(capMap)).then(canvas=>{
             clearTimeout(snipSafety);
             // Restore styles
             document.head.removeChild(style);
