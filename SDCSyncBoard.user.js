@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.51.1
+// @version      15.53.1
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -193,7 +193,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.51.1';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.53.1';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -3892,14 +3892,9 @@ function attemptLPFetch(site,resolve,isRetry){
                     fetchLPPageAuto(planId,'DA',sundayStr,'key','DA Bldg to Bldg Total - CPLH',(v)=>{results.obCplh=v;done++;checkDone();});
                     fetchLPPageAuto(planId,'DeratedRates',sundayStr,'lineItem','Total Building CPLH Inc Support',(v,allRows)=>{
                         const deratedSite=v;
-                        // Extract CTI rate from DeratedRates (Forecast + Cartons)
-                        if(allRows&&allRows.length>0){
-                            for(const row of allRows){
-                                if((row.lineItem||'').trim()==='Case Transfer In'&&row.date===sundayStr&&row.type==='Forecast'&&row.packType==='Cartons'&&parseFloat(row.value)>0){
-                                    results.ctiRate=parseFloat(row.value)||0;break;
-                                }
-                            }
-                        }
+                        // (15.52.0) CTI rate is no longer taken from DeratedRates here (that is the DILUTED
+                        // "Diluted Rates by Path" view, e.g. 47.9). It is settled by settleCti below from the
+                        // UNDILUTED "Undiluted Rates by Path" rows (UnderatedRatesAndHours), DeratedRates last.
                         // (15.46.1, user request) SITE CPLH must come from the UNDILUTED rates (the value the
                         // S&OP WoW page shows, e.g. 19.6), NOT DeratedRates (diluted, e.g. 18.96). Chain:
                         // UnderatedRatesAndHours -> S&OP WoW page -> DeratedRates (last resort, warned).
@@ -3907,8 +3902,8 @@ function attemptLPFetch(site,resolve,isRetry){
                             results.siteCplh=val;
                             if(src==='DeratedRates')console.warn('[SB-LP] Site CPLH: undiluted source not found \u2014 using DeratedRates (diluted) '+val);
                             else dbg('[SB-LP] Site CPLH from '+src+' = '+val+' (derated was '+deratedSite+')');
-                            dbg('[SB-LP] DeratedRates final: CTI='+results.ctiRate+' SiteCPLH='+results.siteCplh);
-                            done+=2;checkDone();
+                            dbg('[SB-LP] DeratedRates final: SiteCPLH='+results.siteCplh);
+                            done++;checkDone();   // (15.52.0) CTI now counts its own `done` in settleCti
                         };
                         try{
                             fetchLPPageAuto(planId,'UnderatedRatesAndHours',sundayStr,'lineItem','Total Building CPLH Inc Support',(u)=>{
@@ -3922,7 +3917,7 @@ function attemptLPFetch(site,resolve,isRetry){
                             });
                         }catch(e1){finish(deratedSite,'DeratedRates');}
                     });
-                    // Row helpers for the TOP rate (DeratedRates -> UnderatedRatesAndHours, unchanged) and the
+                    // Row helpers for the CTI/TOP rates (15.52.0: Undiluted Rates by Path first, see below) and the
                     // per-path rates (15.48.0: S&OPWoW-Page diluted -> UnderatedRatesAndHours, see below).
                     // pickLpRate = Forecast + Cartons, this week's Sunday, EXACT line-item match.
                     // Each page's rows are fetched ONCE (fetchLPPageAuto passes all rows to the
@@ -3932,22 +3927,61 @@ function attemptLPFetch(site,resolve,isRetry){
                     const pickLpRate=(rows,item)=>{for(const r of (rows||[])){if((r.lineItem||'').trim()===item&&r.date===sundayStr&&r.type==='Forecast'&&r.packType==='Cartons'){const v=parseFloat(r.value)||0;if(v>0)return v;}}return 0;};
                     const drRowsP=lpRowsOf('DeratedRates');
                     const urRowsP=lpRowsOf('UnderatedRatesAndHours');
-                    // TOP (Transfer Out Pick) rate: DeratedRates 'Transfer Out Pick - Total' then
-                    // 'Transfer Out Pick - Small'; fallback = the pre-15.47.0 UnderatedRatesAndHours call.
-                    // settleTop runs exactly once (flag) so `done` is incremented exactly once for TOP.
-                    let topSettled=false;
+                    // (15.52.0) CTI + TOP LP rates come from the GalaxyBI "Undiluted Rates by Path" view.
+                    // In GalaxyBI that view (S&OPWoW-Page dropdown / savedViewId) is the page whose data
+                    // name is UnderatedRatesAndHours (GalaxyBIFrontend reportPagesList.ts), so urRowsP
+                    // (same planId + &site=) IS that view's data. Filters: site rows, Column Type
+                    // (type) = Forecast, Week (date) = this week's Sunday, numeric "1. " prefix stripped.
+                    //   CTI: "Case Transfer In" Units (GalaxyBI shows a blank packType as Units), then
+                    //        Cartons; last resort DeratedRates Cartons (diluted, warned).
+                    //   TOP: "Transfer Out Pick - Small" -> Medium -> Large, Cartons ONLY (Units = 271.2
+                    //        is wrong); then DeratedRates Total -> Small (diluted, warned); then any
+                    //        "Transfer Out Pick ..." Cartons Forecast row in the undiluted rows.
+                    // settleCti/settleTop run exactly once (flag) so each increments `done` exactly once.
+                    let ctiSettled=false,topSettled=false;
+                    const settleCti=(v,src)=>{if(ctiSettled)return;ctiSettled=true;results.ctiRate=v;dbg('[SB-LP RATE] CTI => '+v+' (src '+src+')');done++;checkDone();};
                     const settleTop=(v,src)=>{if(topSettled)return;topSettled=true;results.topRate=v;dbg('[SB-LP RATE] TOP => '+v+' (src '+src+')');done++;checkDone();};
-                    drRowsP.then(dr=>{
-                        const vt=pickLpRate(dr,'Transfer Out Pick - Total');
-                        const v=vt>0?vt:pickLpRate(dr,'Transfer Out Pick - Small');
-                        if(v>0){settleTop(v,'DeratedRates ('+(vt>0?'Transfer Out Pick - Total':'Transfer Out Pick - Small')+')');return;}
+                    Promise.all([urRowsP,drRowsP]).then(([urAll,dr])=>{
+                        const ur=sbWowSiteRows(urAll,loadConfig().site);
+                        const undilSrc=(pt)=>'S&OPWoW Undiluted Rates by Path, '+pt+', Forecast '+sundayStr;
+                        let missed=false;
+                        // CTI
                         try{
-                            fetchLPPageAutoRate(planId,'UnderatedRatesAndHours',sundayStr,'Transfer Out Pick - Small',(u)=>{
-                                console.warn('[SB-LP RATE] "Transfer Out Pick - Small" not in DeratedRates \u2014 using UnderatedRatesAndHours '+u);
-                                settleTop(u,'UnderatedRatesAndHours');
-                            });
+                            const cu=sbPickUndilRate(ur,'Case Transfer In','Units',sundayStr);
+                            const cc=cu>0?0:sbPickUndilRate(ur,'Case Transfer In','Cartons',sundayStr);
+                            if(cu>0)settleCti(cu,undilSrc('Units'));
+                            else if(cc>0)settleCti(cc,undilSrc('Cartons'));
+                            else{
+                                missed=true;
+                                const d=pickLpRate(dr,'Case Transfer In');
+                                console.warn('[SB-LP RATE] "Case Transfer In" not in Undiluted Rates by Path (UnderatedRatesAndHours) \u2014 using DeratedRates (diluted) '+d);
+                                settleCti(d,'DeratedRates (diluted, Cartons, Forecast '+sundayStr+')');
+                            }
+                        }catch(e){settleCti(0,'error');}
+                        // TOP
+                        try{
+                            let tv=0,titem='';
+                            for(const it of ['Transfer Out Pick - Small','Transfer Out Pick - Medium','Transfer Out Pick - Large']){
+                                tv=sbPickUndilRate(ur,it,'Cartons',sundayStr);
+                                if(tv>0){titem=it;break;}
+                            }
+                            if(tv>0)settleTop(tv,undilSrc('Cartons')+', '+titem);
+                            else{
+                                missed=true;
+                                const vt=pickLpRate(dr,'Transfer Out Pick - Total');
+                                const vs=vt>0?vt:pickLpRate(dr,'Transfer Out Pick - Small');
+                                if(vs>0){
+                                    console.warn('[SB-LP RATE] TOP Small/Medium/Large Cartons not in Undiluted Rates by Path \u2014 using DeratedRates (diluted) '+vs);
+                                    settleTop(vs,'DeratedRates ('+(vt>0?'Transfer Out Pick - Total':'Transfer Out Pick - Small')+')');
+                                }else{
+                                    const va=sbPickUndilRate(ur,'Transfer Out Pick','Cartons',sundayStr,true);
+                                    console.warn('[SB-LP RATE] TOP not in Undiluted Rates by Path or DeratedRates \u2014 any "Transfer Out Pick" Cartons row = '+va);
+                                    settleTop(va,'UnderatedRatesAndHours (any Transfer Out Pick, Cartons)');
+                                }
+                            }
                         }catch(e){settleTop(0,'error');}
-                    }).catch(()=>settleTop(0,'error'));
+                        if(missed)sbDumpWowLayoutOnce(urAll,ur,'Undiluted Rates by Path');
+                    }).catch(()=>{settleCti(0,'error');settleTop(0,'error');});
                     fetchLPPageAutoRate(planId,'Density',sundayStr,'Case Transfer In',(v)=>{results.ibDensityLP=v;done++;checkDone();});
                     fetchLPPageAutoRate(planId,'Density',sundayStr,'DA Bldg to Bldg Transfer TOTAL',(v)=>{results.obDensityLP=v;done++;checkDone();});
                     // BB Goals: Week Capacity (Cartons) for today's day from IB and DA
@@ -4064,11 +4098,39 @@ function sbPickWowDilutedRate(rows,item,sundayStr){
     }
     return best;
 }
+// (15.52.0) Undiluted ("Undiluted Rates by Path" = UnderatedRatesAndHours) LP rate for one line item.
+// Long rows {site, lineItem, packType, type, date, value}. Line item compared after stripping the
+// numeric display prefix ("1. ", "27. ") and normalizing; packType blank = Units (GalaxyBI's own
+// pivot selector does `packType || "Units"`); type must be Forecast; date must be this week's Sunday.
+// prefixMatch=true matches any line item that STARTS with `item` (last-resort TOP fallback only).
+// Returns the first value > 0, else 0. Function declaration => hoisted, no TDZ.
+function sbPickUndilRate(rows,item,packType,sundayStr,prefixMatch){
+    const want=sbWowNorm(String(item||'').replace(/^\d+\.\s*/,''));
+    const wantPt=String(packType||'').toLowerCase();
+    if(!want||!Array.isArray(rows))return 0;
+    for(const r of rows){
+        if(!r||typeof r!=='object')continue;
+        const li=sbWowNorm(String(r.lineItem==null?'':r.lineItem).trim().replace(/^\d+\.\s*/,''));
+        if(prefixMatch?li.indexOf(want)!==0:li!==want)continue;
+        if(String(r.type==null?'':r.type).trim().toLowerCase()!=='forecast')continue;
+        if(r.date==null||String(r.date).slice(0,10)!==sundayStr)continue;
+        const pt=String(r.packType==null||String(r.packType).trim()===''?'Units':r.packType).trim().toLowerCase();
+        if(pt!==wantPt)continue;
+        const v=parseFloat(r.value)||0;
+        if(v>0)return v;
+    }
+    return 0;
+}
 // One-shot compact dump of the S&OPWoW-Page layout (keys, distinct descriptor values, row labels)
 // so the parser can be finalized. Only via dbg (localStorage syncboard_debug=1).
-function sbDumpWowLayoutOnce(allRows,siteRows){
-    if(SB_WOW_DUMP_LOGGED||!SB_DEBUG)return;
-    SB_WOW_DUMP_LOGGED=true;
+// (15.52.0) Optional `tag` = source name; the one-shot guard is per tag so the undiluted CTI/TOP
+// dump and the S&OPWoW per-path dump don't suppress each other. Untagged = legacy S&OPWoW guard.
+var SB_WOW_DUMP_TAGS={};
+function sbDumpWowLayoutOnce(allRows,siteRows,tag){
+    if(!SB_DEBUG)return;
+    if(tag){if(SB_WOW_DUMP_TAGS[tag])return;SB_WOW_DUMP_TAGS[tag]=true;}
+    else{if(SB_WOW_DUMP_LOGGED)return;SB_WOW_DUMP_LOGGED=true;}
+    const pfx=tag?'[SB-LP WOW DUMP '+tag+']':'[SB-LP WOW DUMP]';
     try{
         const rows=Array.isArray(allRows)?allRows:[];
         const tr=(s)=>{s=String(s==null?'':s);return s.length>40?s.slice(0,40)+'\u2026':s;};
@@ -4081,11 +4143,11 @@ function sbDumpWowLayoutOnce(allRows,siteRows){
             distinct[k]=seen;
         });
         const labels=[];for(const r of (Array.isArray(siteRows)?siteRows:[])){const l=tr(sbWowLabelOf(r));if(l&&labels.indexOf(l)<0){labels.push(l);if(labels.length>=60)break;}}
-        dbg('[SB-LP WOW DUMP] rows='+rows.length+' siteRows='+(Array.isArray(siteRows)?siteRows.length:0)+' keys='+JSON.stringify(keys.slice(0,40)));
-        dbg('[SB-LP WOW DUMP] distinct values per key (first 15): '+JSON.stringify(distinct));
-        dbg('[SB-LP WOW DUMP] row labels (first 60): '+JSON.stringify(labels));
-        dbg('[SB-LP WOW DUMP] sample rows: '+JSON.stringify(rows.slice(0,3)).slice(0,1500));
-    }catch(e){dbg('[SB-LP WOW DUMP] failed: '+e);}
+        dbg(pfx+' rows='+rows.length+' siteRows='+(Array.isArray(siteRows)?siteRows.length:0)+' keys='+JSON.stringify(keys.slice(0,40)));
+        dbg(pfx+' distinct values per key (first 15): '+JSON.stringify(distinct));
+        dbg(pfx+' row labels (first 60): '+JSON.stringify(labels));
+        dbg(pfx+' sample rows: '+JSON.stringify(rows.slice(0,3)).slice(0,1500));
+    }catch(e){dbg(pfx+' failed: '+e);}
 }
 
 function fetchLPPageAuto(planId,pageName,sundayStr,fieldName,targetKey,callback){
@@ -7342,11 +7404,92 @@ function setEosSafetyCount(n){try{localStorage.setItem(EOS_SAFETY_COUNT_KEY,Stri
 // handler can re-render just the tbody. Inputs are .eos-manual so they save/restore like the rest.
 function eosSafetyRowsHTML(n){
     const cell=(id)=>`<td><input type="text" class="support-input eos-manual" id="${id}" style="width:100%;box-sizing:border-box;background:#ffffcc;color:#000;border:1px solid #999;border-radius:3px;"></td>`;
+    // (15.53.0) PA Name cell: a stacked list of PA inputs + a small "+ Add PA" button. The FIRST
+    // input keeps the original id eos-sf-pa-<i> (so pre-15.53 saved single-PA data restores as-is);
+    // extra PAs are appended by wireEosSafetyPas()/eosSafetyPaAppend() from the saved list.
+    const paCell=(i)=>`<td><div class="eos-sf-pa-list" data-row="${i}"><input type="text" class="support-input eos-manual eos-sf-pa-input" id="eos-sf-pa-${i}" aria-label="PA name 1" style="${EOS_PA_INPUT_CSS}"></div><button type="button" class="btn btn-small eos-sf-pa-btn eos-sf-pa-add" aria-label="Add PA" style="margin-top:4px;padding:1px 6px;font-size:10px;line-height:1.4;background:#2e7d32;color:#fff;border-color:#2e7d32;">+ Add PA</button></td>`;
     let html='';
     for(let i=0;i<n;i++){
-        html+='<tr>'+cell('eos-sf-name-'+i)+cell('eos-sf-rbi-'+i)+cell('eos-sf-audit-'+i)+cell('eos-sf-icare-'+i)+cell('eos-sf-pa-'+i)+cell('eos-sf-arc-'+i)+cell('eos-sf-bridge-'+i)+'</tr>';
+        html+='<tr>'+cell('eos-sf-name-'+i)+cell('eos-sf-rbi-'+i)+cell('eos-sf-audit-'+i)+cell('eos-sf-icare-'+i)+paCell(i)+cell('eos-sf-arc-'+i)+cell('eos-sf-bridge-'+i)+'</tr>';
     }
     return html;
+}
+// ---- (15.53.0) Safety Summary: multiple PA names per row ("+ Add PA") ----
+// Some managers have 2+ PAs, so each row's PA Name cell holds a LIST of PA inputs. Storage (same
+// syncboard_support object as every other Safety field):
+//   eos-sf-pas-<i>    = array of all PA names for row i (canonical)
+//   eos-sf-pa-<i>     = first PA (original pre-15.53 key, kept for back-compat)
+//   eos-sf-pa-<i>-<k> = extra PA k (k>=1), mirrored by id so the generic id-keyed saves keep them
+// Old data with only the single eos-sf-pa-<i> string loads as a one-element list.
+const EOS_PA_INPUT_CSS='width:100%;box-sizing:border-box;background:#ffffcc;color:#000;border:1px solid #999;border-radius:3px;';
+function eosSafetyPaList(sup,i){
+    const arr=sup['eos-sf-pas-'+i];
+    if(Array.isArray(arr)&&arr.length)return arr.map(v=>v==null?'':String(v));
+    const first=sup['eos-sf-pa-'+i];
+    const out=[first!=null?String(first):''];
+    for(let k=1;sup['eos-sf-pa-'+i+'-'+k]!=null;k++)out.push(String(sup['eos-sf-pa-'+i+'-'+k]));
+    return out;
+}
+// Persist row i's PA list from the DOM: the array key plus the per-id mirror keys.
+function saveEosSafetyPas(i){
+    const listEl=document.querySelector('.eos-sf-pa-list[data-row="'+i+'"]');if(!listEl)return;
+    const vals=Array.from(listEl.querySelectorAll('.eos-sf-pa-input')).map(e=>e.value);
+    const d=loadSupport();
+    const pre='eos-sf-pa-'+i+'-';
+    Object.keys(d).forEach(key=>{if(key.indexOf(pre)===0)delete d[key];});
+    vals.forEach((v,k)=>{d[k===0?'eos-sf-pa-'+i:pre+k]=v;});
+    d['eos-sf-pas-'+i]=vals;
+    saveSupport(d);
+}
+// Re-number the extra PA inputs of a row after a removal (ids + aria-labels stay contiguous).
+function eosSafetyPaRelabel(listEl,i){
+    Array.from(listEl.querySelectorAll('.eos-sf-pa-input')).forEach((el,k)=>{
+        el.id=k===0?'eos-sf-pa-'+i:'eos-sf-pa-'+i+'-'+k;
+        el.setAttribute('aria-label','PA name '+(k+1));
+    });
+}
+// Append one extra PA input (with its × remove button) to a row's list. DOM-built; the value is
+// set via .value so names are never parsed as HTML. Returns the new input.
+function eosSafetyPaAppend(listEl,i,val){
+    const k=listEl.querySelectorAll('.eos-sf-pa-input').length;
+    const item=document.createElement('div');
+    item.className='eos-sf-pa-item';
+    item.style.cssText='display:flex;align-items:center;gap:4px;margin-top:4px;';
+    const inp=document.createElement('input');
+    inp.type='text';
+    inp.className='support-input eos-manual eos-sf-pa-input';
+    inp.id='eos-sf-pa-'+i+'-'+k;
+    inp.setAttribute('aria-label','PA name '+(k+1));
+    inp.style.cssText=EOS_PA_INPUT_CSS+'flex:1 1 auto;min-width:0;';
+    inp.value=val||'';
+    inp.addEventListener('change',()=>saveEosSafetyPas(i));
+    const rm=document.createElement('button');
+    rm.type='button';
+    rm.className='btn btn-small eos-sf-pa-btn eos-sf-pa-remove';
+    rm.setAttribute('aria-label','Remove PA');
+    rm.title='Remove PA';
+    rm.textContent='\u00D7';
+    rm.style.cssText='flex:0 0 auto;padding:0 6px;font-size:12px;line-height:1.4;background:#c62828;color:#fff;border-color:#c62828;';
+    rm.addEventListener('click',()=>{item.remove();eosSafetyPaRelabel(listEl,i);saveEosSafetyPas(i);});
+    item.appendChild(inp);item.appendChild(rm);
+    listEl.appendChild(item);
+    return inp;
+}
+// Restore each row's saved PA list into the (freshly rendered) Safety tbody and wire the
+// "+ Add PA" buttons. Call AFTER the generic .eos-manual restore so list[0] is authoritative.
+function wireEosSafetyPas(scope){
+    if(!scope)return;
+    const sup=loadSupport();
+    scope.querySelectorAll('.eos-sf-pa-list').forEach(listEl=>{
+        const i=parseInt(listEl.getAttribute('data-row'),10);
+        if(!(i>=0))return;
+        const list=eosSafetyPaList(sup,i);
+        const first=listEl.querySelector('.eos-sf-pa-input');
+        if(first){first.value=list[0]||'';first.addEventListener('change',()=>saveEosSafetyPas(i));}
+        for(let k=1;k<list.length;k++)eosSafetyPaAppend(listEl,i,list[k]);
+        const addBtn=listEl.parentNode?listEl.parentNode.querySelector('.eos-sf-pa-add'):null;
+        if(addBtn)addBtn.addEventListener('click',()=>{const inp=eosSafetyPaAppend(listEl,i,'');saveEosSafetyPas(i);inp.focus();});
+    });
 }
 // Append one Safety row (bump the persisted count, re-render the tbody) and re-wire persistence on
 // the new inputs. Keeps already-entered rows intact (their saved values restore by id).
@@ -7360,6 +7503,7 @@ function addEosSafetyRow(){
         if(sup[el.id]!=null)el.value=sup[el.id];
         el.addEventListener('change',()=>{const d=loadSupport();document.querySelectorAll('.support-input,.callout-textarea,.eos-manual').forEach(e=>{if(e.id)d[e.id]=e.value;});saveSupport(d);});
     });
+    wireEosSafetyPas(tbody);   // (15.53.0) restore extra PAs + wire "+ Add PA"
 }
 // Remove the LAST Safety row (for a misclick on + Add Row). Never drops below 1 row. Re-renders
 // the tbody and re-wires persistence, same as addEosSafetyRow. The removed row's saved values stay
@@ -7375,6 +7519,7 @@ function removeEosSafetyRow(){
         if(sup[el.id]!=null)el.value=sup[el.id];
         el.addEventListener('change',()=>{const d=loadSupport();document.querySelectorAll('.support-input,.callout-textarea,.eos-manual').forEach(e=>{if(e.id)d[e.id]=e.value;});saveSupport(d);});
     });
+    wireEosSafetyPas(tbody);   // (15.53.0) restore extra PAs + wire "+ Add PA"
 }
 
 // Kicks off the EOS Wash Backlog auto-pulls (Inbound from AFT, DA from Rodeo ExSD) and writes
@@ -8428,6 +8573,9 @@ function renderEOSWash(data){
             autoGrow();
         }
     });
+    // (15.53.0) Safety PA Name lists: restore extra PAs (after the generic restore above) and
+    // wire the "+ Add PA" buttons.
+    wireEosSafetyPas(document.getElementById('eos-safety-tbody'));
 
     // (15.47.0) Atlas Breakdown THRESHOLD + DPMO are read-only copies of the Sync-tab ICQA ATLAS
     // cells; refreshEosAtlasFromSync fills them and runs updateAtlasThreshold (red + reason row).
@@ -8504,6 +8652,79 @@ function renderEOSWash(data){
     window.scrollTo(0,0);
 }
 
+// (15.53.1) Capture-only control flattening, called from the onclone of EVERY html2canvas capture
+// (EOS Wash email + Snip). html2canvas paints form controls badly: an <input>'s text is offset and
+// clipped at the bottom, its height/padding inflate the row, a <textarea> paints as one unwrapped
+// line, and a <select> may not show the chosen option. Inside the CLONED subtree only, each visible
+// text-like <input>, <select> (selected option's text) and <textarea> is swapped for a plain
+// <span>/<div> showing its value as typed: cell font (inherited), the control's own highlight /
+// text colours, subtle 1px border, padding 2px 6px, line-height normal, NO fixed / min height, so
+// short manual cells sit at the same row height as the neighbouring computed cells. Empty controls
+// render blank (no box). Values are read from the LIVE controls (cloneNode doesn't reliably carry
+// typed/select/textarea values), paired by querySelectorAll index, else by id. Checkbox / radio /
+// button / hidden inputs and controls that aren't displayed are left as-is. The live DOM is never
+// modified. Also hides the Safety "+ Add PA" / × and "+ Add Row" / "− Remove Row" buttons and
+// keeps extra PA names stacked one per line.
+const SB_CAPTURE_TEXT_TYPES=new Set(['','text','number','date','time','datetime-local','month','week','email','search','tel','url']);
+function sbFlattenControlsForCapture(liveRoot,cloneRoot){
+    if(!liveRoot||!cloneRoot)return;
+    const doc=cloneRoot.ownerDocument;
+    const SEL='input,select,textarea';
+    const live=Array.from(liveRoot.querySelectorAll(SEL));
+    const clones=Array.from(cloneRoot.querySelectorAll(SEL));
+    const byIndex=live.length===clones.length;
+    const imp=(el,prop,val)=>{if(val)el.style.setProperty(prop,val,'important');};
+    clones.forEach((c,i)=>{
+        try{
+            let src=byIndex?live[i]:null;
+            if(!src||src.tagName!==c.tagName||(c.id&&src.id!==c.id))src=c.id?(live.find(e=>e.id===c.id)||null):null;
+            if(!src||!c.parentNode)return;   // can't pair it with its live control: leave the clone as-is
+            const tag=src.tagName;
+            if(tag==='INPUT'&&!SB_CAPTURE_TEXT_TYPES.has(String(src.getAttribute('type')||'').toLowerCase()))return;
+            if(!(src.offsetWidth||src.offsetHeight||src.getClientRects().length))return;   // not displayed
+            let val='';
+            if(tag==='SELECT'){const o=src.options[src.selectedIndex];val=o?o.text:'';}
+            else val=String(src.value==null?'':src.value);
+            const isTa=tag==='TEXTAREA';
+            const cs=window.getComputedStyle(src);
+            const box=doc.createElement(isTa?'div':'span');
+            box.textContent=val;   // text only (never parsed as HTML); pre-wrap keeps line breaks
+            const s=box.style;
+            s.display=isTa?'block':'inline-block';
+            s.boxSizing='border-box';
+            s.width=src.offsetWidth>0?src.offsetWidth+'px':(isTa?'100%':'auto');
+            s.maxWidth='100%';s.minWidth='0';
+            s.height='auto';s.minHeight='0';s.margin='0';
+            s.verticalAlign='middle';
+            s.fontFamily='inherit';s.fontSize='inherit';s.fontWeight='inherit';s.fontStyle='inherit';
+            s.lineHeight='normal';
+            s.whiteSpace='pre-wrap';s.overflowWrap='anywhere';s.wordBreak='break-word';
+            // Inputs follow the cell's alignment (numbers centred like the computed cells) unless
+            // the control set its own; notes keep the textarea's own (left) alignment.
+            const ta=cs.textAlign;
+            if(isTa)s.textAlign=(ta==='start'||!ta)?'left':ta;
+            else s.textAlign=(ta==='center'||ta==='right'||ta==='end'||ta==='-webkit-center')?ta:'inherit';
+            if(val.trim()===''){
+                s.padding='0';s.border='0';s.background='transparent';
+            }else{
+                imp(box,'background-color',cs.backgroundColor);
+                imp(box,'color',cs.color);
+                s.border='1px solid '+(cs.borderTopColor||'#999');
+                s.borderRadius=cs.borderTopLeftRadius||'3px';
+                s.padding='2px 6px';
+            }
+            c.parentNode.replaceChild(box,c);
+        }catch(e){}
+    });
+    // Capture never shows the edit buttons; extra PA names stack one per line under the first.
+    cloneRoot.querySelectorAll('.eos-sf-pa-btn,#eos-safety-add,#eos-safety-remove').forEach(b=>{b.style.display='none';});
+    cloneRoot.querySelectorAll('.eos-sf-pa-item').forEach(it=>{
+        it.style.display='block';
+        const sp=it.firstElementChild;
+        if(sp&&sp.tagName==='SPAN')sp.style.width='100%';
+    });
+}
+
 // Capture the EOS Wash as an image, copy it to the clipboard, and open an email addressed to
 // the site's boss ({SITE}-boss@amazon.com). The user pastes the image into the email body.
 // (15.49.0) KRB3 emails CC site leadership; body has "Inbound EOS" / "Outbound EOS" labels.
@@ -8525,41 +8746,19 @@ function emailEOSWash(){
     const cc=(EOS_EMAIL_CC[site]||[]).join(', ');
     const shift=config.shiftType||'';
     const dateStr=new Date().toLocaleDateString();
-    const subject=`${site} EOS Wash \u2013 ${shift} \u2013 ${dateStr}`;
+    const subject=`${site} EOS Wash`;   // (15.51.2) user request: subject is just "KRB3 EOS Wash"
     const isDark=document.getElementById('sb-root')?.classList.contains('dark-mode');
     if(btn){btn.disabled=true;btn.textContent='\u23F3 Capturing...';}
     // Give the browser a tick, then capture.
     setTimeout(()=>{
-        // (15.48.3) html2canvas paints a <textarea> value as ONE unwrapped, clipped line, so long
-        // Bridge / reason notes were cut off in the emailed image. In the CLONED document only (the
-        // live board is untouched), swap each textarea for a div with the same box styling whose
-        // text wraps (pre-wrap + break-word) and keeps line breaks (\n -> <br>) at the cell width.
-        const srcTas=Array.from(content.querySelectorAll('textarea'));
-        const wrapNotesInClone=(clonedDoc)=>{
-            const cRoot=clonedDoc.getElementById('eoswash-content');
-            if(!cRoot)return;
-            Array.from(cRoot.querySelectorAll('textarea')).forEach((cta,i)=>{
-                const src=srcTas[i];
-                const cs=src?window.getComputedStyle(src):null;
-                const div=clonedDoc.createElement('div');
-                // Text nodes only (no innerHTML) so note text is never parsed as HTML.
-                String(src?src.value:cta.value).split('\n').forEach((line,j)=>{
-                    if(j>0)div.appendChild(clonedDoc.createElement('br'));
-                    div.appendChild(clonedDoc.createTextNode(line));
-                });
-                if(cs){
-                    ['fontFamily','fontSize','fontWeight','lineHeight','color','backgroundColor',
-                     'borderTop','borderRight','borderBottom','borderLeft','borderRadius',
-                     'paddingTop','paddingRight','paddingBottom','paddingLeft','textAlign'].forEach(p=>{div.style[p]=cs[p];});
-                    div.style.minHeight=src.offsetHeight+'px';
-                }
-                div.style.width='100%';div.style.maxWidth='100%';div.style.boxSizing='border-box';
-                div.style.whiteSpace='pre-wrap';div.style.wordWrap='break-word';
-                div.style.overflowWrap='anywhere';div.style.wordBreak='break-word';
-                cta.parentNode.replaceChild(div,cta);
-            });
+        // (15.48.3 / 15.50.0 / 15.53.0 / 15.53.1) In the CLONED document only (the live board is
+        // untouched), every manual input / textarea / select becomes plain wrapping text and the
+        // Safety Add PA / × / Add Row / Remove Row buttons are hidden. See sbFlattenControlsForCapture.
+        const flattenEosClone=(clonedDoc)=>{
+            try{sbFlattenControlsForCapture(content,clonedDoc.getElementById('eoswash-content'));}
+            catch(e){console.warn('[SB-EOS] capture flatten failed:',e);}
         };
-        html2canvas(content,{backgroundColor:isDark?'#1a1a2e':'#ffffff',scale:1,useCORS:true,logging:false,windowWidth:content.scrollWidth,windowHeight:content.scrollHeight,onclone:wrapNotesInClone}).then(canvas=>{
+        html2canvas(content,{backgroundColor:isDark?'#1a1a2e':'#ffffff',scale:1,useCORS:true,logging:false,windowWidth:content.scrollWidth,windowHeight:content.scrollHeight,onclone:flattenEosClone}).then(canvas=>{
             // Build an .eml file (standard email format) with the EOS Wash image embedded inline
             // in the HTML body. Opening the .eml launches the DESKTOP Outlook app with a new
             // message already addressed, subjected, and containing the image — ready to send.
@@ -8572,7 +8771,7 @@ function emailEOSWash(){
             // (Dock / Pick Area Readiness) tables are pasted, then the EOS Wash text + image.
             const htmlBody=''+
                 '<html><body style="font-family:Calibri,Arial,sans-serif;font-size:11pt;">'+
-                'KRB team,<br><br>'+
+                site+' team,<br><br>'+
                 '<b>Inbound EOS</b><br><br><br>'+
                 '<b>Outbound EOS</b><br><br><br>'+
                 'Please see the '+site+' EOS Wash below.<br><br>'+
@@ -9017,21 +9216,12 @@ function doSnip(){
         style.textContent='#sb-root,#sb-root *{color:#000 !important;}#sb-root .pct-good{color:#2e7d32 !important;}#sb-root .pct-warn{color:#e65100 !important;}#sb-root .pct-bad{color:#c62828 !important;}#sb-root .row-fast td{color:#e65100 !important;}#sb-root .goal-title{color:#333 !important;}#sb-root .goal-stats{color:#333 !important;}#sb-root .goal-stats strong{color:#000 !important;}#sb-root .fclm-timestamp{color:#333 !important;}#sb-root .meta-text{color:#333 !important;}#sb-root .target-input{color:#000 !important;padding:4px 6px !important;font-size:13px !important;line-height:1.3 !important;}#sb-root .table-input{color:#000 !important;}#sb-root .panel-title{color:#333 !important;}#sb-root .tg-compact h4{color:#1565c0 !important;}#sb-root .tg-compact:last-child h4{color:#2e7d32 !important;}#sb-root .fixed-target{color:#2e7d32 !important;}#sb-root .row-hc td{color:#666 !important;}#sb-root .section-header h2{color:#000 !important;}#sb-root .metrics-table .bold{color:#000 !important;}#sb-root .nav-tab{color:#333 !important;}#sb-root .nav-tab.active{color:#fff !important;}#sb-root .target-table td{padding:4px 6px !important;line-height:1.4 !important;}#sb-root *{animation:none !important;}#sb-root .metrics-section,#sb-root .sync-right,#sb-root .sync-right>*,#sb-root .sync-right *{opacity:1 !important;transform:none !important;}#sb-root .sync-right{position:static !important;max-height:none !important;overflow:visible !important;top:auto !important;}';
     }
     document.head.appendChild(style);
-    // Replace textareas with divs for html2canvas (textareas don't render wrapped text)
-    const textareaBackups=[];
-    root.querySelectorAll('textarea').forEach(ta=>{
-        const div=document.createElement('div');
-        div.textContent=ta.value;
-        div.style.cssText=window.getComputedStyle(ta).cssText;
-        div.style.whiteSpace='pre-wrap';div.style.wordWrap='break-word';div.style.overflow='visible';div.style.height='auto';div.style.minHeight='32px';div.style.display='block';div.style.padding='6px';div.style.border='1px solid '+(isDark?'#555':'#000');div.style.borderRadius='4px';div.style.fontSize='12px';div.style.lineHeight='1.4';div.style.background=isDark?'#1a1a2e':'#fff';div.style.color=isDark?'#e0e0e0':'#000';div.style.width=ta.offsetWidth+'px';div.style.boxSizing='border-box';
-        textareaBackups.push({ta,parent:ta.parentNode,next:ta.nextSibling});
-        ta.parentNode.replaceChild(div,ta);
-    });
+    // (15.53.1) Textareas / inputs / selects are flattened to plain text in the html2canvas CLONE
+    // (sbFlattenControlsForCapture) instead of swapping live textareas, so the live board's
+    // controls are never detached or replaced during a Snip.
     setTimeout(()=>{
-        html2canvas(root,{backgroundColor:isDark?'#1a1a2e':'#ffffff',scale:1.5,useCORS:true,logging:false,scrollX:0,scrollY:0,windowWidth:root.scrollWidth,width:root.scrollWidth,windowHeight:root.scrollHeight,height:root.scrollHeight}).then(canvas=>{
+        html2canvas(root,{backgroundColor:isDark?'#1a1a2e':'#ffffff',scale:1.5,useCORS:true,logging:false,scrollX:0,scrollY:0,windowWidth:root.scrollWidth,width:root.scrollWidth,windowHeight:root.scrollHeight,height:root.scrollHeight,onclone:(cd)=>{try{sbFlattenControlsForCapture(root,cd.getElementById('sb-root'));}catch(e){console.warn('[SB] snip flatten failed:',e);}}}).then(canvas=>{
             clearTimeout(snipSafety);
-            // Restore textareas
-            textareaBackups.forEach(b=>{const div=b.parent.querySelector('div');if(div&&!div.querySelector){}b.next?b.parent.insertBefore(b.ta,b.next):b.parent.appendChild(b.ta);if(div&&div.parentNode)div.parentNode.removeChild(div);});
             // Restore styles
             document.head.removeChild(style);
             if(rightPanel){rightPanel.style.position=origStyles.rPos;rightPanel.style.maxHeight=origStyles.rMax;rightPanel.style.overflow=origStyles.rOvf;rightPanel.style.top=origStyles.rTop;rightPanel.style.minHeight=origStyles.rMinH||'';}
