@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.53.2
+// @version      15.54.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -193,7 +193,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.53.2';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.54.0';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -5679,6 +5679,7 @@ function buildHTML(){return `
 <div class="section-header"><h2 style="margin-right:14px;">EOS Wash</h2><button id="btn-fetch-eoswash" class="btn btn-primary">\u25B6 Fetch EOS Wash</button><button id="btn-email-eoswash" class="btn" style="background:#1565c0;color:#fff;border-color:#1565c0;">\u2709 Email</button><span id="eoswash-status" class="meta-text" style="margin-left:12px;"></span>
 <span style="margin-left:auto;font-size:11px;color:#888;white-space:nowrap;">LP Shift Plan pulls from the Sync tab (Shift Plan Targets)</span></div>
 <div id="eoswash-content"></div>
+<div style="text-align:center;font-size:10px;color:#999;margin-top:10px;font-style:italic;">Inspired by ucros</div>
 </div></main>
 
 <main id="tab-faststart" class="tab-content"><div class="faststart-container">
@@ -5702,6 +5703,7 @@ function buildHTML(){return `
 <button id="btn-fetch-icqa" class="btn btn-primary">\u25B6 Fetch ICQA</button>
 <span id="sb-icqa-status" class="meta-text" role="status" aria-live="polite"></span></div>
 <div id="sb-icqa-content"></div>
+<div style="text-align:center;font-size:10px;color:#999;margin-top:10px;font-style:italic;">Inspired by Grantlit</div>
 </div></main>
 
 <main id="tab-vrets" class="tab-content"><div class="vrets-container">
@@ -7291,7 +7293,7 @@ async function fetchEOSWashData(){
         const cplhSh=Math.floor((p1Start-15)/60), cplhSm=(p1Start-15)%60;
         const cplhEh=(cplhSh+12)%24, cplhEm=cplhSm;
         const cplhSched={sh:cplhSh<0?cplhSh+24:cplhSh,sm:cplhSm<0?cplhSm+60:cplhSm,eh:cplhEh,em:cplhEm};
-        const [pprHtml,stowH,palletH,pickH,toFluidH,toDockH,toSupportH,cplhData]=await Promise.all([
+        const [pprHtml,stowH,palletH,pickH,toFluidH,toDockH,toSupportH,cplhData,palletizeToteH]=await Promise.all([
             fetchHTML(pprUrl),
             fetchHTML(buildFnUrl(config.site,S.stow,sDate,sched.full.sh,sched.full.sm,eDate,sched.full.eh,sched.full.em)),
             fetchHTML(buildFnUrl(config.site,S.palletStow,sDate,sched.full.sh,sched.full.sm,eDate,sched.full.eh,sched.full.em)),
@@ -7299,7 +7301,10 @@ async function fetchEOSWashData(){
             fetchHTML(buildFnUrl(config.site,S.toFluidLoad,sDate,sched.full.sh,sched.full.sm,eDate,sched.full.eh,sched.full.em)),
             fetchHTML(buildFnUrl(config.site,S.toDock,sDate,sched.full.sh,sched.full.sm,eDate,sched.full.eh,sched.full.em)),
             fetchHTML(buildFnUrl(config.site,S.toSupport,sDate,sched.full.sh,sched.full.sm,eDate,sched.full.eh,sched.full.em)),
-            fetchPeriod(config.site,startDate,cplhSched)
+            fetchPeriod(config.site,startDate,cplhSched),
+            // (15.54.0) Palletize - Tote (shift window) so the wash's DA loaded total includes the
+            // loaded totes exactly like the Sync tab's loadedUnits. Fail-soft: '' -> 0 jobs.
+            fetchHTML(buildFnUrl(config.site,S.palletizeTote,sDate,sched.full.sh,sched.full.sm,eDate,sched.full.eh,sched.full.em)).catch(e=>{console.warn('[SB-EOS] palletizeTote fetch failed:',e&&e.message);return '';})
         ]);
         const ppr=parsePPRDetail(pprHtml);
         const stow=parseFnRollup(stowH),pallet=parseFnRollup(palletH),pick=parseFnRollup(pickH);
@@ -7345,7 +7350,17 @@ async function fetchEOSWashData(){
         const toLoadedSync=((toFluid.jobs||0)+(toDock.caseUnits||0));
         const loadedUnitsSync=toLoadedSync>0?toLoadedSync:0;    // mirrors Sync's toLoaded>0?toLoaded:(obDock...) — obDock not fetched here
         const daHrsSync=pprSync.daTransferHrs||0;
-        const daCplhSync=daHrsSync>0?loadedUnitsSync/daHrsSync:0;
+        // (15.54.0) TOTAL loaded = the Sync tab's loadedUnits exactly: TO Fluid Load jobs + TO Dock
+        // cases + loaded totes (Fluid Load - Tote units + Palletize - Tote jobs). Before 15.54.0 the
+        // wash left the loaded totes out, so its DA CPLH could differ from Sync's at sites that load
+        // totes. Used for Shift Accuracy OB Shift LP BB / DA Shift Plan Actual + the DA CPLH.
+        // sectionVol.ob (Lead/PA & Problem Solve rates) keeps loadedUnitsSync unchanged.
+        let palletizeToteJobsSync=0;
+        try{palletizeToteJobsSync=palletizeToteH?((parsePalletizeTote(palletizeToteH)||{}).jobs||0):0;}catch(e){palletizeToteJobsSync=0;}
+        const loadedTotesSync=(toFluid.fluidToteUnits||0)+palletizeToteJobsSync;
+        const daLoadedSync=loadedUnitsSync+loadedTotesSync;
+        dbg('[SB-EOS DA loaded] toFluidJobs='+(toFluid.jobs||0)+' toDockCases='+(toDock.caseUnits||0)+' fluidToteUnits='+(toFluid.fluidToteUnits||0)+' palletizeToteJobs='+palletizeToteJobsSync+' => daLoaded='+daLoadedSync);
+        const daCplhSync=daHrsSync>0?daLoadedSync/daHrsSync:0;
         dbg('[SB-EOS CPLH] ibVol='+ibVolSync+' ibHrs='+ibHrsSync.toFixed(2)+' (pprHrs='+ibPPRHrsSync.toFixed(2)+' dh='+ibDHSync.toFixed(2)+') ibCPLH='+ibCplhSync.toFixed(2)+' | loaded='+loadedUnitsSync+' daHrs='+daHrsSync.toFixed(2)+' daCPLH='+daCplhSync.toFixed(2));
         // Case volumes keyed by PPR line-item name (used to override PPR eaches with real cases).
         const caseVols={
@@ -7382,7 +7397,7 @@ async function fetchEOSWashData(){
         // the 12hr rolling Site CPLH (same window + formula as the Sync tab).
         // sectionVol carries the IB stow total + OB loaded total so the Lead/PA & Problem Solve
         // support rows can compute Actual Rate = section volume / that path's actual hours.
-        currentEOSWash={ppr,caseVols,caseHrs,alpsTarget,syncCplh:{ib:ibCplhSync,da:daCplhSync,site:siteCplhSync,siteVol:siteThroughputVolSync,siteHrs:siteThroughputHrsSync},sectionVol:{ib:ibVolSync,ob:loadedUnitsSync}};
+        currentEOSWash={ppr,caseVols,caseHrs,alpsTarget,syncCplh:{ib:ibCplhSync,da:daCplhSync,site:siteCplhSync,siteVol:siteThroughputVolSync,siteHrs:siteThroughputHrsSync},sectionVol:{ib:ibVolSync,ob:loadedUnitsSync},daLoaded:daLoadedSync};
         renderEOSWash(currentEOSWash);
         // Auto-pull the Backlog display spans (Inbound from AFT, DA from Rodeo ExSD). Fire from the
         // deliberate fetch path only so passive re-renders don't re-hit the endpoints.
@@ -8414,6 +8429,10 @@ function renderEOSWash(data){
     const ibActCplh=ibActHrs>0?ibActVol/ibActHrs:0;
     const daActVol=sumVol(DA_VOL_ROWS)||0;
     const daActHrs=sumHrs(DA_ROWS.map(r=>r[1]))||0;
+    // (15.54.0) OB Shift LP BB / DA Shift Plan Actual = TOTAL LOADED volume (the Sync tab's
+    // loadedUnits: TO Fluid Load jobs + TO Dock cases + loaded totes), NOT the picked volume.
+    // Older cached data without daLoaded falls back to sectionVol.ob (loaded, without totes).
+    const daLoadedVol=(data&&data.daLoaded>0)?data.daLoaded:(sectionVol.ob||0);
     // DA CPLH actual = Sync-consistent value (loadedUnits/daTransferHrs) when available, so the
     // Shift Accuracy DA CPLH matches the Sync tab and the DA TOTAL row. Fall back to the local
     // picked-vol/summed-hrs only if syncCplh wasn't captured (pre-fix cache re-render).
@@ -8431,8 +8450,8 @@ function renderEOSWash(data){
         ${accRow('IB Shift Plan',ibPlan,ibActVol)}
         ${accRow('IB CPLH',ibCplh,ibActCplhSync,2)}
         <tr><td colspan="4" style="height:6px;background:#888;"></td></tr>
-        ${accRow('OB Shift LP BB',eosLpTargetDA,daActVol)}
-        ${accRow('DA Shift Plan',daPlan,daActVol)}
+        ${accRow('OB Shift LP BB',eosLpTargetDA,daLoadedVol)}
+        ${accRow('DA Shift Plan',daPlan,daLoadedVol)}
         ${accRow('DA CPLH',daCplh,daActCplh,2)}
         </tbody></table>
         <div style="font-size:10px;color:#888;margin-top:6px;">Plan values are read from the Sync tab targets.</div>
@@ -8722,6 +8741,9 @@ function sbFlattenControlsForCapture(capMap,cloneRoot){
             if(tag==='INPUT'&&!SB_CAPTURE_TEXT_TYPES.has(String(src.getAttribute('type')||'').toLowerCase()))return;
             const isTa=tag==='TEXTAREA';
             const box=doc.createElement(isTa?'div':'span');
+            // (15.54.0) Marker class only (no CSS matches it): lets the EOS email reflow find the
+            // flattened boxes in the clone. Has no effect on the Snip capture.
+            box.className=isTa?'sb-cap-flat sb-cap-flat-block':'sb-cap-flat';
             box.textContent=val;   // text only (never parsed as HTML); pre-wrap keeps line breaks
             const s=box.style;
             s.display=isTa?'block':'inline-block';
@@ -8751,12 +8773,194 @@ function sbFlattenControlsForCapture(capMap,cloneRoot){
         }catch(e){}
     });
     // Capture never shows the edit buttons; extra PA names stack one per line under the first.
-    cloneRoot.querySelectorAll('.eos-sf-pa-btn,#eos-safety-add,#eos-safety-remove').forEach(b=>{b.style.display='none';});
+    cloneRoot.querySelectorAll('.eos-sf-pa-btn,#eos-safety-add,#eos-safety-remove').forEach(b=>{b.style.setProperty('display','none','important');});
     cloneRoot.querySelectorAll('.eos-sf-pa-item').forEach(it=>{
         it.style.display='block';
         const sp=it.firstElementChild;
         if(sp&&sp.tagName==='SPAN')sp.style.width='100%';
     });
+}
+
+// (15.53.3) EOS email image was clipped: the left-column labels lost their first characters and
+// the Bridge column was cut off on the right. Fixed by capturing with the full live viewport width
+// + scrollX/scrollY 0 so the clone iframe lays out like the board.
+// (15.54.0) Outlook readability: 15.53.3 captured the board at its full live width (often ~1800 CSS
+// px), and the <img> was capped at 1000 px, so Outlook shrank it ~45% and the text was tiny. Now
+// this runs in onclone (AFTER sbFlattenControlsForCapture) on the CLONED root only and REFLOWS it to
+// a fixed readable layout width (EOS_CAP_W CSS px incl. a PAD gutter, border-box) instead of
+// scaling: tables are width:100% / table-layout:auto, text cells (labels, Bridge, Highlights,
+// Safety) wrap, numeric cells stay on one line, cell padding is trimmed, fonts below
+// EOS_CAP_MIN_FONT are bumped up, and expanded scroll containers can no longer force a wider box.
+// Anything that STILL overflows on the right widens the root as a last resort (never clipped).
+// html2canvas 1.4.1 measures the clone root AFTER onclone, so the canvas is exactly this layout.
+// Returns the final clone size plus each top-level section's vertical span (CSS px, relative to
+// the root's top edge) so the email can split the canvas between sections.
+const EOS_CAP_W=960;          // email layout width (CSS px) incl. the gutter; = <img> width at 1:1
+const EOS_CAP_PAD=8;          // gutter on every side (CSS px)
+const EOS_CAP_SCALE=2;        // html2canvas scale (sharp text); <img> width = canvas.width / this
+const EOS_CAP_MIN_FONT=12;    // smallest font size (CSS px) in the email image
+const EOS_SLICE_MAX_H=1400;   // max CSS height per email image (split only between sections)
+const EOS_NUM_CELL_RE=/^[\s\d.,:%+\-\u2212\u2014\u2013$()x\/]*$/i;   // "numeric" cell text: keep on one line
+function sbReflowEosCaptureClone(cloneRoot,targetW,pad){
+    if(!cloneRoot)return null;
+    const win=cloneRoot.ownerDocument.defaultView||window;
+    const P=pad||0,W=Math.max(200,Math.round(targetW||EOS_CAP_W));
+    const imp=(el,p,v)=>el.style.setProperty(p,v,'important');
+    // Cells wrap BETWEEN words only: overflow-wrap:break-word does not shrink a column's min-content
+    // width (anywhere / word-break:break-word did, which split labels like "Proce|ss Path").
+    const txtWrap=(el)=>{imp(el,'white-space','normal');imp(el,'overflow-wrap','break-word');imp(el,'word-break','normal');};
+    // Root: fixed readable width, gutter, nothing clipped.
+    imp(cloneRoot,'box-sizing','border-box');imp(cloneRoot,'margin','0');imp(cloneRoot,'overflow','visible');
+    imp(cloneRoot,'max-width','none');imp(cloneRoot,'min-width','0');imp(cloneRoot,'padding',P+'px');
+    imp(cloneRoot,'width',W+'px');
+    const all=Array.from(cloneRoot.querySelectorAll('*'));
+    all.forEach(el=>{
+        try{
+            const cs=win.getComputedStyle(el);
+            // Scroll containers: show everything, but never wider than their parent.
+            if(/auto|scroll/.test(cs.overflowX)||/auto|scroll/.test(cs.overflow)){
+                imp(el,'overflow','visible');imp(el,'max-width','100%');imp(el,'min-width','0');
+            }
+            const fs=parseFloat(cs.fontSize);
+            if(fs>0&&fs<EOS_CAP_MIN_FONT)imp(el,'font-size',EOS_CAP_MIN_FONT+'px');
+        }catch(e){}
+    });
+    // Grid / flex children may shrink below their content width (Quality cards).
+    cloneRoot.querySelectorAll('.eos-quality-grid > *,.eos-q-stat > *').forEach(el=>imp(el,'min-width','0'));
+    cloneRoot.querySelectorAll('table').forEach(t=>{
+        imp(t,'width','100%');imp(t,'max-width','100%');imp(t,'min-width','0');imp(t,'table-layout','auto');
+    });
+    cloneRoot.querySelectorAll('td,th').forEach(c=>{
+        imp(c,'padding','5px 7px');imp(c,'min-width','0');imp(c,'width','auto');
+        const hasNote=!!c.querySelector('.sb-cap-flat-block,textarea,[contenteditable]');
+        const txt=(c.textContent||'').trim();
+        if(!hasNote&&c.tagName==='TD'&&EOS_NUM_CELL_RE.test(txt))imp(c,'white-space','nowrap');
+        else txtWrap(c);
+    });
+    // Bridge / last columns keep a readable note width (the board's own min-width was 240-260px).
+    cloneRoot.querySelectorAll('.eoswash-section .metrics-table td:last-child,.eoswash-section .metrics-table th:last-child').forEach(c=>imp(c,'min-width','170px'));
+    // Flattened controls (sbFlattenControlsForCapture) carried the LIVE pixel width; reflow them.
+    cloneRoot.querySelectorAll('.sb-cap-flat').forEach(b=>{
+        imp(b,'max-width','100%');imp(b,'min-width','0');
+        if(b.classList.contains('sb-cap-flat-block')){imp(b,'width','100%');imp(b,'white-space','pre-wrap');imp(b,'overflow-wrap','anywhere');imp(b,'word-break','break-word');}
+        else{imp(b,'width','auto');if(!EOS_NUM_CELL_RE.test(b.textContent||''))txtWrap(b);else imp(b,'white-space','nowrap');}
+    });
+    // Anything left of the root's content edge (negative margins / offsets) -> extra left padding.
+    const rl=cloneRoot.getBoundingClientRect().left;
+    let minLeft=rl+P;
+    all.forEach(el=>{
+        try{const r=el.getBoundingClientRect();if(r.width>0&&r.left<minLeft)minLeft=r.left;}catch(e){}
+    });
+    if(minLeft<rl+P)imp(cloneRoot,'padding-left',(P+Math.ceil(rl+P-minLeft))+'px');
+    // Last resort: anything still overflowing on the right widens the root (never clipped).
+    if(cloneRoot.scrollWidth>cloneRoot.clientWidth){
+        console.warn('[SB-EOS] capture reflow: content wider than '+W+'px ('+cloneRoot.scrollWidth+'), widening');
+        imp(cloneRoot,'width',(cloneRoot.scrollWidth+P)+'px');
+    }
+    const rr=cloneRoot.getBoundingClientRect();
+    const sections=Array.from(cloneRoot.children).filter(el=>{const r=el.getBoundingClientRect();return r.height>0;}).map(el=>{
+        const r=el.getBoundingClientRect();
+        return {top:r.top-rr.top,bottom:r.bottom-rr.top};
+    });
+    return {width:cloneRoot.offsetWidth,height:cloneRoot.offsetHeight,sections};
+}
+// (15.54.0) Split points (CSS px from the top) for the email images: greedily packs whole
+// top-level sections into images of at most maxH; a cut always falls in the gap BETWEEN two
+// sections (never through a table). A single section taller than maxH stays whole. Returns
+// [[y0,y1],...] covering 0..totalH. Outlook desktop shrinks / crops very tall inline images, and
+// separate section images keep each one at its 1:1 size.
+function sbEosSliceRanges(sections,totalH,maxH){
+    const H=Math.max(1,Math.round(totalH||0));
+    if(!sections||!sections.length||!(maxH>0)||H<=maxH)return [[0,H]];
+    const cuts=[];
+    let start=0;
+    for(let i=1;i<sections.length;i++){
+        const prev=sections[i-1],cur=sections[i];
+        if(cur.bottom-start>maxH){
+            const cut=Math.round((prev.bottom+cur.top)/2);
+            if(cut>start&&cut<H){cuts.push(cut);start=cut;}
+        }
+    }
+    const out=[];let y=0;
+    cuts.forEach(c=>{out.push([y,c]);y=c;});
+    out.push([y,H]);
+    return out;
+}
+// (15.54.0) Display size (CSS px) of an EOS email image at 1:1: CSS width = canvas px / scale
+// (= EOS_CAP_W after the reflow), height keeps the aspect ratio. max-width:100% in the <img>
+// style stays as a safety net for narrow reading panes.
+function sbEosImgDisplaySize(canvasW,canvasH,scale){
+    const sc=scale>0?scale:1;
+    return {width:Math.max(1,Math.round(canvasW/sc)),height:Math.max(1,Math.round(canvasH/sc))};
+}
+// (15.54.0) Cut the html2canvas canvas into the email images at the section gaps chosen by
+// sbEosSliceRanges. capInfo comes from sbReflowEosCaptureClone (CSS px); when it is missing (the
+// reflow failed) the whole canvas is one image. Returns [{b64,width,height}] (display CSS px).
+function sbEosSliceCanvas(canvas,capInfo,scale){
+    const sc=scale>0?scale:1;
+    const cssH=(capInfo&&capInfo.height>0)?capInfo.height:canvas.height/sc;
+    const ranges=sbEosSliceRanges(capInfo&&capInfo.sections,cssH,EOS_SLICE_MAX_H);
+    const sy=canvas.height/cssH;   // canvas px per CSS px (= scale, measured)
+    const one=(c)=>{const s=sbEosImgDisplaySize(c.width,c.height,sc);return {b64:c.toDataURL('image/png').split(',')[1],width:s.width,height:s.height};};
+    if(ranges.length<=1)return [one(canvas)];
+    const out=[];
+    ranges.forEach(([y0,y1],i)=>{
+        const p0=Math.round(y0*sy),p1=(i===ranges.length-1)?canvas.height:Math.min(canvas.height,Math.round(y1*sy));
+        if(p1-p0<=0)return;
+        const c=document.createElement('canvas');
+        c.width=canvas.width;c.height=p1-p0;
+        c.getContext('2d').drawImage(canvas,0,p0,canvas.width,p1-p0,0,0,canvas.width,p1-p0);
+        out.push(one(c));
+    });
+    return out.length?out:[one(canvas)];
+}
+// (15.54.0) The EOS .eml (multipart/related): HTML body + one inline PNG part (own Content-ID)
+// per image, the images placed one after another where the single image used to be.
+// (15.49.0) "Inbound EOS" / "Outbound EOS" section labels at the top of the body, each followed by
+// a blank line where the Inbound (Dock / Stow Area Readiness) and Outbound (Dock / Pick Area
+// Readiness) tables are pasted, then the EOS Wash text + image(s).
+function sbBuildEosEml(o){
+    const CRLF='\r\n';   // CRLF line endings are required by the .eml (RFC 822) format.
+    const stamp=o.stamp||Date.now();
+    const boundary='----=_SB_'+stamp;
+    const imgs=(o.images||[]).map((im,i)=>Object.assign({cid:'eoswash_'+stamp+'_'+(i+1),file:'EOSWash'+(o.images.length>1?'-'+(i+1):'')+'.png'},im));
+    const n=imgs.length;
+    const htmlBody=''+
+        '<html><body style="font-family:Calibri,Arial,sans-serif;font-size:11pt;">'+
+        o.site+' team,<br><br>'+
+        '<b>Inbound EOS</b><br><br><br>'+
+        '<b>Outbound EOS</b><br><br><br>'+
+        'Please see the '+o.site+' EOS Wash below.<br><br>'+
+        imgs.map((im,i)=>'<img src="cid:'+im.cid+'" width="'+im.width+'" height="'+im.height+'" alt="EOS Wash'+(n>1?' ('+(i+1)+' of '+n+')':'')+'" style="max-width:100%;height:auto;display:block;">').join('<br>')+
+        '<br><br>'+
+        'Thank you,<br></body></html>';
+    const parts=[];
+    imgs.forEach(im=>{parts.push(
+        '--'+boundary,
+        'Content-Type: image/png; name="'+im.file+'"',
+        'Content-Transfer-Encoding: base64',
+        'Content-ID: <'+im.cid+'>',
+        'Content-Disposition: inline; filename="'+im.file+'"',
+        '',
+        im.b64.replace(/(.{76})/g,'$1'+CRLF),
+        '');});
+    return [
+        'To: '+o.to,
+        ...(o.cc?['Cc: '+o.cc]:[]),   // (15.49.0) only emitted when the site has a CC list
+        'Subject: '+o.subject,
+        'X-Unsent: 1',                 // tells Outlook this is an unsent draft to open in compose
+        'Content-Type: multipart/related; boundary="'+boundary+'"',
+        '',
+        '--'+boundary,
+        'Content-Type: text/html; charset="utf-8"',
+        'Content-Transfer-Encoding: 7bit',
+        '',
+        htmlBody,
+        '',
+        ...parts,
+        '--'+boundary+'--',
+        ''
+    ].join(CRLF);
 }
 
 // Capture the EOS Wash as an image, copy it to the clipboard, and open an email addressed to
@@ -8792,58 +8996,36 @@ function emailEOSWash(){
         // in the finally below whether the capture succeeds or fails.
         let capMap=null;
         try{capMap=sbTagControlsForCapture(content);}catch(e){console.warn('[SB-EOS] capture tag failed:',e);}
+        // (15.53.3) Full-element capture: clone iframe = the full live page size (same media
+        // queries as the board), no scroll offset.
+        // (15.54.0) The cloned root is then REFLOWED to EOS_CAP_W CSS px (see
+        // sbReflowEosCaptureClone) and captured at EOS_CAP_SCALE for sharp text; the email shows
+        // each image at 1:1 CSS size, so Outlook no longer shrinks it.
+        const de=document.documentElement;
+        const liveW=Math.ceil(Math.max(content.scrollWidth,content.getBoundingClientRect().width));
+        const winW=Math.ceil(Math.max(window.innerWidth||0,de.clientWidth||0,de.scrollWidth||0,content.getBoundingClientRect().left+window.scrollX+liveW+2*EOS_CAP_PAD));
+        const winH=Math.ceil(Math.max(window.innerHeight||0,de.scrollHeight||0,content.getBoundingClientRect().top+window.scrollY+content.scrollHeight+2*EOS_CAP_PAD));
+        let capInfo=null;   // reflowed clone size + section spans (CSS px), set in onclone
         const flattenEosClone=(clonedDoc)=>{
-            try{sbFlattenControlsForCapture(capMap,clonedDoc.getElementById('eoswash-content'));}
+            const cr=clonedDoc.getElementById('eoswash-content');
+            try{sbFlattenControlsForCapture(capMap,cr);}
             catch(e){console.warn('[SB-EOS] capture flatten failed:',e);}
+            try{capInfo=sbReflowEosCaptureClone(cr,EOS_CAP_W,EOS_CAP_PAD);}
+            catch(e){console.warn('[SB-EOS] capture reflow failed:',e);}
         };
         let capPromise;
-        try{capPromise=html2canvas(content,{backgroundColor:isDark?'#1a1a2e':'#ffffff',scale:1,useCORS:true,logging:false,windowWidth:content.scrollWidth,windowHeight:content.scrollHeight,onclone:flattenEosClone});}
+        try{capPromise=html2canvas(content,{backgroundColor:isDark?'#1a1a2e':'#ffffff',scale:EOS_CAP_SCALE,useCORS:true,logging:false,scrollX:0,scrollY:0,windowWidth:winW,windowHeight:winH,onclone:flattenEosClone});}
         catch(e){capPromise=Promise.reject(e);}
         capPromise.finally(()=>sbUntagControlsForCapture(capMap)).then(canvas=>{
             // Build an .eml file (standard email format) with the EOS Wash image embedded inline
             // in the HTML body. Opening the .eml launches the DESKTOP Outlook app with a new
             // message already addressed, subjected, and containing the image — ready to send.
-            const dataUrl=canvas.toDataURL('image/png');
-            const b64=dataUrl.split(',')[1];
-            const cid='eoswash_'+Date.now();
-            const boundary='----=_SB_'+Date.now();
-            // (15.49.0) "Inbound EOS" / "Outbound EOS" section labels at the top of the body, each
-            // followed by a blank line where the Inbound (Dock / Stow Area Readiness) and Outbound
-            // (Dock / Pick Area Readiness) tables are pasted, then the EOS Wash text + image.
-            const htmlBody=''+
-                '<html><body style="font-family:Calibri,Arial,sans-serif;font-size:11pt;">'+
-                site+' team,<br><br>'+
-                '<b>Inbound EOS</b><br><br><br>'+
-                '<b>Outbound EOS</b><br><br><br>'+
-                'Please see the '+site+' EOS Wash below.<br><br>'+
-                '<img src="cid:'+cid+'" style="max-width:100%;"><br><br>'+
-                'Thank you,<br></body></html>';
-            // CRLF line endings are required by the .eml (RFC 822) format.
-            const CRLF='\r\n';
-            const eml=[
-                'To: '+to,
-                ...(cc?['Cc: '+cc]:[]),       // (15.49.0) only emitted when the site has a CC list
-                'Subject: '+subject,
-                'X-Unsent: 1',                 // tells Outlook this is an unsent draft to open in compose
-                'Content-Type: multipart/related; boundary="'+boundary+'"',
-                '',
-                '--'+boundary,
-                'Content-Type: text/html; charset="utf-8"',
-                'Content-Transfer-Encoding: 7bit',
-                '',
-                htmlBody,
-                '',
-                '--'+boundary,
-                'Content-Type: image/png; name="EOSWash.png"',
-                'Content-Transfer-Encoding: base64',
-                'Content-ID: <'+cid+'>',
-                'Content-Disposition: inline; filename="EOSWash.png"',
-                '',
-                b64.replace(/(.{76})/g,'$1'+CRLF),
-                '',
-                '--'+boundary+'--',
-                ''
-            ].join(CRLF);
+            // (15.54.0) One canvas, split between sections into images of at most EOS_SLICE_MAX_H
+            // CSS px (see sbEosSliceRanges), each shown at 1:1 CSS size (width = canvas.width /
+            // EOS_CAP_SCALE = EOS_CAP_W). Outlook desktop honours the width/height attributes;
+            // other clients use max-width:100% + height:auto. The PNGs keep the 2x resolution.
+            const images=sbEosSliceCanvas(canvas,capInfo,EOS_CAP_SCALE);
+            const eml=sbBuildEosEml({to,cc,subject,site,images,stamp:Date.now()});
             const blob=new Blob([eml],{type:'message/rfc822'});
             const url=URL.createObjectURL(blob);
             const a=document.createElement('a');
