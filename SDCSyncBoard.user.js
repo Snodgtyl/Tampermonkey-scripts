@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.54.0
+// @version      15.54.5
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -193,7 +193,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.54.0';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.54.5';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -295,13 +295,15 @@ function applyUpdateStatus(behind,remote){
         // Header badge
         const badge=document.getElementById('sb-ver-badge');
         if(badge){
-            if(behind){badge.textContent='v'+SB_VERSION+' \u2191 update to v'+remote;badge.style.color='#e65100';badge.style.fontWeight='800';badge.title='This board is behind. Latest is v'+remote+'. It should auto-update within ~24h; if not, reinstall from GitHub.';}
+            // (15.54.3) the new version is a clickable link to the raw .user.js -> Tampermonkey opens its
+            // install/update page. `remote` is digits/dots only (regex above), so safe to put in HTML.
+            if(behind){badge.innerHTML='v'+SB_VERSION+' \u2191 update to <a href="'+SB_RAW_URL+'" target="_blank" rel="noopener noreferrer" style="color:#e65100;text-decoration:underline;font-weight:800;" title="Click to install v'+remote+'">v'+remote+'</a>';badge.style.color='#e65100';badge.style.fontWeight='800';badge.title='This board is behind. Latest is v'+remote+'. Click the version to update now.';}
             else{badge.textContent='v'+SB_VERSION;badge.style.color='#888';badge.title='Up to date (latest on GitHub is v'+remote+').';}
         }
         // Settings note
         const note=document.getElementById('sb-update-note');
         if(note){
-            if(behind){note.innerHTML='\u26A0\uFE0F Running <strong>v'+SB_VERSION+'</strong> \u2014 latest is <strong>v'+remote+'</strong>. Auto-update should catch within ~24h. If it doesn\u2019t, reinstall from GitHub.';note.style.color='#c62828';}
+            if(behind){note.innerHTML='\u26A0\uFE0F Running <strong>v'+SB_VERSION+'</strong> \u2014 latest is <a href="'+SB_RAW_URL+'" target="_blank" rel="noopener noreferrer" style="color:#c62828;font-weight:700;text-decoration:underline;">v'+remote+' (click to update)</a>.';note.style.color='#c62828';}
             else{note.innerHTML='\u2713 Up to date (v'+SB_VERSION+', latest on GitHub v'+remote+').';note.style.color='#2e7d32';}
         }
         // Once-per-day Slack ping when behind, so the creator sees stale boards in the usage channel.
@@ -391,6 +393,12 @@ function saveFastStartSnapshot(moment){
     const goal=parseInt(document.getElementById('fs-goal-time')?.value,10)||20;
     if(!fsLastResults||!fsLastResults.length){
         fsShowStatus('\u26A0 Run Fast Start first \u2014 nothing to save for '+moment,'error');
+        return;
+    }
+    // Don't label one window's numbers as the other (e.g. SOS results saved as "1st Break").
+    const need=moment==='1st Break'?'Break1':'SOS';
+    if(fsLastWindow&&fsLastWindow!==need){
+        fsShowStatus('\u26A0 Last run was '+(fsLastWindow==='Break1'?'After Break 1':'SOS')+' \u2014 set WINDOW to '+(need==='Break1'?'After Break 1':'SOS')+' and Run Fast Start before saving '+moment,'error');
         return;
     }
     const snap=fastStartSnapshot(moment,site,goal);
@@ -3891,31 +3899,47 @@ function attemptLPFetch(site,resolve,isRetry){
                     fetchLPPageAuto(planId,'IB',sundayStr,'key','IB Total CPLH',(v)=>{results.ibCplh=v;done++;checkDone();});
                     fetchLPPageAuto(planId,'DA',sundayStr,'key','DA Bldg to Bldg Total - CPLH',(v)=>{results.obCplh=v;done++;checkDone();});
                     fetchLPPageAuto(planId,'DeratedRates',sundayStr,'lineItem','Total Building CPLH Inc Support',(v,allRows)=>{
-                        const deratedSite=v;
+                        const deratedLoose=v;   // fetchLPPageAuto's loose (includes) match, last resort only
                         // (15.52.0) CTI rate is no longer taken from DeratedRates here (that is the DILUTED
                         // "Diluted Rates by Path" view, e.g. 47.9). It is settled by settleCti below from the
                         // UNDILUTED "Undiluted Rates by Path" rows (UnderatedRatesAndHours), DeratedRates last.
-                        // (15.46.1, user request) SITE CPLH must come from the UNDILUTED rates (the value the
-                        // S&OP WoW page shows, e.g. 19.6), NOT DeratedRates (diluted, e.g. 18.96). Chain:
-                        // UnderatedRatesAndHours -> S&OP WoW page -> DeratedRates (last resort, warned).
+                        // (15.54.2, user request; reverses 15.46.1) SITE CPLH comes from the DILUTED rates by
+                        // plan: GalaxyBI "Diluted Rates by Path" (= DeratedRates page) line item
+                        // "121. Total Building CPLH Inc Support" (numeric prefix stripped), Forecast, this
+                        // week's Sunday, e.g. 20.3 (NOT "119. ... Exc Support" 24.4). Chain:
+                        // DeratedRates Cartons -> DeratedRates Units -> undiluted chain (UnderatedRatesAndHours
+                        // -> S&OP WoW page) -> DeratedRates loose match (all fallbacks warned).
+                        const SITE_ITEM='Total Building CPLH Inc Support';
                         const finish=(val,src)=>{
                             results.siteCplh=val;
-                            if(src==='DeratedRates')console.warn('[SB-LP] Site CPLH: undiluted source not found \u2014 using DeratedRates (diluted) '+val);
-                            else dbg('[SB-LP] Site CPLH from '+src+' = '+val+' (derated was '+deratedSite+')');
-                            dbg('[SB-LP] DeratedRates final: SiteCPLH='+results.siteCplh);
+                            dbg('[SB-LP RATE] Site CPLH => '+val+' (src '+src+')');
                             done++;checkDone();   // (15.52.0) CTI now counts its own `done` in settleCti
                         };
+                        const drSite=sbWowSiteRows(allRows,loadConfig().site);
+                        const dc=sbPickUndilRate(drSite,SITE_ITEM,'Cartons',sundayStr);
+                        if(dc>0){finish(dc,'DeratedRates '+SITE_ITEM+', Cartons, Forecast '+sundayStr);return;}
+                        const du=sbPickUndilRate(drSite,SITE_ITEM,'Units',sundayStr);
+                        if(du>0){
+                            console.warn('[SB-LP RATE] Site CPLH: no DeratedRates Cartons Forecast row \u2014 using DeratedRates Units '+du);
+                            finish(du,'DeratedRates '+SITE_ITEM+', Units, Forecast '+sundayStr);return;
+                        }
+                        console.warn('[SB-LP RATE] Site CPLH: "'+SITE_ITEM+'" not in DeratedRates (diluted) \u2014 falling back to the undiluted chain');
+                        const lastResort=()=>{
+                            console.warn('[SB-LP RATE] Site CPLH: undiluted chain empty \u2014 using DeratedRates loose match '+deratedLoose);
+                            finish(deratedLoose,'DeratedRates loose match');
+                        };
                         try{
-                            fetchLPPageAuto(planId,'UnderatedRatesAndHours',sundayStr,'lineItem','Total Building CPLH Inc Support',(u)=>{
-                                if(u>0){finish(u,'UnderatedRatesAndHours');return;}
+                            fetchLPPageAuto(planId,'UnderatedRatesAndHours',sundayStr,'lineItem',SITE_ITEM,(u)=>{
+                                if(u>0){console.warn('[SB-LP RATE] Site CPLH: using UnderatedRatesAndHours (undiluted) '+u);finish(u,'UnderatedRatesAndHours (undiluted fallback)');return;}
                                 try{
                                     // '&' must be URL-encoded inside the pageName query value.
-                                    fetchLPPageAuto(planId,'S%26OPWoW-Page',sundayStr,'lineItem','Total Building CPLH Inc Support',(w)=>{
-                                        if(w>0)finish(w,'S&OPWoW-Page');else finish(deratedSite,'DeratedRates');
+                                    fetchLPPageAuto(planId,'S%26OPWoW-Page',sundayStr,'lineItem',SITE_ITEM,(w)=>{
+                                        if(w>0){console.warn('[SB-LP RATE] Site CPLH: using S&OPWoW-Page (undiluted) '+w);finish(w,'S&OPWoW-Page (undiluted fallback)');}
+                                        else lastResort();
                                     });
-                                }catch(e2){finish(deratedSite,'DeratedRates');}
+                                }catch(e2){lastResort();}
                             });
-                        }catch(e1){finish(deratedSite,'DeratedRates');}
+                        }catch(e1){lastResort();}
                     });
                     // Row helpers for the CTI/TOP rates (15.52.0: Undiluted Rates by Path first, see below) and the
                     // per-path rates (15.48.0: S&OPWoW-Page diluted -> UnderatedRatesAndHours, see below).
@@ -4103,6 +4127,8 @@ function sbPickWowDilutedRate(rows,item,sundayStr){
 // numeric display prefix ("1. ", "27. ") and normalizing; packType blank = Units (GalaxyBI's own
 // pivot selector does `packType || "Units"`); type must be Forecast; date must be this week's Sunday.
 // prefixMatch=true matches any line item that STARTS with `item` (last-resort TOP fallback only).
+// (15.54.2) Same long-row shape on DeratedRates ("Diluted Rates by Path"), so this is also the
+// Site CPLH picker ("121. Total Building CPLH Inc Support", Cartons then Units).
 // Returns the first value > 0, else 0. Function declaration => hoisted, no TDZ.
 function sbPickUndilRate(rows,item,packType,sundayStr,prefixMatch){
     const want=sbWowNorm(String(item||'').replace(/^\d+\.\s*/,''));
@@ -5359,7 +5385,7 @@ function buildHTML(){return `
 <main id="tab-sync" class="tab-content active">
 <div class="targets-panel targets-panel-top"><h3 class="panel-title" style="display:flex;justify-content:space-between;align-items:center;">
 <span style="display:inline-flex;gap:0;"><button id="btn-view-targets" class="btn btn-small day-toggle active" style="border-radius:4px 0 0 4px;">Shift Plan Targets</button><button id="btn-view-current" class="btn btn-small day-toggle" style="border-radius:0;">Current Day</button><button id="btn-view-prior" class="btn btn-small day-toggle" style="border-radius:0 4px 4px 0;">Prior Day</button></span>
-<button id="btn-clear-targets" class="btn btn-small btn-danger">Clear</button></h3>
+</h3>
 <div id="spt-targets-view">
 <div class="target-groups-row">
 <div class="tg-compact"><h4>INBOUND</h4><table class="target-table"><thead><tr><th></th><th>Target</th><th>%</th></tr></thead><tbody>
@@ -5395,10 +5421,12 @@ function buildHTML(){return `
 <tr class="lp-row"><td>TOTAL</td><td><span id="sort-vol-total" class="lp-val">\u2014</span></td><td><span id="sort-rate-blended-tgt" class="lp-val">\u2014</span></td></tr>
 <input type="hidden" id="sort-goal"><input type="hidden" id="sort-rate-target">
 </tbody></table></div>
-<div class="sort-tgt" style="margin-top:6px;padding-top:6px;border-top:2px solid #000;"><h4 style="color:#333;">SITE</h4><table class="target-table"><tbody>
+<div class="sort-tgt" style="margin-top:6px;padding-top:6px;border-top:2px solid #000;display:flex;flex-direction:column;"><h4 style="color:#333;">SITE</h4><table class="target-table"><tbody>
 <tr><td>SITE CPLH TARGET</td><td><input type="number" id="site-cplh-target" class="target-input" step="0.01"></td><td><span id="site-cplh-pct">\u2014</span></td></tr>
 <tr class="lp-row"><td>THROUGHPUT LP CPLH</td><td><span id="spt-site-lp-cplh" class="lp-val">\u2014</span></td><td></td></tr>
-</tbody></table></div>
+</tbody></table>
+<!-- (15.54.4) Clear moved from the panel header to the bottom-right of the targets section -->
+<div style="margin-top:auto;padding-top:10px;display:flex;justify-content:flex-end;"><button id="btn-clear-targets" class="btn btn-small btn-danger" title="Clear all shift plan targets">Clear</button></div></div>
 </div><!-- /spt-targets-view -->
 
 <div id="spt-current-view" style="display:none;">
@@ -5687,6 +5715,7 @@ function buildHTML(){return `
 <div class="fs-controls" style="display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;background:#fff;border:2px solid #000;border-radius:4px;padding:10px 14px;margin-bottom:10px;">
 <div><label style="display:block;font-size:11px;font-weight:700;margin-bottom:4px;">SITE</label><select id="fs-site" class="select-input"></select></div>
 <div><label style="display:block;font-size:11px;font-weight:700;margin-bottom:4px;">SHIFT START (DATE / TIME)</label><input type="datetime-local" id="fs-start-datetime" class="select-input" style="width:210px;"></div>
+<div><label for="fs-window" style="display:block;font-size:11px;font-weight:700;margin-bottom:4px;">WINDOW</label><select id="fs-window" class="select-input" title="SOS = from shift start. After Break 1 = from the end of 1st break (from the site schedule), using the same shift start date."><option value="SOS">SOS</option><option value="Break1">After Break 1</option></select></div>
 <div><label style="display:block;font-size:11px;font-weight:700;margin-bottom:4px;">GOAL (MIN)</label><input type="number" id="fs-goal-time" class="target-input" value="20" min="1" max="60" style="width:80px;"></div>
 <div><label style="display:flex;align-items:center;gap:6px;font-size:12px;font-weight:600;cursor:pointer;margin-bottom:2px;"><input type="checkbox" id="fs-remove-nonfc" checked style="width:15px;height:15px;">Remove NonFC</label></div>
 <button id="btn-fetch-faststart" class="btn btn-primary">\u25B6 Run Fast Start</button>
@@ -7942,8 +7971,8 @@ function renderEOSWash(data){
     if(!(daCplh>0)){const v=parseFloat(lpVals.obCplh)||0;if(v>0)daCplh=v;}
     let ctiLpRate=parseFloat(lpVals.ctiRate)||0;
     let topLpRate=parseFloat(lpVals.topRate)||0;
-    // CHANGE 3: cached LP SITE CPLH target (DeratedRates "Total Building CPLH Inc Support",
-    // e.g. 19.56). Used by throughputRow via closure as the "% to LP" basis — the SAME target
+    // CHANGE 3: cached LP SITE CPLH target (15.54.2: DeratedRates = Diluted Rates by Path,
+    // "121. Total Building CPLH Inc Support", Cartons, Forecast, e.g. 20.3). Used by throughputRow via closure as the "% to LP" basis — the SAME target
     // the Sync tab uses, NOT the PPR THROUGHPUT ratioToPlan.
     const siteLpCplh=parseFloat((loadLPValues()||{}).siteCplh)||0;
     // display-text fallback if the cached numeric is missing/zero
@@ -8248,7 +8277,7 @@ function renderEOSWash(data){
         // #site-cplh-value, only if syncCplh.site is unavailable (pre-fix cache re-render).
         let rate=(syncCplh&&syncCplh.site>0)?syncCplh.site:(tHrs>0?vol/tHrs:0);
         if(!(rate>0)){const sv=parseFloat(document.getElementById('site-cplh-value')?.textContent);if(sv>0)rate=sv;}
-        // % to LP against the cached LP SITE CPLH target (e.g. 19.56), NOT the PPR ratio.
+        // % to LP against the cached LP SITE CPLH target (diluted, e.g. 20.3), NOT the PPR ratio.
         const pct=(siteLpCplh>0&&rate>0)?(rate/siteLpCplh)*100:0;
         // Hours Variance (owner spec) = Formula A on the COMBINED IB+OB LP shift-plan volume vs the
         // site LP CPLH, minus actual throughput hours: (IB_LP + OB_LP)/siteLpCplh - tHrs.
@@ -8439,6 +8468,11 @@ function renderEOSWash(data){
     const daActCplh=(syncCplh&&syncCplh.da>0)?syncCplh.da:(daActHrs>0?daActVol/daActHrs:0);
     // IB CPLH actual: same treatment for consistency with the Sync tab.
     const ibActCplhSync=(syncCplh&&syncCplh.ib>0)?syncCplh.ib:ibActCplh;
+    // (15.54.5) Site CPLH row. Plan = Sync tab SITE CPLH TARGET input, falling back to the LP site
+    // CPLH (diluted "Total Building CPLH Inc Support"). Actual = Sync-consistent site CPLH
+    // (throughput vol / throughput hrs), falling back to the Sync tab's rendered value.
+    const siteCplhPlan=gv('site-cplh-target')||siteLpCplh||0;
+    const siteActCplh=(syncCplh&&syncCplh.site>0)?syncCplh.site:(parseFloat(document.getElementById('site-cplh-value')?.textContent)||0);
     const accRow=(label,plan,act,dec=0,pctHigh=true)=>{
         const varc=(plan&&act)?((pctHigh?act/plan:plan/act)*100):0;
         return `<tr><td>${label}</td><td>${plan?fv(plan,dec):'\u2014'}</td><td>${act?fv(act,dec):'\u2014'}</td><td style="${bg(varc)}">${varc>0?varc.toFixed(1)+'%':'\u2014'}</td></tr>`;
@@ -8453,6 +8487,8 @@ function renderEOSWash(data){
         ${accRow('OB Shift LP BB',eosLpTargetDA,daLoadedVol)}
         ${accRow('DA Shift Plan',daPlan,daLoadedVol)}
         ${accRow('DA CPLH',daCplh,daActCplh,2)}
+        <tr><td colspan="4" style="height:6px;background:#888;"></td></tr>
+        ${accRow('Site CPLH',siteCplhPlan,siteActCplh,2)}
         </tbody></table>
         <div style="font-size:10px;color:#888;margin-top:6px;">Plan values are read from the Sync tab targets.</div>
     </section>`;
@@ -9806,6 +9842,7 @@ function showReminderBanner(title,body,severity){
 const FS_GOAL_KEY='syncboard_fs_goal';
 const FS_DT_KEY='syncboard_fs_datetime';
 const FS_NONFC_KEY='syncboard_fs_nonfc';
+const FS_WINDOW_KEY='syncboard_fs_window';
 // Window shape: search opens FS_LOOKBACK_MIN before shift start and runs FS_FORWARD_MIN after.
 // Per-associate cap: minutes-to-first over FS_CAP_MIN means the AA isn't part of fast start.
 const FS_LOOKBACK_MIN=40, FS_FORWARD_MIN=60, FS_CAP_MIN=60;
@@ -9815,6 +9852,34 @@ const FS_ACTION_MAP={CaseStowed:'CaseStow',PalletTransferred:'PalletTransIn',Ite
 // Tie-break when two processes share the identical first-scan timestamp.
 const FS_TIE_BREAK=['CaseStow','Pick'];
 let fsLastResults=[];   // kept so a target/goal change can re-render without re-fetching
+let fsLastWindow='';    // 'SOS' | 'Break1' — which window fsLastResults came from
+let fsCurWin='SOS';     // window label for the [SB-FS] debug lines of the run in progress
+
+// Pick the site's Days or Nights schedule whose P1 (SOS) start is nearest the entered shift
+// start (circular, so 18:15 matches Nights even if the board config is set to Days).
+function fsPickSchedule(site,sosDate){
+    const s=SITE_SCHEDULES[site]||(()=>{const c=loadConfig();return{days:c.days,nights:c.nights};})();
+    const m=sosDate.getHours()*60+sosDate.getMinutes();
+    const dist=(p)=>{const d=Math.abs(m-(p.sh*60+p.sm))%1440;return Math.min(d,1440-d);};
+    return dist(s.nights.p1)<dist(s.days.p1)?{type:'Nights',sched:s.nights}:{type:'Days',sched:s.days};
+}
+// Pure window math. SOS: [sos-LOOKBACK, sos+FORWARD], anchor = sos.
+// Break1: break = p1 end -> p2 start, placed relative to the entered SOS by minute offsets
+// (mod 24h), so night shifts that cross midnight roll to the next calendar day correctly.
+// Search opens at max(breakStart, breakEnd-LOOKBACK) — never before the break, so pre-break
+// scans can't be picked up — and runs FORWARD min past break end (same duration as SOS).
+function fsComputeWindow(sosDate,sched,which){
+    const MIN=60*1000;
+    if(which!=='Break1'){
+        return{which:'SOS',anchor:sosDate,searchStart:new Date(sosDate.getTime()-FS_LOOKBACK_MIN*MIN),searchEnd:new Date(sosDate.getTime()+FS_FORWARD_MIN*MIN)};
+    }
+    const p1=sched.p1,p2=sched.p2,base=p1.sh*60+p1.sm;
+    const off=(h,m)=>(((h*60+m)-base)%1440+1440)%1440;
+    const breakStart=new Date(sosDate.getTime()+off(p1.eh,p1.em)*MIN);
+    const breakEnd=new Date(sosDate.getTime()+off(p2.sh,p2.sm)*MIN);
+    const searchStart=new Date(Math.max(breakStart.getTime(),breakEnd.getTime()-FS_LOOKBACK_MIN*MIN));
+    return{which:'Break1',breakStart,breakEnd,anchor:breakEnd,searchStart,searchEnd:new Date(breakEnd.getTime()+FS_FORWARD_MIN*MIN)};
+}
 
 function fsShowStatus(msg,type){
     const el=document.getElementById('faststart-status');
@@ -9868,14 +9933,18 @@ function fsFetchAttendance(site,startDate,endDate){
         reportFormat:'CSV',warehouseId:site,startDateDay:fmtDate(startDate),maxIntradayDays:'30',spanType:'Intraday',
         startDateIntraday:fmtDate(startDate),startHourIntraday:startDate.getHours(),startMinuteIntraday:startDate.getMinutes(),
         endDateIntraday:fmtDate(endDate),endHourIntraday:endDate.getHours(),endMinuteIntraday:endDate.getMinutes()});
-    return fsFetchCSV(url);
+    return fsFetchCSV(url).then(data=>{fsLogFetch(startDate,endDate,url,data);return data;});
+}
+// [SB-FS] debug line per report fetch (only with syncboard_debug=1).
+function fsLogFetch(startDate,endDate,url,data){
+    dbg('[SB-FS] window='+fsCurWin+' start='+startDate.toISOString()+' end='+endDate.toISOString()+' url='+url+' rows='+(data?data.length:0));
 }
 function fsFetchProcess(site,processId,startDate,endDate,processName){
     const url=fsBuildURL('https://fclm-portal.amazon.com/reports/functionRollup',{
         reportFormat:'CSV',warehouseId:site,processId,maxIntradayDays:'1',spanType:'Intraday',
         startDateIntraday:fmtDate(startDate),startHourIntraday:startDate.getHours(),startMinuteIntraday:startDate.getMinutes(),
         endDateIntraday:fmtDate(endDate),endHourIntraday:endDate.getHours(),endMinuteIntraday:endDate.getMinutes()});
-    return fsFetchCSV(url).then(data=>({processName,data}));
+    return fsFetchCSV(url).then(data=>{fsLogFetch(startDate,endDate,url,data);return{processName,data};});
 }
 function fsFetchActivity(site,employeeId,startDate,endDate){
     const url=fsBuildURL('https://fclm-portal.amazon.com/employee/activityDetails',{
@@ -9885,11 +9954,15 @@ function fsFetchActivity(site,employeeId,startDate,endDate){
     return fsFetchCSV(url);
 }
 // Earliest qualifying scan per process, as { process: {time} }.
-function fsFirstActivityByProcess(activityData){
+// minTime (optional, ms): ignore scans before it (After Break 1 = break start, so pre-break
+// scans never count as the first post-break activity).
+function fsFirstActivityByProcess(activityData,minTime){
     const earliest={};
+    const clean=(s)=>String(s).replace(/\s+(EST|EDT|PST|PDT|CST|CDT|MST|MDT)$/i,'');
     activityData.forEach(row=>{
         const action=row['Job Action']||row['Action']||row['action'];
         const time=row['Event Date/Time']||row['Action Time']||row['ActionTime']||row['Time'];
+        if(minTime!=null&&time&&new Date(clean(time)).getTime()<minTime)return;
         if(FS_ACTION_MAP[action]&&time){
             const p=FS_ACTION_MAP[action];
             if(!earliest[p]||new Date(time)<new Date(earliest[p].time))earliest[p]={time,process:p};
@@ -9910,7 +9983,12 @@ function fsComputeMetrics(times,goal){
     return{count:n,avg,tp90,overGoal,minutesLost};
 }
 // Resolve all associates: roster -> punch-in -> first activity -> minutes-to-first row.
-async function fsProcessEmployees(attendance,processDataArray,site,startDate,endDate,attStartDate,removeNonFC){
+// win (optional) = fsComputeWindow() result. For win.which==='Break1': only "In" punches inside
+// the search window count (the return-from-meal punch); AAs with no punch (paid break) are
+// measured from break end; scans before the search start are ignored.
+async function fsProcessEmployees(attendance,processDataArray,site,startDate,endDate,attStartDate,removeNonFC,win){
+    const isBreak=!!(win&&win.which==='Break1');
+    const tzClean=(s)=>String(s).replace(/\s+(EST|EDT|PST|PDT|CST|CDT|MST|MDT)$/i,'');
     const employees=new Map();
     const nonFC=new Set();
     if(removeNonFC){
@@ -9938,6 +10016,7 @@ async function fsProcessEmployees(attendance,processDataArray,site,startDate,end
         const type=row['Punch Type']||row['PunchType']||row['Type'];
         const time=row['Punch Time']||row['PunchTime']||row['Time'];
         if(type!=='In'||!time||fsIsAnonymous(nm,id))return;
+        if(isBreak){const t=new Date(tzClean(time)).getTime();if(!(t>=win.searchStart.getTime()&&t<=win.searchEnd.getTime()))return;}
         const key=id?String(id).trim():'';
         const emp=key&&employees.get(key);
         if(!emp||emp.punchIn)return;
@@ -9946,11 +10025,19 @@ async function fsProcessEmployees(attendance,processDataArray,site,startDate,end
     const rows=[];
     let processed=0,total=employees.size;
     for(const [empId,emp] of employees){
-        if(emp.nonFC||!emp.punchIn){processed++;continue;}
+        if(emp.nonFC){processed++;continue;}
+        // After Break 1 with no return punch (paid break): measure from scheduled break end.
+        let refBreakEnd=false;
+        if(!emp.punchIn){
+            if(!isBreak){processed++;continue;}
+            const a=win.anchor,p2=(x)=>String(x).padStart(2,'0');
+            emp.punchIn=fmtDate(a)+' '+p2(a.getHours())+':'+p2(a.getMinutes())+':00';
+            refBreakEnd=true;
+        }
         let activity;
         try{activity=await fsFetchActivity(site,empId,attStartDate,endDate);}
         catch(e){processed++;continue;}
-        const byProcess=fsFirstActivityByProcess(activity);
+        const byProcess=fsFirstActivityByProcess(activity,isBreak?win.searchStart.getTime():undefined);
         let winner=null;
         Object.keys(byProcess).forEach(p=>{
             const rank=FS_TIE_BREAK.indexOf(p)===-1?FS_TIE_BREAK.length:FS_TIE_BREAK.indexOf(p);
@@ -9961,8 +10048,10 @@ async function fsProcessEmployees(attendance,processDataArray,site,startDate,end
             const clean=(s)=>s.replace(/\s+(EST|EDT|PST|PDT|CST|CDT|MST|MDT)$/i,'');
             const punch=new Date(clean(emp.punchIn));
             const act=new Date(clean(winner.time));
-            const minutesToFirst=Math.round((act-punch)/60000);
-            rows.push({employeeId:empId,name:emp.name,punchIn:emp.punchIn,firstActivity:winner.time,process:winner.process,minutesToFirst});
+            let minutesToFirst=Math.round((act-punch)/60000);
+            // Back scanning before scheduled break end with no punch = started on time (0).
+            if(refBreakEnd&&minutesToFirst<0)minutesToFirst=0;
+            rows.push({employeeId:empId,name:emp.name,punchIn:emp.punchIn,firstActivity:winner.time,process:winner.process,minutesToFirst,refBreakEnd});
         }
         processed++;
         if(processed%10===0||processed===total)fsShowStatus('Processing associates '+processed+'/'+total+'\u2026','info');
@@ -9977,18 +10066,27 @@ async function fetchFastStartData(){
     const dt=document.getElementById('fs-start-datetime').value;
     const goal=parseInt(document.getElementById('fs-goal-time').value,10)||20;
     const removeNonFC=document.getElementById('fs-remove-nonfc').checked;
+    const which=(document.getElementById('fs-window')?.value)==='Break1'?'Break1':'SOS';
     const btn=document.getElementById('btn-fetch-faststart');
     const content=document.getElementById('faststart-content');
     if(!site){fsShowStatus('Select a site','error');return;}
     if(!dt){fsShowStatus('Enter a shift start date/time','error');return;}
     // Persist inputs
-    try{localStorage.setItem(FS_GOAL_KEY,String(goal));localStorage.setItem(FS_DT_KEY,dt);localStorage.setItem(FS_NONFC_KEY,removeNonFC?'1':'0');}catch(e){}
-    const startDate=new Date(dt);
-    const endDate=new Date(startDate.getTime()+FS_FORWARD_MIN*60*1000);
-    const attStartDate=new Date(startDate.getTime()-FS_LOOKBACK_MIN*60*1000);
+    try{localStorage.setItem(FS_GOAL_KEY,String(goal));localStorage.setItem(FS_DT_KEY,dt);localStorage.setItem(FS_NONFC_KEY,removeNonFC?'1':'0');localStorage.setItem(FS_WINDOW_KEY,which);}catch(e){}
+    const sosDate=new Date(dt);
+    const pick=fsPickSchedule(site,sosDate);
+    const win=fsComputeWindow(sosDate,pick.sched,which);
+    fsCurWin=win.which;
+    // startDate = the anchor minutes are measured from; attStartDate..endDate = search window.
+    const startDate=win.anchor;
+    const endDate=win.searchEnd;
+    const attStartDate=win.searchStart;
     const hhmm=(d)=>String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
+    dbg('[SB-FS] window='+win.which+' shift='+pick.type+' sos='+sosDate.toISOString()+(win.breakStart?' breakStart='+win.breakStart.toISOString()+' breakEnd='+win.breakEnd.toISOString():'')+' start='+attStartDate.toISOString()+' end='+endDate.toISOString());
     const note=document.getElementById('fs-window-note');
-    if(note)note.innerHTML='<b>'+site+'</b> \u00b7 shift start <b>'+hhmm(startDate)+'</b> \u00b7 searching <b>'+hhmm(attStartDate)+' \u2013 '+hhmm(endDate)+'</b> ('+FS_LOOKBACK_MIN+' min before \u2192 '+FS_FORWARD_MIN+' min after) \u00b7 goal '+goal+' min';
+    if(note)note.innerHTML=win.which==='Break1'
+        ?'<b>'+site+'</b> \u00b7 <b>After Break 1</b> ('+pick.type+') \u00b7 break <b>'+hhmm(win.breakStart)+' \u2013 '+hhmm(win.breakEnd)+'</b> \u00b7 searching <b>'+fmtDate(attStartDate)+' '+hhmm(attStartDate)+' \u2013 '+hhmm(endDate)+'</b> (break end \u2192 '+FS_FORWARD_MIN+' min after; no return punch = timed from break end) \u00b7 goal '+goal+' min'
+        :'<b>'+site+'</b> \u00b7 shift start <b>'+hhmm(startDate)+'</b> \u00b7 searching <b>'+hhmm(attStartDate)+' \u2013 '+hhmm(endDate)+'</b> ('+FS_LOOKBACK_MIN+' min before \u2192 '+FS_FORWARD_MIN+' min after) \u00b7 goal '+goal+' min';
     if(btn){btn.disabled=true;btn.textContent='\u23F3 Running...';}
     if(content)content.innerHTML='<div style="padding:20px;font-size:14px;">\u23F3 Querying Fast Start data\u2026 this can take a minute.</div>';
     fsShowStatus('Querying data\u2026','info');
@@ -9999,10 +10097,12 @@ async function fetchFastStartData(){
             fsFetchAttendance(site,attStartDate,endDate),
             ...Object.entries(uniqueProcesses).map(([id,name])=>fsFetchProcess(site,id,attStartDate,endDate,name))
         ]);
-        const results=await fsProcessEmployees(attendance,processData,site,startDate,endDate,attStartDate,removeNonFC);
+        const results=await fsProcessEmployees(attendance,processData,site,startDate,endDate,attStartDate,removeNonFC,win);
+        dbg('[SB-FS] window='+win.which+' start='+attStartDate.toISOString()+' end='+endDate.toISOString()+' url=(per-AA activityDetails) rows='+results.length);
         fsLastResults=results;
+        fsLastWindow=win.which;
         renderFastStart(results,goal);
-        fsShowStatus('\u2713 Complete \u2014 '+results.length+' associates \u00b7 '+new Date().toLocaleTimeString(),'success');
+        fsShowStatus('\u2713 Complete ('+(win.which==='Break1'?'After Break 1':'SOS')+') \u2014 '+results.length+' associates \u00b7 '+new Date().toLocaleTimeString(),'success');
     }catch(err){
         console.error('[SB-FastStart] error:',err);
         if(content)content.innerHTML='<div style="padding:20px;font-size:14px;color:#c62828;">\u26A0 Fast Start failed: '+(err&&err.message?err.message:err)+'</div>';
@@ -10036,7 +10136,7 @@ function renderFastStart(results,goal){
     procs.forEach(p=>{
         const emps=byProcess[p];
         const rows=emps.map(e=>'<tr class="'+(e.minutesToFirst>goal?'fs-row-over':'fs-row-ok')+'">'+
-            '<td>'+e.employeeId+'</td><td>'+e.name+'</td><td title="'+e.punchIn+'">'+fsFmtTime(e.punchIn)+'</td>'+
+            '<td>'+e.employeeId+'</td><td>'+e.name+'</td><td title="'+e.punchIn+(e.refBreakEnd?' (no return punch \u2014 scheduled break end)':'')+'">'+fsFmtTime(e.punchIn)+(e.refBreakEnd?' <span style="font-size:10px;color:#888;">(break end)</span>':'')+'</td>'+
             '<td title="'+e.firstActivity+'">'+fsFmtTime(e.firstActivity)+'</td><td style="font-weight:700;">'+e.minutesToFirst+'</td></tr>').join('');
         tables+='<section class="faststart-section"><h3>'+p+' ('+emps.length+' associates)</h3>'+
             '<table class="metrics-table fs-detail-table"><thead><tr><th>Employee ID</th><th>Name</th><th>Punch In</th><th>First Activity</th><th>Minutes</th></tr></thead><tbody>'+rows+'</tbody></table></section>';
@@ -10061,6 +10161,8 @@ function initFastStartControls(){
     if(goal){const g=localStorage.getItem(FS_GOAL_KEY);if(g)goal.value=g;}
     const nonfc=document.getElementById('fs-remove-nonfc');
     if(nonfc){const n=localStorage.getItem(FS_NONFC_KEY);if(n!=null)nonfc.checked=n==='1';}
+    const winSel=document.getElementById('fs-window');
+    if(winSel){const w=localStorage.getItem(FS_WINDOW_KEY);if(w==='SOS'||w==='Break1')winSel.value=w;}
     const dt=document.getElementById('fs-start-datetime');
     if(dt&&!dt.value){
         const saved=localStorage.getItem(FS_DT_KEY);
