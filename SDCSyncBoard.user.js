@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.57.0
+// @version      15.58.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -9,9 +9,6 @@
 // @match        https://fclm-portal.amazon.com/*
 // @match        https://oculus.qubit.amazon.dev/transship/*
 // @match        https://portal.sandop.a2z.com/*
-// @match        https://outlook.office.com/*
-// @match        https://outlook.office365.com/*
-// @match        https://outlook.cloud.microsoft/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -72,6 +69,8 @@ try{
 // (15.57.0) Outlook on the web (new Outlook): fill the EOS Wash compose opened by the board's Email
 // button. Acts ONLY in the top frame and ONLY when a fresh (< 3 min) GM entry exists; otherwise does
 // nothing at all. Always RETURNS before any FCLM bootstrapping. TDZ: never call dbg() here.
+// (15.58.0) INERT: the outlook.* @match lines were removed (the default Email mode is now 'app'),
+// so this never runs; kept for the non-default SB_EOS_EMAIL_MODE='owa' (re-add the @match lines).
 try{
     const h=window.location.hostname;
     if(h==='outlook.office.com'||h==='outlook.office365.com'||h==='outlook.cloud.microsoft'){
@@ -207,7 +206,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.57.0';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.58.0';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -6348,6 +6347,10 @@ function buildCSS2(){return `
 .eoswash-section.eos-ib-section h3{color:#1565c0;}
 .eoswash-section.eos-da-section{border:3px solid #e65100;}
 .eoswash-section.eos-da-section h3{color:#e65100;}
+/* (15.58.0) EOS Email button "armed" state (second click opens the email): pulsing amber. */
+@keyframes sbEosArmPulse{0%,100%{box-shadow:0 0 0 0 rgba(255,179,0,.85);}50%{box-shadow:0 0 0 8px rgba(255,179,0,0);}}
+#sb-root #btn-email-eoswash.sb-eos-armed{background:#ef6c00!important;border-color:#ef6c00!important;color:#fff!important;animation:sbEosArmPulse 1.2s ease-in-out infinite;}
+@media (prefers-reduced-motion:reduce){#sb-root #btn-email-eoswash.sb-eos-armed{animation:none;outline:3px solid #ffb300;outline-offset:2px;}}
 .eoswash-section.eos-support-section{border:3px solid #7b1fa2;}
 .eoswash-section.eos-support-section h3{color:#7b1fa2;}
 /* Safety Summary = green section (border + heading + soft green fill). */
@@ -8124,6 +8127,9 @@ function fillEosBacklog(site){
     const pend={site:S,done:false,p:null};
     pend.p=Promise.all(chains).then(()=>{pend.done=true;dbg('[SB-EOS] backlog fill done for '+S);},()=>{pend.done=true;});
     _sbEosBacklogPending=pend;
+    // (15.58.0) The spans are written with textContent (no input/change event), so the pre-captured
+    // Email image is re-scheduled here once the whole fill settles (incl. after a capture timeout).
+    pend.p.then(()=>{if(_sbEosBacklogPending===pend&&typeof sbEosPrecaptureSchedule==='function')sbEosPrecaptureSchedule();});
 }
 // (15.55.0) Backlog state for the EOS Wash: the in-flight fill ({site,done,p}) and the last
 // finished cell values ({site,cells:{id:{text,title}}}). var (not let) so no TDZ on early calls.
@@ -8217,6 +8223,7 @@ function refreshEosAtlasFromSync(){
         eosFillFromSync('eos-q-shipfail-dpmo','atlas-shipfm-value');
         ['eos-q-bincol-dpmo','eos-q-shipfail-dpmo'].forEach(id=>{const el=document.getElementById(id);if(el)el.title='Auto-filled from Sync tab ICQA (ATLAS DPMO)';});
         updateAtlasThreshold();
+        sbEosPrecaptureSchedule();   // (15.58.0) Atlas cells changed -> the cached Email image is stale
     }catch(e){console.warn('[SB-EOS Atlas] refresh failed: '+(e&&e.message));}
 }
 
@@ -9016,6 +9023,8 @@ function renderEOSWash(data){
         autofill('eos-q-icqa-hrs',window._icqaTotalHours.toFixed(2));
     }
     window.scrollTo(0,0);
+    // (15.58.0) The Email image is pre-captured in the background; a re-render invalidates it.
+    sbEosPrecaptureSchedule();
 }
 
 // (15.53.1 / 15.53.2) Capture-only control flattening — the ONE place form controls are swapped
@@ -9328,7 +9337,15 @@ function sbEosEmailToast(msg,kind,linkHref){
         el.style.cssText='position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:1000000;max-width:760px;padding:10px 16px;display:flex;align-items:center;gap:12px;font:600 14px sans-serif;border-radius:6px;box-shadow:0 4px 14px rgba(0,0,0,0.25);'+(warn?'background:#fff3cd;color:#664d03;border:1px solid #ffe08a;':'background:#e8f5e9;color:#1b5e20;border:1px solid #81c784;');
         el.textContent='';
         const t=document.createElement('span');t.textContent=msg;el.appendChild(t);
-        if(linkHref){const a=document.createElement('a');a.href=linkHref;a.textContent='Open email again';a.style.cssText='color:inherit;text-decoration:underline;white-space:nowrap;';el.appendChild(a);}
+        // (15.58.0) linkHref may also be an array of {text, href, download?, onClick?, small?} links.
+        const links=Array.isArray(linkHref)?linkHref:(linkHref?[{text:'Open email again',href:linkHref}]:[]);
+        links.forEach(l=>{
+            const a=document.createElement('a');a.href=l.href||'#';a.textContent=l.text;
+            if(l.download)a.download=l.download;
+            if(typeof l.onClick==='function')a.addEventListener('click',(e)=>{e.preventDefault();l.onClick(e);});
+            a.style.cssText='color:inherit;text-decoration:underline;white-space:nowrap;'+(l.small?'font-size:12px;font-weight:normal;':'');
+            el.appendChild(a);
+        });
         const b=document.createElement('button');b.type='button';b.textContent='Dismiss';
         b.style.cssText='background:rgba(0,0,0,0.08);border:none;color:inherit;padding:4px 10px;border-radius:4px;cursor:pointer;font-weight:bold;';
         b.addEventListener('click',()=>{el.style.display='none';});el.appendChild(b);
@@ -9349,7 +9366,180 @@ function sbEosMailtoUrl(to,ccList,subject){
 // a new tab and let sbRunOutlookComposeFiller insert the body there; 'eml' = the 15.56.1 .eml
 // download. 'owa' falls back to the .eml automatically if the tab is blocked or anything fails
 // before the tab is navigated.
-const SB_EOS_EMAIL_MODE='owa';
+// (15.58.0) New default 'app': opens the system default mail app (new Outlook or classic Outlook)
+// via mailto: (To / Cc / Subject / plain-text greeting) and puts ONE pre-captured PNG of the whole
+// EOS Wash on the clipboard in the same click, so the user pastes it with one Ctrl+V. 'owa' (needs
+// the outlook.* @match lines re-added) and 'eml' stay available but are not the default.
+const SB_EOS_EMAIL_MODE='app';
+// (15.58.0) Plain-text mailto: body. CRLF line breaks (encoded %0D%0A) for Outlook.
+function sbEosMailtoBody(site){
+    return site+' team,\r\n\r\n[Press Ctrl+V here to paste the EOS Wash]\r\n\r\nPlease see the '+site+' EOS Wash above.\r\n\r\nThank you,';
+}
+// (15.58.0) mailto: with To + Cc (comma-separated) + Subject + plain-text body. Falls back to the
+// body-less URL if the result would exceed maxLen (default 1800) characters.
+function sbEosMailtoAppUrl(to,ccList,subject,body,maxLen){
+    const enc=(s)=>encodeURIComponent(s).replace(/%40/g,'@');
+    const q=[];
+    if(ccList&&ccList.length)q.push('cc='+ccList.map(enc).join(','));
+    q.push('subject='+encodeURIComponent(subject||''));
+    const base='mailto:'+enc(to||'')+'?'+q.join('&');
+    if(!body)return base;
+    const full=base+'&body='+encodeURIComponent(body);
+    return full.length<=(maxLen>0?maxLen:1800)?full:base;
+}
+// (15.58.0) Background pre-capture of the Email image (Firefox: the click's user activation would
+// expire during a multi-second capture, and ClipboardItem must get a ready Blob, not a Promise).
+// {blob,canvas,capInfo,site,ts} = last good capture; dirty = it no longer matches the board;
+// gen bumps on every invalidation so an in-flight capture that finished stale is discarded.
+// blSnap = sbEosBacklogSnap() at capture time (detects IPT / backlog that changed without an event).
+var _sbEosPre={blob:null,canvas:null,capInfo:null,site:'',ts:0,dirty:true,gen:0,busy:null,timer:null,blSnap:''};
+const SB_EOS_PRE_DEBOUNCE_MS=2000;
+// The EOS Wash is rendered (not the empty / "Click Fetch" placeholder).
+function sbEosWashRendered(content){
+    return !!(content&&content.querySelector('.eos-highlights-section'));
+}
+// Mark the cached image stale NOW and re-capture delayMs (default ~2s) after the last call.
+function sbEosPrecaptureSchedule(delayMs){
+    try{
+        const st=_sbEosPre;if(!st)return;
+        st.dirty=true;st.gen++;
+        clearTimeout(st.timer);st.timer=null;
+        // An armed "Click to open email" button no longer matches the board: back to plain Email
+        // (the next click sends at once if the re-capture has finished, else prepares again).
+        const btn=document.getElementById('btn-email-eoswash');
+        if(btn&&btn.classList.contains('sb-eos-armed')){btn.classList.remove('sb-eos-armed');btn.textContent='\u2709 Email';btn.disabled=false;}
+        if(SB_EOS_EMAIL_MODE!=='app'||!sbEosEnabled())return;
+        // Skip when a capture that started after this change already made the cache fresh.
+        st.timer=setTimeout(()=>{st.timer=null;if(sbEosPrecaptureFresh())return;sbEosPrecapture(false).catch(e=>dbg('[SB-EOS] pre-capture skipped: '+(e&&e.message)));},delayMs>=0?delayMs:SB_EOS_PRE_DEBOUNCE_MS);
+    }catch(e){console.warn('[SB-EOS] pre-capture schedule failed: '+(e&&e.message));}
+}
+// The visible text of the 10 EOS backlog / IPT cells (compared against the snapshot taken at capture).
+function sbEosBacklogSnap(){
+    return EOS_BL_IDS.map(id=>{const el=document.getElementById(id);return el?(el.textContent||'').trim():'';}).join('\u0001');
+}
+// (15.58.0) Synchronous re-check (as 15.57.0's click-time sbEosBacklogReady did): restore the finished
+// backlog values and re-read IPT from GM storage (the S&OP Network Viewer tab writes it). If the cells
+// no longer match the cached image, invalidate it. Returns true when the cache was invalidated.
+function sbEosPrecaptureRecheck(){
+    try{
+        if(!sbEosWashRendered(document.getElementById('eoswash-content')))return false;
+        sbEosBacklogReapply();
+        sbFillIptCells('eos-bl-ib-ipt','eos-bl-da-ipt',sbShiftIso());
+        const st=_sbEosPre;
+        if(!sbEosPrecaptureFresh()||st.blSnap===sbEosBacklogSnap())return false;
+        dbg('[SB-EOS] backlog / IPT changed since the pre-capture \u2014 recapturing');
+        sbEosPrecaptureSchedule();
+        return true;
+    }catch(e){console.warn('[SB-EOS] pre-capture recheck failed: '+(e&&e.message));return false;}
+}
+// True when the cached Blob matches the current board (safe to write in a click synchronously).
+function sbEosPrecaptureFresh(){
+    const st=_sbEosPre;
+    const S=String((loadConfig()||{}).site||'').toUpperCase();
+    return !!(st&&st.blob&&!st.dirty&&st.site===S);
+}
+// Capture now (waits for an in-flight capture first). Resolves the state once a FRESH blob is
+// cached; repeats while edits keep invalidating it. Rejects when the wash is not rendered /
+// hidden / html2canvas is missing or the capture fails.
+// loop=true (Email click): keep capturing until fresh; loop=false (background): one capture, a
+// stale result just waits for the next debounced schedule (never back-to-back while typing).
+function sbEosPrecapture(loop){
+    const st=_sbEosPre;
+    if(st.busy)return st.busy.then(()=>0,()=>0).then(()=>sbEosPrecaptureFresh()?st:sbEosPrecapture(loop));
+    const content=document.getElementById('eoswash-content');
+    if(!sbEosWashRendered(content))return Promise.reject(new Error('EOS Wash not rendered'));
+    if(typeof html2canvas==='undefined')return Promise.reject(new Error('html2canvas not loaded'));
+    if(!content.getClientRects().length)return Promise.reject(new Error('EOS Wash tab hidden'));
+    const S=String((loadConfig()||{}).site||'').toUpperCase();
+    // gen / backlog snapshot are taken AFTER the backlog wait (sbEosBacklogReady has re-applied the
+    // backlog and re-read IPT by then), right before the DOM is cloned.
+    let gen=0,blSt='ok',snap='';
+    st.busy=sbEosBacklogReady(15000)
+        .then(r=>{blSt=r;gen=st.gen;snap=sbEosBacklogSnap();return sbEosCaptureCanvas(content,{labels:true});})
+        .then(({canvas,capInfo})=>{
+            if(!canvas||canvas.width<10||canvas.height<10)throw new Error('empty capture');
+            return sbEosCombinedPngBlob(canvas,EOS_CAP_SCALE).then(blob=>{
+                if(gen!==st.gen){dbg('[SB-EOS] pre-capture finished stale \u2014 recapturing');return;}
+                // (15.58.0) A capture taken on the backlog TIMEOUT shows n/a for the unfinished
+                // cells. Background: never cache it as fresh (the fill's settle hook re-schedules).
+                // Email click (loop): accept it like 15.57.0 did, unless the fill finished during
+                // the capture (then re-capture with the real values).
+                if(blSt==='timeout'){
+                    const p=_sbEosBacklogPending, done=!p||p.site!==S||p.done;
+                    if(done){dbg('[SB-EOS] backlog finished during the pre-capture \u2014 recapturing');return;}
+                    if(!loop){dbg('[SB-EOS] pre-capture taken on backlog timeout \u2014 not cached as fresh');return;}
+                }
+                Object.assign(st,{blob,canvas,capInfo,site:S,ts:Date.now(),dirty:false,blSnap:snap});
+                dbg('[SB-EOS] pre-capture ready: '+(blob.size/1024).toFixed(0)+' KB PNG');
+            });
+        })
+        .finally(()=>{st.busy=null;});
+    return st.busy.then(()=>{
+        if(sbEosPrecaptureFresh())return st;
+        if(loop)return sbEosPrecapture(true);
+        throw new Error('stale (EOS Wash changed during the capture)');
+    });
+}
+// (15.58.0) The send step, run SYNCHRONOUSLY inside a click: clipboard.write with the ready Blob
+// (no Promise values), then the mailto: in the same click. If the write is unsupported / fails,
+// the mail app still opens and the toast offers the PNG download + the .eml (classic Outlook).
+function sbEosSendApp(ctx){
+    const st=_sbEosPre,blob=st.blob,btn=ctx.btn;
+    const mailto=sbEosMailtoAppUrl(ctx.to,ctx.ccAddrs,ctx.subject,sbEosMailtoBody(ctx.site));
+    let writeP;
+    try{
+        if(navigator.clipboard&&typeof navigator.clipboard.write==='function'&&typeof ClipboardItem==='function')
+            writeP=navigator.clipboard.write([new ClipboardItem({'image/png':blob})]);
+        else writeP=Promise.reject(new Error('navigator.clipboard.write / ClipboardItem unavailable'));
+    }catch(e){writeP=Promise.reject(e);}
+    try{sbOpenMailto(mailto);}catch(e){console.warn('[SB-EOS] mailto open failed: '+(e&&e.message));}
+    dbg('[SB-EOS] email app: mailto opened ('+mailto.length+' chars), clipboard image write requested');
+    const stamp=new Date().toISOString().slice(0,16).replace(/[T:]/g,'-');
+    const emlLink={text:'Download .eml (classic Outlook)',href:'#',small:true,onClick:()=>{
+        try{
+            const images=sbEosSliceCanvas(st.canvas,st.capInfo,EOS_CAP_SCALE);
+            const eml=sbBuildEosEml({to:ctx.to,cc:ctx.cc,subject:ctx.subject,site:ctx.site,images,stamp:Date.now()});
+            const u=URL.createObjectURL(new Blob([eml],{type:'message/rfc822'}));
+            const a=document.createElement('a');a.href=u;a.download=(ctx.site||'EOS')+'_EOS_Wash_'+stamp+'.eml';
+            document.body.appendChild(a);a.click();document.body.removeChild(a);
+            setTimeout(()=>URL.revokeObjectURL(u),4000);
+        }catch(e){console.warn('[SB-EOS] .eml build failed: '+(e&&e.message));}
+    }};
+    sbEosEmailToast('Outlook opened \u2014 click in the body where it says \u2018Press Ctrl+V\u2019 and press Ctrl+V.','ok',[{text:'Open email again',href:mailto},emlLink]);
+    if(btn){btn.classList.remove('sb-eos-armed');btn.disabled=true;btn.textContent='\u2713 Outlook opened';}
+    setTimeout(()=>{if(btn){btn.classList.remove('sb-eos-armed');btn.textContent='\u2709 Email';btn.disabled=false;}},5000);
+    return Promise.resolve(writeP).then(()=>{dbg('[SB-EOS] clipboard image written');return 'ok';},err=>{
+        console.warn('[SB-EOS] clipboard image write failed: '+(err&&err.message));
+        let imgUrl='';
+        try{imgUrl=URL.createObjectURL(blob);setTimeout(()=>URL.revokeObjectURL(imgUrl),120000);}catch(e){}
+        const links=[];
+        if(imgUrl)links.push({text:'\u2B07 Download image',href:imgUrl,download:(ctx.site||'EOS')+'_EOS_Wash_'+stamp+'.png'});
+        links.push(emlLink);
+        sbEosEmailToast('Outlook opened, but the EOS Wash image couldn\u2019t be copied. Download the image and insert it where it says \u2018Press Ctrl+V\u2019.','warn',links);
+        return 'failed';
+    });
+}
+// (15.58.0) 'app' mode click. Fresh cached image -> send now (same click). Otherwise
+// "⏳ Preparing…", finish the capture, then arm a pulsing "📋 Click to open email" button whose
+// NEXT click (fresh user activation) sends. Never relies on activation surviving the capture.
+function sbEosEmailAppClick(ctx){
+    const btn=ctx.btn;
+    if(!sbEosWashRendered(document.getElementById('eoswash-content'))){alert('Fetch the EOS Wash first, then email.');return Promise.resolve('not-rendered');}
+    sbEosPrecaptureRecheck();   // IPT captured in S&OP / late backlog since the pre-capture -> not fresh
+    if(sbEosPrecaptureFresh())return sbEosSendApp(ctx);
+    if(btn){btn.classList.remove('sb-eos-armed');btn.disabled=true;btn.textContent='\u23F3 Preparing\u2026';}
+    clearTimeout(_sbEosPre.timer);_sbEosPre.timer=null;   // capture now, not after the debounce
+    return sbEosPrecapture(true).then(()=>{
+        if(btn){btn.disabled=false;btn.textContent='\uD83D\uDCCB Click to open email';btn.classList.add('sb-eos-armed');}
+        sbEosEmailToast('EOS Wash ready \u2014 click \u201C\uD83D\uDCCB Click to open email\u201D to open Outlook.','ok');
+        return 'armed';
+    }).catch(e=>{
+        console.error('[SB-EOS] email capture failed:',e);
+        if(btn){btn.classList.remove('sb-eos-armed');btn.textContent='\u2709 Email';btn.disabled=false;}
+        alert('Screenshot failed: '+(e&&e.message));
+        return 'error';
+    });
+}
 // Text shown in the compose body until the filler swaps in the EOS Wash (the filler removes it).
 const SB_EOS_OWA_PLACEHOLDER='Inserting the EOS Wash, please wait...';
 // (15.57.0) Outlook on the web compose deeplink: To / Cc (comma-separated) / Subject / short body.
@@ -9373,7 +9563,10 @@ function sbOpenMailto(url){
 // (15.55.0) The EOS Wash html2canvas capture (moved out of emailEOSWash, behaviour unchanged
 // except: the CLONE is forced to the light theme and backlog cells with no value show "n/a").
 // Resolves {canvas,capInfo}; the live controls' data-sb-cap stamps are always removed.
-function sbEosCaptureCanvas(content){
+// (15.58.0) opts.labels: draw small bold "Inbound EOS" / "Outbound EOS" labels above the INBOUND /
+// OUTBOUND sections in the clone, so the single clipboard image stands alone (the mailto body is
+// plain text with no labels). The live board is untouched.
+function sbEosCaptureCanvas(content,opts){
     return new Promise((resolve,reject)=>{
         // Give the browser a tick, then capture.
         setTimeout(()=>{
@@ -9411,6 +9604,17 @@ function sbEosCaptureCanvas(content){
                 }catch(e){console.warn('[SB-EOS] backlog n/a pass failed:',e);}
                 try{sbFlattenControlsForCapture(capMap,cr);}
                 catch(e){console.warn('[SB-EOS] capture flatten failed:',e);}
+                if(opts&&opts.labels){
+                    try{
+                        [['.eos-ib-section','Inbound EOS'],['.eos-da-section','Outbound EOS']].forEach(([sel,txt])=>{
+                            const sec=cr&&cr.querySelector(sel);if(!sec||!sec.parentNode)return;
+                            const d=clonedDoc.createElement('div');
+                            d.className='sb-cap-eos-label';d.textContent=txt;
+                            d.style.cssText='font:700 15px Calibri,Arial,sans-serif;color:#000;margin:12px 0 4px;text-align:left;';
+                            sec.parentNode.insertBefore(d,sec);
+                        });
+                    }catch(e){console.warn('[SB-EOS] capture labels failed:',e);}
+                }
                 try{capInfo=sbReflowEosCaptureClone(cr,EOS_CAP_W,EOS_CAP_PAD);}
                 catch(e){console.warn('[SB-EOS] capture reflow failed:',e);}
             };
@@ -9450,6 +9654,8 @@ function sbEosCombinedPngBlob(canvas,scale){
 // (15.57.0) Default mode SB_EOS_EMAIL_MODE='owa': a new tab opens in the click, the finished email
 // goes to GM storage, the tab goes to the new Outlook compose deeplink and sbRunOutlookComposeFiller
 // inserts the body there (no download, no Ctrl+V). Falls back to the .eml download.
+// (15.58.0) Default mode is now 'app' (sbEosEmailAppClick): mailto: opens whatever Outlook is the
+// default mail app, with the pre-captured EOS Wash PNG on the clipboard for one Ctrl+V.
 function emailEOSWash(){
     if(!sbEosEnabled())return;   // (15.51.0) KRB3-only (button is hidden with the tab for other sites)
     const content=document.getElementById('eoswash-content');
@@ -9469,6 +9675,8 @@ function emailEOSWash(){
     const ccAddrs=(EOS_EMAIL_CC[site]||[]).map(s=>{const m=/<([^>]+)>/.exec(s);return m?m[1]:s;});
     const subject=`${site} EOS Wash`;   // (15.51.2) user request: subject is just "KRB3 EOS Wash"
     const mailto=sbEosMailtoUrl(to,ccAddrs,subject);
+    // (15.58.0) Default: open the system mail app (new / classic Outlook) + one-Ctrl+V clipboard image.
+    if(SB_EOS_EMAIL_MODE==='app'){sbEosEmailAppClick({btn,site,to,cc,ccAddrs,subject});return;}
     if(btn){btn.disabled=true;btn.textContent='\u23F3 Loading backlog\u2026';}
     const resetBtn=(ms)=>{if(btn)setTimeout(()=>{btn.textContent='\u2709 Email';btn.disabled=false;},ms||0);};
     // (15.57.0) Open the Outlook tab NOW, inside the click's user activation (avoids the pop-up
@@ -9859,6 +10067,17 @@ function initBoard(){
     document.getElementById('btn-save-fs-sos')?.addEventListener('click',()=>saveFastStartSnapshot('SOS'));
     document.getElementById('btn-save-fs-break')?.addEventListener('click',()=>saveFastStartSnapshot('1st Break'));
     document.getElementById('btn-email-eoswash')?.addEventListener('click',emailEOSWash);
+    // (15.58.0) Any edit / button in the EOS Wash makes the pre-captured Email image stale:
+    // mark it dirty now, re-capture ~2s after the last change. #eoswash-content is static (never
+    // re-created by renderEOSWash), so one delegated set of listeners covers every re-render.
+    {const ec=document.getElementById('eoswash-content');
+     if(ec)['input','change','click'].forEach(t=>ec.addEventListener(t,(e)=>{
+         if(t==='click'&&!(e.target&&e.target.closest&&e.target.closest('button')))return;
+         sbEosPrecaptureSchedule();
+     }));}
+    // (15.58.0) Back from the S&OP Network Viewer tab (IPT capture writes GM storage, no event here):
+    // re-read IPT and re-capture if it changed, so the Email click usually finds a fresh image.
+    document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&SB_EOS_EMAIL_MODE==='app'&&sbEosEnabled())sbEosPrecaptureRecheck();});
     initEosPlanInputs(); // seed + wire the manual IB/DA daily-plan target inputs
     document.getElementById('btn-fetch-vrets')?.addEventListener('click',()=>{trackUsage('vrets');fetchVRETsData();});
     // ICQA tab: click-only fetch (usage ping on the deliberate click) + persisted fallback target.
@@ -9921,6 +10140,9 @@ function initBoard(){
         if(tab.dataset.tab==='eoswash'&&sbEosEnabled()){
             const et=document.getElementById('eoswash-content');
             if(et&&et.innerHTML.trim()===''){et.innerHTML='<div style="padding:20px;font-size:14px;color:#666;">Click <strong>\u25B6 Fetch EOS Wash</strong> to load.</div>';}
+            // (15.58.0) A capture skipped while the tab was hidden runs now that it is visible.
+            if(_sbEosPre.dirty)sbEosPrecaptureSchedule(800);
+            else sbEosPrecaptureRecheck();   // IPT may have been captured in another tab meanwhile
         }
         // Prime the Fast Start tab controls the first time it's opened (no auto-fetch:
         // Fast Start is a heavy, on-demand query, so the user clicks Run themselves).
