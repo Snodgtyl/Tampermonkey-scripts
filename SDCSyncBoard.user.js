@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.58.0
+// @version      15.59.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -9,6 +9,9 @@
 // @match        https://fclm-portal.amazon.com/*
 // @match        https://oculus.qubit.amazon.dev/transship/*
 // @match        https://portal.sandop.a2z.com/*
+// @match        https://outlook.office.com/*
+// @match        https://outlook.office365.com/*
+// @match        https://outlook.cloud.microsoft/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -67,14 +70,15 @@ try{
     }
 }catch(e){ /* if location is unreadable, fall through to FCLM behavior */ }
 // (15.57.0) Outlook on the web (new Outlook): fill the EOS Wash compose opened by the board's Email
-// button. Acts ONLY in the top frame and ONLY when a fresh (< 3 min) GM entry exists; otherwise does
+// button. Acts ONLY in the top frame and ONLY when a fresh (< 15 min) GM entry exists; otherwise does
 // nothing at all. Always RETURNS before any FCLM bootstrapping. TDZ: never call dbg() here.
-// (15.58.0) INERT: the outlook.* @match lines were removed (the default Email mode is now 'app'),
-// so this never runs; kept for the non-default SB_EOS_EMAIL_MODE='owa' (re-add the @match lines).
+// (15.59.0) Default Email mode is 'owa' again (outlook.* @match lines restored). The entry now lives
+// 15 min (sign-in can take a while) and the filler re-opens the stored compose deeplink if the
+// sign-in redirect dropped it (see sbRunOutlookComposeFiller). Without a fresh entry: nothing at all.
 try{
     const h=window.location.hostname;
     if(h==='outlook.office.com'||h==='outlook.office365.com'||h==='outlook.cloud.microsoft'){
-        try{ if(window.top===window&&sbOwaPendingEmail(180000))sbRunOutlookComposeFiller(); }catch(e){ try{console.warn('[SB-EOS-Outlook] fatal (ignored):',e&&e.message);}catch(_){ } }
+        try{ if(window.top===window&&sbOwaPendingEmail(900000))sbRunOutlookComposeFiller(); }catch(e){ try{console.warn('[SB-EOS-Outlook] fatal (ignored):',e&&e.message);}catch(_){ } }
         return; // Outlook path never builds the FCLM board.
     }
 }catch(e){ /* if location is unreadable, fall through to FCLM behavior */ }
@@ -206,7 +210,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.58.0';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.59.0';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -227,7 +231,7 @@ function getUserAlias(){
         //    "badgephotos...?login=snodgtyl". Scan all anchors for these patterns.
         const anchors=Array.from(document.querySelectorAll('a[href]'));
         const rxes=[/[?&](?:login|user|userId|alias|employeeId)=([a-z0-9]{3,20})/i,/(?:phonetool|people|users)\/([a-z0-9]{3,20})/i,/badgephoto[^?]*\?[^#]*?(?:login|user)=([a-z0-9]{3,20})/i];
-        for(const a of anchors){const href=a.getAttribute('href')||'';for(const rx of rxes){const m=href.match(rx);if(m&&valid(m[1])){localStorage.setItem('syncboard_alias',m[1].toLowerCase());return m[1].toLowerCase();}}}
+        for(const a of anchors){const href=a.getAttribute('href')||'';for(const rx of rxes){const m=href.match(rx);if( m&&valid(m[1])){localStorage.setItem('syncboard_alias',m[1].toLowerCase());return m[1].toLowerCase();}}}
         // 2) A badge/avatar <img> whose src encodes the login.
         for(const img of Array.from(document.querySelectorAll('img[src]'))){const src=img.getAttribute('src')||'';const m=src.match(/(?:login|user|employeeId)=([a-z0-9]{3,20})/i);if(m&&valid(m[1])){localStorage.setItem('syncboard_alias',m[1].toLowerCase());return m[1].toLowerCase();}}
         // 3) Known id/class candidates for a header login element.
@@ -1673,11 +1677,20 @@ function sbRunOculusCollector(){
     }catch(e){console.warn('[SB-IB-Collector] fatal',e&&e.message);}
 }
 
-// ── OUTLOOK (OWA) EOS COMPOSE FILLER (15.57.0) ─────────────────────────────
+// ── OUTLOOK (OWA) EOS COMPOSE FILLER (15.57.0, sign-in proof since 15.59.0) ─
 // The board's EOS Wash "Email" button stores the finished email in GM storage
-// (sb_eos_pending_email = {token,ts,to,cc:[...],subject,html,text,placeholder,images}) and opens the
-// new Outlook (Outlook on the web) compose deeplink in a new tab. On the Outlook hosts the RUN-CONTEXT
-// BRANCH calls this ONLY when a fresh (< 3 min) entry exists. It waits for the compose body, removes
+// (sb_eos_pending_email = {token,ts,to,cc:[...],subject,html,text,placeholder,images,imgs:[{b64,width,
+// height}],deeplink,redirects,redirectedAt}) and opens the new Outlook (Outlook on the web) compose
+// deeplink in a new tab. On the Outlook hosts the RUN-CONTEXT BRANCH calls this ONLY when a fresh
+// (< 15 min) entry exists.
+// (15.59.0) Sign-in proof: the Microsoft sign-in redirect can drop the deeplink (OWA lands on the
+// inbox). If this page is not a compose URL and no compose editor shows up within 8s, the stored
+// deeplink is opened ONCE from this page (max 2 per entry; redirects / redirectedAt are recorded in
+// the entry so it can never loop). The editor wait is 120s (MutationObserver + polling) and covers an
+// inline reading-pane draft; a popout window runs its own copy of this filler. A tab whose entry was
+// used by another tab (or replaced by a newer Email click) stops quietly.
+// If OWA drops the data: images of the HTML paste (text in, images missing), the PNGs are pasted
+// again as image Files (DataTransfer.items; paste, then drop). It waits for the compose body, removes
 // the deeplink placeholder text and inserts the HTML body (synthetic paste -> execCommand insertHTML
 // -> innerHTML), checks To/Cc/Subject (best effort), then deletes the entry and shows a toast. It
 // NEVER sends. If every insert fails it puts the HTML on the clipboard (GM_setClipboard) and asks the
@@ -1690,7 +1703,7 @@ function sbOwaPendingEmail(maxAgeMs){
         const p=GM_getValue('sb_eos_pending_email',null);
         if(!p||typeof p!=='object'||typeof p.html!=='string'||!p.html||!(p.ts>0))return null;
         const age=Date.now()-p.ts;
-        if(age>(maxAgeMs>0?maxAgeMs:180000)||age<-60000)return null;   // stale, or clock nonsense
+        if(age>(maxAgeMs>0?maxAgeMs:900000)||age<-60000)return null;   // stale, or clock nonsense
         return p;
     }catch(e){return null;}
 }
@@ -1715,40 +1728,141 @@ function sbRunOutlookComposeFiller(){
             clearTimeout(el._sbHide);el._sbHide=setTimeout(()=>{el.style.display='none';},30000);
         }catch(e){warn('toast failed:',e&&e.message);}
     };
+    const MAX_AGE=15*60*1000;        // entry lifetime (sign-in can take a while)
+    const REDIRECT_WAIT_MS=8000;     // non-compose page: wait this long for an editor before re-opening compose
+    const EDITOR_WAIT_MS=120000;     // compose editor wait
+    const MAX_REDIRECTS=2;           // loop guard (per entry, across page loads)
     const visible=(el)=>{try{const r=el.getBoundingClientRect();return r.width>0&&r.height>0;}catch(e){return false;}};
-    const BODY_SEL=[
-        'div[contenteditable="true"][aria-label*="Message body" i]',
-        'div[role="textbox"][contenteditable="true"][aria-label*="body" i]',
-        '[aria-label="Message body, press Alt+F10 to exit"]'
-    ];
-    const findEditor=()=>{
-        for(const s of BODY_SEL){
-            let els=[];try{els=Array.from(document.querySelectorAll(s)).filter(visible);}catch(e){}
-            if(els.length)return els[0];
-        }
-        // Generic: the largest visible top-level contenteditable that is not a recipient well/subject.
+    const isHeaderField=(el)=>{const lab=(el.getAttribute('aria-label')||'').trim().toLowerCase();return /^(to|cc|bcc)\b/.test(lab)||lab.indexOf('subject')!==-1;};
+    const largest=(els)=>{
         let best=null,area=0;
-        document.querySelectorAll('[contenteditable="true"]').forEach(el=>{
-            const lab=(el.getAttribute('aria-label')||'').trim().toLowerCase();
-            if(/^(to|cc|bcc)\b/.test(lab)||lab.indexOf('subject')!==-1)return;
-            if(el.parentElement&&el.parentElement.closest('[contenteditable="true"]'))return;
-            if(!visible(el))return;
-            const r=el.getBoundingClientRect(),a=r.width*r.height;
-            if(r.height>=60&&a>area){best=el;area=a;}
-        });
+        els.forEach(el=>{const r=el.getBoundingClientRect(),a=r.width*r.height;if(a>area){best=el;area=a;}});
         return best;
     };
-    // MutationObserver + polling, up to timeoutMs. Resolves the editor or null.
-    const waitForEditor=(timeoutMs)=>new Promise(resolve=>{
-        let done=false,mo=null,iv=null,to=null;
+    // (15.59.0) Compose regions (reading-pane draft / popout / dialog): the nearest ancestor of a
+    // Subject field or To / Cc well that also holds a non-header contenteditable.
+    const composeRegions=()=>{
+        const out=[];
+        try{
+            document.querySelectorAll('input[aria-label*="subject" i],[aria-label="To"],[aria-label="Cc"]').forEach(f=>{
+                let el=f.parentElement;
+                for(let i=0;el&&i<15;i++,el=el.parentElement){
+                    const hit=Array.from(el.querySelectorAll('[contenteditable="true"]')).some(c=>!isHeaderField(c));
+                    if(hit){if(out.indexOf(el)===-1)out.push(el);break;}
+                }
+            });
+        }catch(e){}
+        return out;
+    };
+    const findEditor=()=>{
+        // 1. OWA's labelled message body.
+        let els=[];
+        try{els=Array.from(document.querySelectorAll('div[contenteditable="true"][aria-label*="Message body" i]')).filter(visible);}catch(e){}
+        if(els.length)return els[0];
+        // 2. A textbox inside a compose region (not a recipient well / subject).
+        for(const reg of composeRegions()){
+            let c=[];
+            try{c=Array.from(reg.querySelectorAll('div[role="textbox"][contenteditable="true"]')).filter(el=>!isHeaderField(el)&&visible(el));}catch(e){}
+            if(c.length)return largest(c);
+        }
+        // 3. Generic: the largest visible top-level contenteditable that is not a recipient well/subject.
+        const gen=[];
+        document.querySelectorAll('[contenteditable="true"]').forEach(el=>{
+            if(isHeaderField(el))return;
+            if(el.parentElement&&el.parentElement.closest('[contenteditable="true"]'))return;
+            if(!visible(el))return;
+            if(el.getBoundingClientRect().height>=60)gen.push(el);
+        });
+        return largest(gen);
+    };
+    // The entry this tab is working on is still pending (not used by another tab / a popout, not
+    // replaced by a newer Email click, not expired).
+    const stillMine=(token)=>{const c=sbOwaPendingEmail(MAX_AGE);return !!(c&&c.token===token);};
+    // MutationObserver + polling, up to timeoutMs. Resolves the editor, null (timeout) or 'gone'
+    // (the entry was handled elsewhere / replaced / expired: stop quietly).
+    const waitForEditor=(timeoutMs,token)=>new Promise(resolve=>{
+        let done=false,mo=null,iv=null,to=null,n=0;
         const finish=(el)=>{if(done)return;done=true;try{mo&&mo.disconnect();}catch(_){ }clearInterval(iv);clearTimeout(to);resolve(el);};
         const check=()=>{try{const el=findEditor();if(el)finish(el);}catch(_){ }};
         try{mo=new MutationObserver(check);mo.observe(document.documentElement,{childList:true,subtree:true});}catch(_){ }
-        iv=setInterval(check,500);
+        iv=setInterval(()=>{check();if(token&&!done&&(++n%4===0)&&!stillMine(token))finish('gone');},500);
         to=setTimeout(()=>finish(null),timeoutMs);
         check();
     });
+    const isComposeUrl=()=>{try{return /\/(deeplink\/)?compose\b/i.test(window.location.pathname||'');}catch(e){return false;}};
+    // (15.59.0) Where to re-open compose: the stored deeplink, on THIS Outlook host when both are
+    // Outlook hosts (saves the office.com -> cloud.microsoft hop).
+    const redirectTarget=(p)=>{
+        let u=String(p.deeplink||'');
+        try{
+            const owa=/^(outlook\.office\.com|outlook\.office365\.com|outlook\.cloud\.microsoft)$/i;
+            const t=new URL(u);
+            if(owa.test(t.hostname)&&owa.test(window.location.hostname)&&t.hostname!==window.location.hostname){t.protocol=window.location.protocol;t.host=window.location.host;u=t.href;}
+        }catch(e){}
+        return u;
+    };
+    // Navigate once to the compose deeplink; records redirects / redirectedAt first (loop guard).
+    const maybeRedirect=(p)=>{
+        const n=p.redirects>0?p.redirects:0;
+        if(!p.deeplink){warn('no stored deeplink \u2014 cannot re-open compose');return false;}
+        if(n>=MAX_REDIRECTS){warn('loop guard: compose was already re-opened '+n+' time(s) \u2014 not again');return false;}
+        const target=redirectTarget(p);
+        try{GM_setValue(KEY,Object.assign({},p,{redirects:n+1,redirectedAt:Date.now()}));}
+        catch(e){warn('could not record the redirect (not redirecting):',e&&e.message);return false;}
+        log('no compose editor after '+(REDIRECT_WAIT_MS/1000)+'s on '+window.location.pathname+' (sign-in dropped the deeplink?) \u2014 re-opening compose ('+(n+1)+'/'+MAX_REDIRECTS+')');
+        try{window.location.assign(target);}catch(e){warn('redirect failed:',e&&e.message);return false;}
+        return true;
+    };
     const imgCount=(ed)=>{try{return ed.querySelectorAll('img').length;}catch(e){return 0;}};
+    const countOf=(s,sub)=>{let n=0,i=0;s=s||'';while((i=s.indexOf(sub,i))!==-1){n++;i+=sub.length;}return n;};
+    // (15.59.0) Caret where the images belong: before "Thank you," (else the end of the body).
+    const caretForImages=(ed)=>{
+        try{
+            ed.focus();
+            const sel=window.getSelection(),r=document.createRange();
+            const tw=document.createTreeWalker(ed,NodeFilter.SHOW_TEXT);
+            let n=null;
+            while(tw.nextNode()){if((tw.currentNode.nodeValue||'').indexOf('Thank you,')!==-1){n=tw.currentNode;break;}}
+            if(n)r.setStart(n,n.nodeValue.indexOf('Thank you,'));
+            else{r.selectNodeContents(ed);r.collapse(false);}
+            r.collapse(true);sel.removeAllRanges();sel.addRange(r);
+            return r;
+        }catch(e){warn('image caret placement failed:',e&&e.message);return null;}
+    };
+    const b64ToFile=(b64,i)=>{
+        const bin=atob(b64),u=new Uint8Array(bin.length);
+        for(let k=0;k<bin.length;k++)u[k]=bin.charCodeAt(k);
+        return new File([u],'EOSWash-'+(i+1)+'.png',{type:'image/png'});
+    };
+    // (15.59.0) OWA rejected the data: images: paste the PNGs as image Files (paste, then drop).
+    // have() = images added so far; resolves true once need are present.
+    const insertImageFiles=async(ed,list,have,need)=>{
+        let files=[];
+        try{files=list.map((im,i)=>b64ToFile(im.b64,i));}catch(e){warn('image decode failed:',e&&e.message);return false;}
+        if(!files.length){warn('no image data in the entry');return false;}
+        for(const kind of ['paste','drop']){
+            const e=findEditor()||ed;
+            const r=caretForImages(e);
+            try{
+                const dt=new DataTransfer();
+                files.forEach(f=>dt.items.add(f));
+                let ev=null;
+                if(kind==='paste'){try{ev=new ClipboardEvent('paste',{clipboardData:dt,bubbles:true,cancelable:true});}catch(_){ev=null;}}
+                else{
+                    let x=0,y=0;try{const b=r&&r.getBoundingClientRect();if(b){x=b.left;y=b.top;}}catch(_){ }
+                    try{ev=new DragEvent('drop',{dataTransfer:dt,bubbles:true,cancelable:true,clientX:x,clientY:y});}catch(_){ev=null;}
+                }
+                if(!ev)ev=new Event(kind,{bubbles:true,cancelable:true});
+                const prop=kind==='paste'?'clipboardData':'dataTransfer';
+                if(!ev[prop]){try{Object.defineProperty(ev,prop,{value:dt});}catch(_){ }}
+                e.dispatchEvent(ev);
+            }catch(err){warn('image file '+kind+' threw:',err&&err.message);}
+            // OWA uploads pasted image files as inline attachments: allow a few seconds.
+            for(let i=0;i<12;i++){await sleep(500);if(have()>=need){log('images added via file '+kind);return true;}}
+            log('image file '+kind+' did not add the images ('+have()+'/'+need+')');
+        }
+        return false;
+    };
     const caretStart=(ed)=>{
         try{
             ed.focus();
@@ -1805,7 +1919,7 @@ function sbRunOutlookComposeFiller(){
     };
     return (async()=>{
         try{
-            const p=sbOwaPendingEmail(180000);
+            const p=sbOwaPendingEmail(MAX_AGE);
             if(!p)return 'skipped';
             const html=p.html;
             // Body fragment (no <html>/<body> wrapper) for the execCommand / innerHTML fallbacks.
@@ -1814,14 +1928,33 @@ function sbRunOutlookComposeFiller(){
             const frag=bm?('<div'+(sm?' style="'+sm[1]+'"':'')+'>'+bm[2]+'</div>'):html;
             const plain=p.text||'';
             const nImgs=(html.match(/<img\b/gi)||[]).length;
-            log('pending EOS Wash found ('+(html.length/1048576).toFixed(2)+' MB, '+nImgs+' image(s)) — waiting for the compose body');
-            let ed=await waitForEditor(45000);
+            const imgList=Array.isArray(p.imgs)?p.imgs.filter(im=>im&&typeof im.b64==='string'&&im.b64):[];
+            log('pending EOS Wash found on '+window.location.hostname+window.location.pathname+' ('+(html.length/1048576).toFixed(2)+' MB, '+nImgs+' image(s), redirects so far: '+(p.redirects||0)+')');
+            let ed=null;
+            // (15.59.0) Not a compose URL (e.g. the inbox after the Microsoft sign-in dropped the
+            // deeplink): give OWA ~8s to show an editor, else re-open the stored deeplink once.
+            if(!isComposeUrl()){
+                log('not a compose page \u2014 waiting up to '+(REDIRECT_WAIT_MS/1000)+'s for a compose editor');
+                ed=await waitForEditor(REDIRECT_WAIT_MS,p.token);
+                if(ed==='gone'){log('entry handled elsewhere / replaced \u2014 nothing to do');return 'skipped';}
+                if(!ed){
+                    const cur=sbOwaPendingEmail(MAX_AGE);
+                    if(!cur||cur.token!==p.token){log('entry handled elsewhere / replaced \u2014 nothing to do');return 'skipped';}
+                    if(maybeRedirect(cur))return 'redirected';
+                }
+            }
             if(!ed){
-                warn('compose body not found within 45s');
+                log('waiting up to '+(EDITOR_WAIT_MS/1000)+'s for the compose body');
+                ed=await waitForEditor(EDITOR_WAIT_MS,p.token);
+            }
+            if(ed==='gone'){log('entry handled elsewhere / replaced \u2014 nothing to do');return 'skipped';}
+            if(!ed){
+                warn('compose body not found within '+(EDITOR_WAIT_MS/1000)+'s \u2014 putting the EOS Wash on the clipboard');
                 try{if(typeof GM_setClipboard==='function')GM_setClipboard(html,'html');}catch(e){warn('GM_setClipboard failed:',e&&e.message);}
-                toast('Press Ctrl+V in the message body to paste the EOS Wash.',true);
+                toast('Couldn\u2019t find the Outlook message body. Open a new message and press Ctrl+V in the message body to paste the EOS Wash.',true);
                 return 'no-editor';
             }
+            log('compose body found');
             // Let the deeplink body (placeholder) land so OWA does not overwrite our insert.
             for(let i=0;i<20;i++){
                 const cur=findEditor()||ed;ed=cur;
@@ -1831,16 +1964,18 @@ function sbRunOutlookComposeFiller(){
             await sleep(400);
             ed=findEditor()||ed;
             // Another Outlook tab may have used the entry meanwhile.
-            const again=sbOwaPendingEmail(180000);
+            const again=sbOwaPendingEmail(MAX_AGE);
             if(!again||again.token!==p.token){log('entry already handled elsewhere — nothing to do');return 'skipped';}
             fillHeaders(p);
             stripPlaceholder(ed,p.placeholder);
-            const hadTeam=(ed.textContent||'').indexOf('team,')!==-1;
-            const ok=(before)=>{
-                const e2=findEditor()||ed;
-                const got=imgCount(e2)-before;
-                if(nImgs>0&&got>=nImgs)return true;
-                return !hadTeam&&(e2.textContent||'').indexOf('team,')!==-1;
+            // (15.59.0) Verify by what was ADDED to the body: "team," (greeting) and the <img> count.
+            const baseTeam=countOf(ed.textContent,'team,'),baseImgs=imgCount(ed);
+            const state=()=>{const e2=findEditor()||ed;return {ed:e2,text:countOf(e2.textContent,'team,')>baseTeam,imgs:imgCount(e2)-baseImgs};};
+            const done=(how)=>{
+                try{if(typeof GM_deleteValue==='function')GM_deleteValue(KEY);}catch(e){warn('GM_deleteValue failed:',e&&e.message);}
+                log('EOS Wash inserted via '+how+' \u2014 entry removed');
+                toast('EOS Wash inserted \u2014 review and press Send.',false);
+                return how;
             };
             const attempts=[
                 ['paste',(e)=>{
@@ -1859,24 +1994,41 @@ function sbRunOutlookComposeFiller(){
                     e.dispatchEvent(new Event('change',{bubbles:true}));
                 }]
             ];
+            let how='';
             for(const [name,fn] of attempts){
                 ed=findEditor()||ed;
-                const before=imgCount(ed);
                 caretStart(ed);
+                log('inserting via '+name);
                 try{fn(ed);}catch(e){warn(name+' insert threw:',e&&e.message);}
                 await sleep(1500);
-                if(ok(before)){
-                    try{if(typeof GM_deleteValue==='function')GM_deleteValue(KEY);}catch(e){warn('GM_deleteValue failed:',e&&e.message);}
-                    log('EOS Wash inserted via '+name);
-                    toast('EOS Wash inserted \u2014 review and press Send.',false);
-                    return name;
-                }
-                log(name+' insert did not take — trying the next method');
+                const s=state();
+                log(name+': greeting '+(s.text?'present':'missing')+', images '+s.imgs+'/'+nImgs);
+                if(s.text||(nImgs>0&&s.imgs>=nImgs)){how=name;ed=s.ed;break;}
+                log(name+' insert did not take \u2014 trying the next method');
             }
-            warn('all insert methods failed — putting the EOS Wash on the clipboard');
-            try{if(typeof GM_setClipboard==='function')GM_setClipboard(html,'html');}catch(e){warn('GM_setClipboard failed:',e&&e.message);}
-            toast('Press Ctrl+V in the message body to paste the EOS Wash.',true);
-            return 'failed';
+            if(!how){
+                warn('all insert methods failed \u2014 putting the EOS Wash on the clipboard');
+                try{if(typeof GM_setClipboard==='function')GM_setClipboard(html,'html');}catch(e){warn('GM_setClipboard failed:',e&&e.message);}
+                toast('Press Ctrl+V in the message body to paste the EOS Wash.',true);
+                return 'failed';
+            }
+            // (15.59.0) Text is in but OWA dropped the data: images -> paste them as image Files.
+            const s1=state();
+            if(nImgs>0&&s1.imgs<nImgs){
+                const missing=imgList.slice(Math.max(0,s1.imgs));
+                log('text inserted but only '+s1.imgs+'/'+nImgs+' image(s) \u2014 pasting '+missing.length+' image(s) as files');
+                const okImgs=await insertImageFiles(s1.ed,missing,()=>state().imgs,nImgs);
+                if(!okImgs){
+                    warn('images could not be inserted \u2014 putting the images on the clipboard');
+                    const imgsHtml=imgList.map(im=>'<img src="data:image/png;base64,'+im.b64+'" width="'+(im.width||'')+'" height="'+(im.height||'')+'" alt="EOS Wash" style="max-width:100%;height:auto;display:block;">').join('<br>');
+                    try{if(imgsHtml&&typeof GM_setClipboard==='function')GM_setClipboard(imgsHtml,'html');}catch(e){warn('GM_setClipboard failed:',e&&e.message);}
+                    try{if(typeof GM_deleteValue==='function')GM_deleteValue(KEY);}catch(e){warn('GM_deleteValue failed:',e&&e.message);}
+                    toast('The text is in, but the EOS Wash images didn\u2019t attach. Click above \u201CThank you,\u201D and press Ctrl+V in the message body to paste them.',true);
+                    return how+'+no-images';
+                }
+                how+='+image-files';
+            }
+            return done(how);
         }catch(e){warn('fatal (ignored):',e&&e.message);return 'error';}
     })();
 }
@@ -9370,10 +9522,16 @@ function sbEosMailtoUrl(to,ccList,subject){
 // via mailto: (To / Cc / Subject / plain-text greeting) and puts ONE pre-captured PNG of the whole
 // EOS Wash on the clipboard in the same click, so the user pastes it with one Ctrl+V. 'owa' (needs
 // the outlook.* @match lines re-added) and 'eml' stay available but are not the default.
-const SB_EOS_EMAIL_MODE='app';
+// (15.59.0) Default is 'owa' again (user request: click -> Outlook on the web opens with everything
+// filled in, no paste). sbEosEmailOwaClick: the tab opens in the click, the pre-captured image is
+// used when fresh, and a blocked pop-up falls back to 'app'. 'app' and 'eml' stay as fallbacks.
+const SB_EOS_EMAIL_MODE='owa';
+// (15.59.0) Pre-capture runs for both the 'app' and the 'owa' mode.
+function sbEosPrecaptureMode(){return SB_EOS_EMAIL_MODE==='app'||SB_EOS_EMAIL_MODE==='owa';}
 // (15.58.0) Plain-text mailto: body. CRLF line breaks (encoded %0D%0A) for Outlook.
 function sbEosMailtoBody(site){
-    return site+' team,\r\n\r\n[Press Ctrl+V here to paste the EOS Wash]\r\n\r\nPlease see the '+site+' EOS Wash above.\r\n\r\nThank you,';
+    // (15.58.1) Restore the IB/OB handoff-note spots at the top (same order as the pre-15.58.0 email).
+    return site+' team,\r\n\r\nInbound EOS\r\n\r\n\r\nOutbound EOS\r\n\r\n\r\nPlease see the '+site+' EOS Wash below.\r\n\r\n[Press Ctrl+V here to paste the EOS Wash]\r\n\r\nThank you,';
 }
 // (15.58.0) mailto: with To + Cc (comma-separated) + Subject + plain-text body. Falls back to the
 // body-less URL if the result would exceed maxLen (default 1800) characters.
@@ -9408,7 +9566,7 @@ function sbEosPrecaptureSchedule(delayMs){
         // (the next click sends at once if the re-capture has finished, else prepares again).
         const btn=document.getElementById('btn-email-eoswash');
         if(btn&&btn.classList.contains('sb-eos-armed')){btn.classList.remove('sb-eos-armed');btn.textContent='\u2709 Email';btn.disabled=false;}
-        if(SB_EOS_EMAIL_MODE!=='app'||!sbEosEnabled())return;
+        if(!sbEosPrecaptureMode()||!sbEosEnabled())return;
         // Skip when a capture that started after this change already made the cache fresh.
         st.timer=setTimeout(()=>{st.timer=null;if(sbEosPrecaptureFresh())return;sbEosPrecapture(false).catch(e=>dbg('[SB-EOS] pre-capture skipped: '+(e&&e.message)));},delayMs>=0?delayMs:SB_EOS_PRE_DEBOUNCE_MS);
     }catch(e){console.warn('[SB-EOS] pre-capture schedule failed: '+(e&&e.message));}
@@ -9554,6 +9712,73 @@ function sbEosOwaDeeplink(to,ccList,subject,body){
 function sbEosBodyText(site){
     return site+' team,\n\nInbound EOS\n\n\nOutbound EOS\n\n\nPlease see the '+site+' EOS Wash below.\n\nThank you,\n';
 }
+// (15.59.0) "Preparing" page written into the just-opened about:blank tab (same origin as the board).
+function sbEosOwaPreparingPage(win){
+    try{
+        const d=win.document;
+        d.title='EOS Wash \u2014 preparing email';
+        const root=d.body||d.documentElement;
+        root.textContent='';
+        root.style.cssText='font:16px Segoe UI,Arial,sans-serif;color:#222;margin:40px;';
+        const p1=d.createElement('p');p1.setAttribute('role','status');p1.style.fontWeight='600';
+        p1.textContent='\u23F3 Preparing the EOS Wash\u2026 this tab will open Outlook.';
+        const p2=d.createElement('p');
+        p2.textContent='First time: sign in to Outlook once \u2014 the EOS Wash fills in automatically after.';
+        root.appendChild(p1);root.appendChild(p2);
+    }catch(e){console.warn('[SB-EOS] preparing page failed: '+(e&&e.message));}
+}
+// (15.59.0) 'owa' mode click (default). window.open runs synchronously in the click (user
+// activation). Pop-up blocked -> the 'app' mode (mailto + clipboard), never the .eml. Otherwise the
+// fresh pre-captured image is used at once, else it is captured now (backlog wait + capture). The
+// finished email goes to GM storage (with the deeplink + the PNGs for the File paste fallback) and
+// the tab goes to the compose deeplink; sbRunOutlookComposeFiller inserts the body there.
+function sbEosEmailOwaClick(ctx){
+    const btn=ctx.btn;
+    if(!sbEosWashRendered(document.getElementById('eoswash-content'))){alert('Fetch the EOS Wash first, then email.');return Promise.resolve('not-rendered');}
+    let win=null;
+    try{win=window.open('about:blank','_blank');}catch(e){win=null;}
+    if(!win){
+        console.warn('[SB-EOS] the Outlook tab was blocked \u2014 falling back to the mail app (mailto + clipboard)');
+        return sbEosEmailAppClick(ctx);
+    }
+    try{win.opener=null;}catch(e){}
+    sbEosOwaPreparingPage(win);
+    sbEosPrecaptureRecheck();   // IPT / backlog changed since the pre-capture -> not fresh
+    const fresh=sbEosPrecaptureFresh();
+    if(btn){btn.classList.remove('sb-eos-armed');btn.disabled=true;btn.textContent='\u23F3 Preparing email\u2026';}
+    const resetBtn=(ms)=>{setTimeout(()=>{if(btn){btn.classList.remove('sb-eos-armed');btn.textContent='\u2709 Email';btn.disabled=false;}},ms||0);};
+    if(!fresh){clearTimeout(_sbEosPre.timer);_sbEosPre.timer=null;}   // capture now, not after the debounce
+    dbg('[SB-EOS] Outlook email: '+(fresh?'using the fresh pre-capture':'capturing now'));
+    const job=fresh?Promise.resolve(_sbEosPre):sbEosPrecapture(true);
+    return job.then(st=>{
+        const images=sbEosSliceCanvas(st.canvas,st.capInfo,EOS_CAP_SCALE);
+        const html=sbEosBodyHtml(ctx.site,images,im=>'data:image/png;base64,'+im.b64);
+        if(win.closed)throw new Error('the Outlook tab was closed');
+        if(typeof GM_setValue!=='function')throw new Error('GM_setValue unavailable');
+        let token='';
+        try{const a=new Uint32Array(2);crypto.getRandomValues(a);token=a[0].toString(36)+a[1].toString(36);}
+        catch(e){token=Math.random().toString(36).slice(2);}
+        const deeplink=sbEosOwaDeeplink(ctx.to,ctx.ccAddrs,ctx.subject,SB_EOS_OWA_PLACEHOLDER);
+        GM_setValue('sb_eos_pending_email',{token,ts:Date.now(),to:ctx.to,cc:ctx.ccAddrs,subject:ctx.subject,html,
+            text:sbEosBodyText(ctx.site),placeholder:SB_EOS_OWA_PLACEHOLDER,images:images.length,
+            imgs:images.map(im=>({b64:im.b64,width:im.width,height:im.height})),
+            deeplink,redirects:0,redirectedAt:0});
+        dbg('[SB-EOS] pending Outlook email stored: '+(html.length/1048576).toFixed(2)+' MB, '+images.length+' image(s)');
+        win.location.href=deeplink;
+        sbEosEmailToast('Outlook opened in a new tab \u2014 the EOS Wash fills in automatically. First time: sign in to Outlook once \u2014 the EOS Wash fills in automatically after.','ok');
+        if(btn)btn.textContent='\u2713 Outlook opened';
+        resetBtn(5000);
+        return 'ok';
+    }).catch(e=>{
+        console.warn('[SB-EOS] Outlook email failed ('+(e&&e.message)+')');
+        try{GM_deleteValue('sb_eos_pending_email');}catch(_){}
+        try{if(!win.closed)win.close();}catch(_){}
+        resetBtn(0);
+        // A real click (fresh user activation) is needed for the mailto + clipboard fallback.
+        sbEosEmailToast('Couldn\u2019t open Outlook on the web ('+(e&&e.message)+').','warn',[{text:'Open in the mail app instead',href:'#',onClick:()=>sbEosEmailAppClick(ctx)}]);
+        return 'error';
+    });
+}
 // Hidden-anchor click: hands the mailto: to the OS mail handler (Outlook) without navigating or
 // unloading the board (no window.open popup, no iframe).
 function sbOpenMailto(url){
@@ -9656,6 +9881,7 @@ function sbEosCombinedPngBlob(canvas,scale){
 // inserts the body there (no download, no Ctrl+V). Falls back to the .eml download.
 // (15.58.0) Default mode is now 'app' (sbEosEmailAppClick): mailto: opens whatever Outlook is the
 // default mail app, with the pre-captured EOS Wash PNG on the clipboard for one Ctrl+V.
+// (15.59.0) Default mode is 'owa' again (sbEosEmailOwaClick); 'app' / 'eml' remain as fallbacks.
 function emailEOSWash(){
     if(!sbEosEnabled())return;   // (15.51.0) KRB3-only (button is hidden with the tab for other sites)
     const content=document.getElementById('eoswash-content');
@@ -9677,18 +9903,11 @@ function emailEOSWash(){
     const mailto=sbEosMailtoUrl(to,ccAddrs,subject);
     // (15.58.0) Default: open the system mail app (new / classic Outlook) + one-Ctrl+V clipboard image.
     if(SB_EOS_EMAIL_MODE==='app'){sbEosEmailAppClick({btn,site,to,cc,ccAddrs,subject});return;}
+    // (15.59.0) Default: Outlook on the web, filled in automatically (blocked pop-up -> 'app').
+    if(SB_EOS_EMAIL_MODE==='owa'){sbEosEmailOwaClick({btn,site,to,cc,ccAddrs,subject});return;}
+    // ---- 'eml' mode below (the 15.56.1 .eml download) ----
     if(btn){btn.disabled=true;btn.textContent='\u23F3 Loading backlog\u2026';}
     const resetBtn=(ms)=>{if(btn)setTimeout(()=>{btn.textContent='\u2709 Email';btn.disabled=false;},ms||0);};
-    // (15.57.0) Open the Outlook tab NOW, inside the click's user activation (avoids the pop-up
-    // blocker); it is navigated to the compose deeplink once the capture is done.
-    let owaWin=null;
-    if(SB_EOS_EMAIL_MODE==='owa'){
-        try{owaWin=window.open('about:blank','_blank');}catch(e){owaWin=null;}
-        if(owaWin){
-            try{owaWin.opener=null;}catch(e){}
-            try{owaWin.document.title='EOS Wash';owaWin.document.body.style.font='16px sans-serif';owaWin.document.body.textContent='Preparing the EOS Wash email\u2026';}catch(e){}
-        }
-    }
     // Backlog ready -> capture -> section images + body HTML + combined PNG.
     const job=sbEosBacklogReady(15000).then(()=>{
         if(btn)btn.textContent='\u23F3 Capturing...';
@@ -9709,7 +9928,7 @@ function emailEOSWash(){
     // backlog wait + light-theme capture + Highlights-first order. Set SB_EOS_USE_CLIPBOARD=true
     // to re-enable the clipboard flow later.
     const SB_EOS_USE_CLIPBOARD=false;
-    // The 15.56.1 .eml download (also the fallback of the 'owa' mode).
+    // The 15.56.1 .eml download ('eml' mode only; 'owa' falls back to 'app' since 15.59.0).
     const downloadEml=(j)=>{
         const eml=sbBuildEosEml({to,cc,subject,site,images:j.images,stamp:Date.now()});
         const blob=new Blob([eml],{type:'message/rfc822'});
@@ -9722,43 +9941,7 @@ function emailEOSWash(){
         if(btn)btn.textContent='\u2713 .eml downloaded';
         resetBtn(4000);
     };
-    // (15.57.0) New Outlook: hand the body to the Outlook tab via GM storage, then navigate the tab
-    // to the compose deeplink (To / Cc / Subject); sbRunOutlookComposeFiller inserts the body there.
-    if(SB_EOS_EMAIL_MODE==='owa'&&owaWin){
-        job.then(j=>{
-            try{
-                if(owaWin.closed)throw new Error('the Outlook tab was closed');
-                if(typeof GM_setValue!=='function')throw new Error('GM_setValue unavailable');
-                let token='';
-                try{const a=new Uint32Array(2);crypto.getRandomValues(a);token=a[0].toString(36)+a[1].toString(36);}
-                catch(e){token=Math.random().toString(36).slice(2);}
-                GM_setValue('sb_eos_pending_email',{token,ts:Date.now(),to,cc:ccAddrs,subject,html:j.html,
-                    text:sbEosBodyText(site),placeholder:SB_EOS_OWA_PLACEHOLDER,images:j.images.length});
-                dbg('[SB-EOS] pending Outlook email stored: '+(j.html.length/1048576).toFixed(2)+' MB, '+j.images.length+' image(s)');
-                owaWin.location.href=sbEosOwaDeeplink(to,ccAddrs,subject,SB_EOS_OWA_PLACEHOLDER);
-            }catch(e){
-                console.warn('[SB-EOS] Outlook hand-off failed ('+(e&&e.message)+') \u2014 falling back to the .eml download');
-                try{GM_deleteValue('sb_eos_pending_email');}catch(_){}
-                try{owaWin.close();}catch(_){}
-                downloadEml(j);
-                sbEosEmailToast('Couldn\u2019t open Outlook \u2014 downloaded the .eml instead. Open it to send.','warn');
-                return;
-            }
-            sbEosEmailToast('Opening Outlook\u2026 the EOS Wash will be inserted automatically.','ok');
-            if(btn)btn.textContent='\u2713 Outlook opened';
-            resetBtn(4000);
-        }).catch(e=>{
-            try{owaWin.close();}catch(_){}
-            console.error('[SB-EOS] email capture failed:',e);
-            if(btn){btn.textContent='\u2709 Email';btn.disabled=false;}
-            alert('Screenshot failed: '+(e&&e.message));
-        });
-        return;
-    }
-    if(SB_EOS_EMAIL_MODE==='owa'&&!owaWin){
-        console.warn('[SB-EOS] the Outlook tab was blocked \u2014 falling back to the .eml download');
-        job.then(()=>sbEosEmailToast('Pop-up blocked \u2014 downloaded the .eml instead. Allow pop-ups for this page to open Outlook directly.','warn')).catch(()=>{});
-    }
+    // (15.59.0) The 'owa' hand-off moved to sbEosEmailOwaClick (pre-capture, sign-in-proof entry).
     if(!SB_EOS_USE_CLIPBOARD){
         job.then(j=>{
             downloadEml(j);
@@ -10077,7 +10260,7 @@ function initBoard(){
      }));}
     // (15.58.0) Back from the S&OP Network Viewer tab (IPT capture writes GM storage, no event here):
     // re-read IPT and re-capture if it changed, so the Email click usually finds a fresh image.
-    document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&SB_EOS_EMAIL_MODE==='app'&&sbEosEnabled())sbEosPrecaptureRecheck();});
+    document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&sbEosPrecaptureMode()&&sbEosEnabled())sbEosPrecaptureRecheck();});
     initEosPlanInputs(); // seed + wire the manual IB/DA daily-plan target inputs
     document.getElementById('btn-fetch-vrets')?.addEventListener('click',()=>{trackUsage('vrets');fetchVRETsData();});
     // ICQA tab: click-only fetch (usage ping on the deliberate click) + persisted fallback target.
