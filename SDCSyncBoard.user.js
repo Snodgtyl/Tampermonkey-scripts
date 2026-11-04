@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.55.0
+// @version      15.56.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -194,7 +194,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.55.0';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.56.0';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -3972,17 +3972,19 @@ function attemptLPFetch(site,resolve,isRetry){
                         const ur=sbWowSiteRows(urAll,loadConfig().site);
                         const undilSrc=(pt)=>'S&OPWoW Undiluted Rates by Path, '+pt+', Forecast '+sundayStr;
                         let missed=false;
-                        // CTI
+                        // CTI — (15.56.0, user request) DILUTED first: DeratedRates ("Diluted Rates by
+                        // Path") "Case Transfer In", Cartons, Forecast this week's Sunday. Falls back to
+                        // the undiluted rows (Units, then Cartons) only if the diluted row is missing.
                         try{
-                            const cu=sbPickUndilRate(ur,'Case Transfer In','Units',sundayStr);
-                            const cc=cu>0?0:sbPickUndilRate(ur,'Case Transfer In','Cartons',sundayStr);
-                            if(cu>0)settleCti(cu,undilSrc('Units'));
-                            else if(cc>0)settleCti(cc,undilSrc('Cartons'));
+                            const d=pickLpRate(dr,'Case Transfer In');
+                            if(d>0)settleCti(d,'DeratedRates (Diluted Rates by Path, Cartons, Forecast '+sundayStr+')');
                             else{
                                 missed=true;
-                                const d=pickLpRate(dr,'Case Transfer In');
-                                console.warn('[SB-LP RATE] "Case Transfer In" not in Undiluted Rates by Path (UnderatedRatesAndHours) \u2014 using DeratedRates (diluted) '+d);
-                                settleCti(d,'DeratedRates (diluted, Cartons, Forecast '+sundayStr+')');
+                                const cu=sbPickUndilRate(ur,'Case Transfer In','Units',sundayStr);
+                                const cc=cu>0?0:sbPickUndilRate(ur,'Case Transfer In','Cartons',sundayStr);
+                                const u=cu>0?cu:cc;
+                                console.warn('[SB-LP RATE] "Case Transfer In" not in DeratedRates (diluted) \u2014 using Undiluted Rates by Path '+u);
+                                settleCti(u,undilSrc(cu>0?'Units':'Cartons'));
                             }
                         }catch(e){settleCti(0,'error');}
                         // TOP
