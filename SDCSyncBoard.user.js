@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.56.0
+// @version      15.56.1
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -194,7 +194,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.56.0';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.56.1';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -9243,6 +9243,30 @@ function emailEOSWash(){
             .then(png=>({images,html,png}));
     });
     job.catch(()=>{});   // handled below; avoids an "unhandled rejection" for the side branches
+    // (15.56.1) ROLLBACK at user request: the clipboard + mailto flow wasn't sending. Go back to the
+    // proven pre-15.55.0 .eml download (opens in Outlook with images inline). Keeps the 15.55.0
+    // backlog wait + light-theme capture + Highlights-first order. Set SB_EOS_USE_CLIPBOARD=true
+    // to re-enable the clipboard flow later.
+    const SB_EOS_USE_CLIPBOARD=false;
+    if(!SB_EOS_USE_CLIPBOARD){
+        job.then(j=>{
+            const eml=sbBuildEosEml({to,cc,subject,site,images:j.images,stamp:Date.now()});
+            const blob=new Blob([eml],{type:'message/rfc822'});
+            const url=URL.createObjectURL(blob);
+            const a=document.createElement('a');
+            a.href=url;
+            a.download=(site||'EOS')+'_EOS_Wash_'+new Date().toISOString().slice(0,16).replace(/[T:]/g,'-')+'.eml';
+            document.body.appendChild(a);a.click();document.body.removeChild(a);
+            setTimeout(()=>URL.revokeObjectURL(url),4000);
+            if(btn)btn.textContent='\u2713 .eml downloaded';
+            resetBtn(4000);
+        }).catch(e=>{
+            console.error('[SB-EOS] email capture failed:',e);
+            if(btn){btn.textContent='\u2709 Email';btn.disabled=false;}
+            alert('Screenshot failed: '+(e&&e.message));
+        });
+        return;
+    }
     // Clipboard write created NOW, inside the click's user activation; its blobs resolve later.
     let writeP;
     try{
