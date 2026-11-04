@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.54.5
+// @version      15.55.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -13,6 +13,7 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_deleteValue
+// @grant        GM_setClipboard
 // @connect      fc-benchmarking.amazon.com
 // @connect      adapt-iad.amazon.com
 // @connect      galaxybi.aka.corp.amazon.com
@@ -193,7 +194,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.54.5';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.55.0';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -267,6 +268,8 @@ function trackUsage(action){
 // once-per-day Slack ping to the usage channel so the creator can see which boards are running
 // stale. This surfaces auto-update failures (version drift) instead of them going unnoticed.
 const SB_RAW_URL='https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js';
+// (15.54.6) Install/update link shown on the "update to vX" badge + Settings note (owner-provided URL).
+const SB_INSTALL_URL='https://github.com/Snodgtyl/Tampermonkey-scripts/raw/refs/heads/main/SDCSyncBoard.user.js';
 // Compare two dotted version strings. Returns -1 (a<b), 0 (equal), 1 (a>b).
 function cmpVersion(a,b){
     const pa=String(a).split('.').map(n=>parseInt(n,10)||0),pb=String(b).split('.').map(n=>parseInt(n,10)||0);
@@ -297,13 +300,13 @@ function applyUpdateStatus(behind,remote){
         if(badge){
             // (15.54.3) the new version is a clickable link to the raw .user.js -> Tampermonkey opens its
             // install/update page. `remote` is digits/dots only (regex above), so safe to put in HTML.
-            if(behind){badge.innerHTML='v'+SB_VERSION+' \u2191 update to <a href="'+SB_RAW_URL+'" target="_blank" rel="noopener noreferrer" style="color:#e65100;text-decoration:underline;font-weight:800;" title="Click to install v'+remote+'">v'+remote+'</a>';badge.style.color='#e65100';badge.style.fontWeight='800';badge.title='This board is behind. Latest is v'+remote+'. Click the version to update now.';}
+            if(behind){badge.innerHTML='v'+SB_VERSION+' \u2191 update to <a href="'+SB_INSTALL_URL+'" target="_blank" rel="noopener noreferrer" style="color:#e65100;text-decoration:underline;font-weight:800;" title="Click to install v'+remote+'">v'+remote+'</a>';badge.style.color='#e65100';badge.style.fontWeight='800';badge.title='This board is behind. Latest is v'+remote+'. Click the version to update now.';}
             else{badge.textContent='v'+SB_VERSION;badge.style.color='#888';badge.title='Up to date (latest on GitHub is v'+remote+').';}
         }
         // Settings note
         const note=document.getElementById('sb-update-note');
         if(note){
-            if(behind){note.innerHTML='\u26A0\uFE0F Running <strong>v'+SB_VERSION+'</strong> \u2014 latest is <a href="'+SB_RAW_URL+'" target="_blank" rel="noopener noreferrer" style="color:#c62828;font-weight:700;text-decoration:underline;">v'+remote+' (click to update)</a>.';note.style.color='#c62828';}
+            if(behind){note.innerHTML='\u26A0\uFE0F Running <strong>v'+SB_VERSION+'</strong> \u2014 latest is <a href="'+SB_INSTALL_URL+'" target="_blank" rel="noopener noreferrer" style="color:#c62828;font-weight:700;text-decoration:underline;">v'+remote+' (click to update)</a>.';note.style.color='#c62828';}
             else{note.innerHTML='\u2713 Up to date (v'+SB_VERSION+', latest on GitHub v'+remote+').';note.style.color='#2e7d32';}
         }
         // Once-per-day Slack ping when behind, so the creator sees stale boards in the usage channel.
@@ -7704,25 +7707,54 @@ function sbReadBacklogSnapshot(site,iso){
 // (15.47.0) IPT Backlog (SandOP Network Viewer, captured by sbRunSandopIptCollector into GM storage
 // sb_ipt_v1_<SITE> = {ib:{'YYYY-MM-DD':n},da:{...},ibTs,daTs}). Read for ONE date: default = the
 // shift START date (getShiftDates().startDate — a Nights shift read at 03:00 uses the date it
-// started). Missing date -> null (caller shows an em-dash; never substitutes another date).
+// started). Missing date -> null (caller shows an em-dash). (15.55.0) The current-shift lookup
+// also tries today and the previous day (see sbIptCandidates).
 // (15.47.1) Publish the board's site to GM storage so the SandOP collector only stores that site's
 // table (called on board load, site change, and Get Data). Never throws.
 function sbPublishBoardSite(site){try{const S=String(site||'').toUpperCase();if(S&&typeof GM_setValue==='function')GM_setValue('sb_board_site',S);}catch(e){console.warn('[SB-IPT] board site publish failed: '+(e&&e.message));}}
 function sbShiftIso(){try{return isoDate(getShiftDates(loadConfig()).startDate);}catch(e){return isoDate(new Date());}}
+// (15.55.0) IPT showed an em-dash when the collector had no column for the exact shift START date
+// (e.g. a Nights shift read at 02:00 looks up yesterday, but the Network Viewer's date columns
+// start at today, or SandOP was last opened the day before). For the CURRENT shift lookup the
+// candidates are now: shift start date -> today (local) -> the day before the shift date (nearest
+// previous stored date within 1 day). An explicit other date (Prior Day view) stays exact.
+// All dates are LOCAL (isoDate), never toISOString (UTC), matching the collector's isoOf.
+function sbIptCandidates(iso,todayIso,current){
+    const out=[iso];
+    if(!current)return out;
+    if(todayIso&&out.indexOf(todayIso)===-1)out.push(todayIso);
+    try{
+        const p=String(iso).split('-').map(Number);
+        const d=new Date(p[0],p[1]-1,p[2],12,0,0,0);d.setDate(d.getDate()-1);
+        const prev=isoDate(d);
+        if(out.indexOf(prev)===-1)out.push(prev);
+    }catch(e){}
+    return out;
+}
+// First candidate date with a finite numeric value for dir -> {val,date,ts}, else null.
+function sbIptPick(obj,dir,cands){
+    const m=obj&&obj[dir];
+    if(!m)return null;
+    for(let i=0;i<cands.length;i++){
+        const v=m[cands[i]];
+        if(typeof v==='number'&&isFinite(v))return {val:v,date:cands[i],ts:(obj[dir+'Ts']||0)};
+    }
+    return null;
+}
 function getIptValues(site,iso){
     const out={ib:null,da:null};
     try{
         const S=String(site||'').toUpperCase();
-        const date=iso||sbShiftIso();
+        const shiftIso=sbShiftIso();
+        const date=iso||shiftIso;
         if(!S||typeof GM_getValue!=='function')return out;
         const raw=GM_getValue('sb_ipt_v1_'+S,null);
         let obj=null;
         try{obj=(typeof raw==='string')?JSON.parse(raw):raw;}catch(e){obj=null;}
-        ['ib','da'].forEach(dir=>{
-            const v=obj&&obj[dir]&&obj[dir][date];
-            if(typeof v==='number'&&isFinite(v))out[dir]={val:v,date:date,ts:(obj[dir+'Ts']||0)};
-        });
-        dbg('[SB-IPT] '+S+' '+date+' ib='+(out.ib?out.ib.val:'\u2014')+' da='+(out.da?out.da.val:'\u2014'));
+        const cands=sbIptCandidates(date,isoDate(new Date()),date===shiftIso);
+        ['ib','da'].forEach(dir=>{out[dir]=sbIptPick(obj,dir,cands);});
+        const keys=(dir)=>(obj&&obj[dir])?Object.keys(obj[dir]).sort().join(','):'';
+        dbg('[SB-IPT] lookup site='+S+' iso='+date+' tried=['+cands.join(',')+'] ib='+(out.ib?out.ib.val+'@'+out.ib.date:'\u2014')+' da='+(out.da?out.da.val+'@'+out.da.date:'\u2014')+' keys=[ib:'+keys('ib')+' | da:'+keys('da')+']');
     }catch(e){console.warn('[SB-IPT] read failed: '+(e&&e.message));}
     return out;
 }
@@ -7845,23 +7877,75 @@ function fillEosBacklog(site){
     // Shared compute (one implementation of the backlog + days math, also used by the Sync tab's
     // Dept Backlog). Its promises NEVER reject; the snapshot/memo save happens inside it.
     const c=sbComputeBacklog(S);
-    c.ibP.then(r=>{ if(!r){ib.forEach(dash);return;} put(ib[0],r.units); put(ib[1],r.cases); }).catch(()=>{ib.forEach(dash);});
-    c.daP.then(r=>{ if(!r){da.forEach(dash);return;} put(da[0],r.units); put(da[1],r.cases); }).catch(()=>{da.forEach(dash);});
+    // (15.55.0) Remember each finished cell (text + tooltip) so a passive re-render of the EOS Wash
+    // (theme toggle, RSR LP edit) can restore it, and track the whole fill as one promise so the
+    // Email capture can wait for it (sbEosBacklogReady).
+    const cells={};_sbEosBacklogCells={site:S,cells:cells};
+    const rec=(ids)=>ids.forEach(id=>{const el=document.getElementById(id);if(el&&!el.querySelector('.sb-spin'))cells[id]={text:el.textContent,title:el.getAttribute('title')};});
+    const chains=[];
+    chains.push(c.ibP.then(r=>{ if(!r){ib.forEach(dash);return;} put(ib[0],r.units); put(ib[1],r.cases); }).catch(()=>{ib.forEach(dash);}).then(()=>rec(ib)));
+    chains.push(c.daP.then(r=>{ if(!r){da.forEach(dash);return;} put(da[0],r.units); put(da[1],r.cases); }).catch(()=>{da.forEach(dash);}).then(()=>rec(da)));
     // Writes the precomputed days cell (2 decimals + math tooltip), else the em-dash. Null-guarded.
     const writeDays=(id,cell)=>{
         const el=document.getElementById(id);if(!el)return;
         if(!cell){el.textContent=DASH;el.removeAttribute('title');return;}
         el.textContent=cell.text;el.title=cell.title;
     };
-    const doDays=(label,ids,daysP)=>{
-        daysP.then(d=>{
+    const doDays=(label,ids,daysP)=>daysP.then(d=>{
             if(!d){ids.forEach(dashDay);return;}
             writeDays(ids[0],d.units);
             writeDays(ids[1],d.cases);
-        }).catch(e=>{console.warn('[SB-BacklogDays] '+label+' render error: '+(e&&e.message));ids.forEach(dashDay);});
-    };
-    doDays('IB',ibDays,c.ibDaysP);
-    doDays('DA',daDays,c.daDaysP);
+        }).catch(e=>{console.warn('[SB-BacklogDays] '+label+' render error: '+(e&&e.message));ids.forEach(dashDay);}).then(()=>rec(ids));
+    chains.push(doDays('IB',ibDays,c.ibDaysP));
+    chains.push(doDays('DA',daDays,c.daDaysP));
+    const pend={site:S,done:false,p:null};
+    pend.p=Promise.all(chains).then(()=>{pend.done=true;dbg('[SB-EOS] backlog fill done for '+S);},()=>{pend.done=true;});
+    _sbEosBacklogPending=pend;
+}
+// (15.55.0) Backlog state for the EOS Wash: the in-flight fill ({site,done,p}) and the last
+// finished cell values ({site,cells:{id:{text,title}}}). var (not let) so no TDZ on early calls.
+var _sbEosBacklogPending=null, _sbEosBacklogCells=null;
+var EOS_BL_IDS=['eos-bl-ib-units','eos-bl-ib-cases','eos-bl-ib-dunits','eos-bl-ib-dcases','eos-bl-ib-ipt',
+                'eos-bl-da-units','eos-bl-da-cases','eos-bl-da-dunits','eos-bl-da-dcases','eos-bl-da-ipt'];
+// Re-writes the last finished backlog values into the (re-rendered) spans. Root cause of the
+// "backlog not at all" email: renderEOSWash rebuilds the spans as em-dashes on every passive
+// re-render, but only the Fetch path refilled them, so a theme toggle / LP edit blanked them.
+function sbEosBacklogReapply(){
+    try{
+        const S=String((loadConfig()||{}).site||'').toUpperCase();
+        const c=_sbEosBacklogCells;
+        if(!c||c.site!==S)return;
+        Object.keys(c.cells).forEach(id=>{
+            const el=document.getElementById(id);if(!el)return;
+            const v=c.cells[id];
+            el.textContent=v.text;
+            if(v.title)el.title=v.title;else el.removeAttribute('title');
+        });
+    }catch(e){console.warn('[SB-EOS] backlog reapply failed: '+(e&&e.message));}
+}
+// (15.55.0) Resolves ('ok' | 'timeout') once the EOS Wash backlog fill has finished, at most
+// timeoutMs later. Starts a fill when none ran for this site. Then restores the finished values
+// and re-reads IPT from GM storage, so the capture never races the backlog fetches. Never rejects.
+function sbEosBacklogReady(timeoutMs){
+    const ms=timeoutMs>0?timeoutMs:15000;
+    try{
+        const S=String((loadConfig()||{}).site||'').toUpperCase();
+        let pend=_sbEosBacklogPending;
+        if(S&&!(pend&&pend.site===S)&&!(_sbEosBacklogCells&&_sbEosBacklogCells.site===S)){
+            dbg('[SB-EOS] backlog never pulled for '+S+' \u2014 starting it before the capture');
+            fillEosBacklog(S);pend=_sbEosBacklogPending;
+        }
+        const wait=(pend&&pend.site===S&&!pend.done)?pend.p.then(()=>'ok'):Promise.resolve('ok');
+        let timer=null;
+        const to=new Promise(res=>{timer=setTimeout(()=>res('timeout'),ms);});
+        return Promise.race([wait,to]).then(st=>{
+            clearTimeout(timer);
+            if(st==='timeout')console.warn('[SB-EOS] backlog still loading after '+ms+'ms \u2014 capturing; missing cells show n/a');
+            sbEosBacklogReapply();
+            sbFillIptCells('eos-bl-ib-ipt','eos-bl-da-ipt',sbShiftIso());
+            return st;
+        }).catch(()=>'ok');
+    }catch(e){console.warn('[SB-EOS] backlog ready check failed: '+(e&&e.message));return Promise.resolve('ok');}
 }
 
 // (15.47.0) EOS Wash Atlas Breakdown: THRESHOLD and DPMO are READ-ONLY copies of the Sync ICQA
@@ -8493,8 +8577,8 @@ function renderEOSWash(data){
         <div style="font-size:10px;color:#888;margin-top:6px;">Plan values are read from the Sync tab targets.</div>
     </section>`;
 
-    // (15.50.0) Highlights: two manual free-text rows (Success Story, Safety) placed between Shift
-    // Accuracy and INBOUND. Textareas reuse the Bridge note styling/auto-grow (eos-bridge-ta) and
+    // (15.50.0) Highlights: two manual free-text rows (Success Story, Safety). (15.55.0) Placed at
+    // the very TOP of the tab, above Shift Accuracy. Textareas reuse the Bridge note styling/auto-grow (eos-bridge-ta) and
     // persist via the normal .eos-manual save (keyed by id), so Get Data re-renders restore them.
     // The email's onclone step swaps every textarea in #eoswash-content, so these wrap in the image.
     const hlNote=(id,ph)=>`<textarea class="support-input eos-manual eos-bridge-ta eos-highlight-ta" id="${id}" placeholder="${ph}" rows="2" style="width:100%;box-sizing:border-box;background:#ffffcc;color:#000;border:1px solid #999;border-radius:3px;resize:vertical;white-space:pre-wrap;word-wrap:break-word;font-family:inherit;text-align:left;"></textarea>`;
@@ -8595,7 +8679,9 @@ function renderEOSWash(data){
         <div style="margin-top:8px;"><button id="eos-safety-add" class="btn btn-small" style="background:#2e7d32;color:#fff;border-color:#2e7d32;">+ Add Row</button> <button id="eos-safety-remove" class="btn btn-small" style="background:#c62828;color:#fff;border-color:#c62828;">\u2212 Remove Row</button></div>
     </section>`;
 
-    content.innerHTML=accuracyHTML+highlightsHTML+processHTML+backlogHTML+qualityHTML+safetyHTML;
+    // (15.55.0) Highlights first (above Shift Accuracy). The email images / Snip follow this DOM
+    // order (sections are split top-to-bottom in sbReflowEosCaptureClone / sbEosSliceRanges).
+    content.innerHTML=highlightsHTML+accuracyHTML+processHTML+backlogHTML+qualityHTML+safetyHTML;
 
     // Wire the Safety "+ Add Row" button (adds one more leader row, persists the new count).
     { const addBtn=document.getElementById('eos-safety-add'); if(addBtn)addBtn.addEventListener('click',addEosSafetyRow);
@@ -8635,6 +8721,8 @@ function renderEOSWash(data){
     // (15.47.0) Atlas Breakdown THRESHOLD + DPMO are read-only copies of the Sync-tab ICQA ATLAS
     // cells; refreshEosAtlasFromSync fills them and runs updateAtlasThreshold (red + reason row).
     refreshEosAtlasFromSync();
+    // (15.55.0) Restore the last finished backlog values (re-render no longer blanks them).
+    sbEosBacklogReapply();
     // (15.47.0) IPT Backlog (SandOP Network Viewer capture) for the shift START date.
     sbFillIptCells('eos-bl-ib-ipt','eos-bl-da-ipt',sbShiftIso());
 
@@ -8955,21 +9043,27 @@ function sbEosSliceCanvas(canvas,capInfo,scale){
 // (15.49.0) "Inbound EOS" / "Outbound EOS" section labels at the top of the body, each followed by
 // a blank line where the Inbound (Dock / Stow Area Readiness) and Outbound (Dock / Pick Area
 // Readiness) tables are pasted, then the EOS Wash text + image(s).
+// (15.55.0) The body HTML is shared with the clipboard email (sbEosBodyHtml); srcOf(im) gives each
+// <img> src (cid: for the .eml, a data: URI for the clipboard). The .eml is now only the last-resort
+// fallback when the clipboard cannot be written.
+function sbEosBodyHtml(site,imgs,srcOf){
+    const n=imgs.length;
+    return ''+
+        '<html><body style="font-family:Calibri,Arial,sans-serif;font-size:11pt;">'+
+        site+' team,<br><br>'+
+        '<b>Inbound EOS</b><br><br><br>'+
+        '<b>Outbound EOS</b><br><br><br>'+
+        'Please see the '+site+' EOS Wash below.<br><br>'+
+        imgs.map((im,i)=>'<img src="'+srcOf(im)+'" width="'+im.width+'" height="'+im.height+'" alt="EOS Wash'+(n>1?' ('+(i+1)+' of '+n+')':'')+'" style="max-width:100%;height:auto;display:block;">').join('<br>')+
+        '<br><br>'+
+        'Thank you,<br></body></html>';
+}
 function sbBuildEosEml(o){
     const CRLF='\r\n';   // CRLF line endings are required by the .eml (RFC 822) format.
     const stamp=o.stamp||Date.now();
     const boundary='----=_SB_'+stamp;
     const imgs=(o.images||[]).map((im,i)=>Object.assign({cid:'eoswash_'+stamp+'_'+(i+1),file:'EOSWash'+(o.images.length>1?'-'+(i+1):'')+'.png'},im));
-    const n=imgs.length;
-    const htmlBody=''+
-        '<html><body style="font-family:Calibri,Arial,sans-serif;font-size:11pt;">'+
-        o.site+' team,<br><br>'+
-        '<b>Inbound EOS</b><br><br><br>'+
-        '<b>Outbound EOS</b><br><br><br>'+
-        'Please see the '+o.site+' EOS Wash below.<br><br>'+
-        imgs.map((im,i)=>'<img src="cid:'+im.cid+'" width="'+im.width+'" height="'+im.height+'" alt="EOS Wash'+(n>1?' ('+(i+1)+' of '+n+')':'')+'" style="max-width:100%;height:auto;display:block;">').join('<br>')+
-        '<br><br>'+
-        'Thank you,<br></body></html>';
+    const htmlBody=sbEosBodyHtml(o.site,imgs,im=>'cid:'+im.cid);
     const parts=[];
     imgs.forEach(im=>{parts.push(
         '--'+boundary,
@@ -8999,9 +9093,118 @@ function sbBuildEosEml(o){
     ].join(CRLF);
 }
 
-// Capture the EOS Wash as an image, copy it to the clipboard, and open an email addressed to
-// the site's boss ({SITE}-boss@amazon.com). The user pastes the image into the email body.
+// (15.55.0) On-board notice for the Email button: fixed banner outside #sb-root (so the dark-mode
+// colour overrides never touch it), role=status / aria-live so screen readers announce it, a
+// Dismiss button, auto-hides after 25s. kind 'ok' (green) | 'warn' (amber). linkHref adds an
+// "Open email again" link (a real user click always may launch the mail app). Never throws.
+function sbEosEmailToast(msg,kind,linkHref){
+    try{
+        let el=document.getElementById('sb-eos-email-toast');
+        if(!el){el=document.createElement('div');el.id='sb-eos-email-toast';el.setAttribute('role','status');el.setAttribute('aria-live','polite');document.body.appendChild(el);}
+        const warn=kind==='warn';
+        el.style.cssText='position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:1000000;max-width:760px;padding:10px 16px;display:flex;align-items:center;gap:12px;font:600 14px sans-serif;border-radius:6px;box-shadow:0 4px 14px rgba(0,0,0,0.25);'+(warn?'background:#fff3cd;color:#664d03;border:1px solid #ffe08a;':'background:#e8f5e9;color:#1b5e20;border:1px solid #81c784;');
+        el.textContent='';
+        const t=document.createElement('span');t.textContent=msg;el.appendChild(t);
+        if(linkHref){const a=document.createElement('a');a.href=linkHref;a.textContent='Open email again';a.style.cssText='color:inherit;text-decoration:underline;white-space:nowrap;';el.appendChild(a);}
+        const b=document.createElement('button');b.type='button';b.textContent='Dismiss';
+        b.style.cssText='background:rgba(0,0,0,0.08);border:none;color:inherit;padding:4px 10px;border-radius:4px;cursor:pointer;font-weight:bold;';
+        b.addEventListener('click',()=>{el.style.display='none';});el.appendChild(b);
+        el.style.display='flex';
+        clearTimeout(el._sbHide);el._sbHide=setTimeout(()=>{el.style.display='none';},25000);
+    }catch(e){console.warn('[SB-EOS] toast failed: '+(e&&e.message));}
+}
+// (15.55.0) Short mailto: URL (no body / image data, so no length limits): To + Cc + Subject.
+// Plain addresses joined with ';' (the separator Outlook desktop / new Outlook accept).
+function sbEosMailtoUrl(to,ccList,subject){
+    const enc=(s)=>encodeURIComponent(s).replace(/%40/g,'@');
+    const q=[];
+    if(ccList&&ccList.length)q.push('cc='+ccList.map(enc).join(';'));
+    q.push('subject='+encodeURIComponent(subject));
+    return 'mailto:'+enc(to)+'?'+q.join('&');
+}
+// Hidden-anchor click: hands the mailto: to the OS mail handler (Outlook) without navigating or
+// unloading the board (no window.open popup, no iframe).
+function sbOpenMailto(url){
+    const a=document.createElement('a');a.href=url;a.style.display='none';
+    document.body.appendChild(a);a.click();document.body.removeChild(a);
+}
+// (15.55.0) The EOS Wash html2canvas capture (moved out of emailEOSWash, behaviour unchanged
+// except: the CLONE is forced to the light theme and backlog cells with no value show "n/a").
+// Resolves {canvas,capInfo}; the live controls' data-sb-cap stamps are always removed.
+function sbEosCaptureCanvas(content){
+    return new Promise((resolve,reject)=>{
+        // Give the browser a tick, then capture.
+        setTimeout(()=>{
+            // (15.48.3 / 15.50.0 / 15.53.0 / 15.53.1) In the CLONED document only (the live board is
+            // untouched), every manual input / textarea / select becomes plain wrapping text and the
+            // Safety Add PA / × / Add Row / Remove Row buttons are hidden. See sbFlattenControlsForCapture.
+            // (15.53.2) Stamp the LIVE controls + snapshot their values first; the stamps are removed
+            // in the finally below whether the capture succeeds or fails.
+            let capMap=null;
+            try{capMap=sbTagControlsForCapture(content);}catch(e){console.warn('[SB-EOS] capture tag failed:',e);}
+            // (15.53.3) Full-element capture: clone iframe = the full live page size (same media
+            // queries as the board), no scroll offset.
+            // (15.54.0) The cloned root is then REFLOWED to EOS_CAP_W CSS px (see
+            // sbReflowEosCaptureClone) and captured at EOS_CAP_SCALE for sharp text; the email shows
+            // each image at 1:1 CSS size, so Outlook no longer shrinks it.
+            const de=document.documentElement;
+            const liveW=Math.ceil(Math.max(content.scrollWidth,content.getBoundingClientRect().width));
+            const winW=Math.ceil(Math.max(window.innerWidth||0,de.clientWidth||0,de.scrollWidth||0,content.getBoundingClientRect().left+window.scrollX+liveW+2*EOS_CAP_PAD));
+            const winH=Math.ceil(Math.max(window.innerHeight||0,de.scrollHeight||0,content.getBoundingClientRect().top+window.scrollY+content.scrollHeight+2*EOS_CAP_PAD));
+            let capInfo=null;   // reflowed clone size + section spans (CSS px), set in onclone
+            const flattenEosClone=(clonedDoc)=>{
+                // (15.55.0) Always light theme in the email, whatever the board theme.
+                try{const rc=clonedDoc.getElementById('sb-root');if(rc)rc.classList.remove('dark-mode');}catch(e){}
+                const cr=clonedDoc.getElementById('eoswash-content');
+                // (15.55.0) A backlog cell still spinning / blank / em-dash after sbEosBacklogReady
+                // reads "n/a" in the email (never an empty cell), and is logged.
+                try{
+                    const na=[];
+                    EOS_BL_IDS.forEach(id=>{
+                        const el=cr&&cr.querySelector('#'+id);if(!el)return;
+                        const t=(el.textContent||'').trim();
+                        if(el.querySelector('.sb-spin')||!t||t==='\u2014'){el.textContent='n/a';na.push(id);}
+                    });
+                    if(na.length)console.warn('[SB-EOS] backlog value unavailable, shown as n/a in the email: '+na.join(', '));
+                }catch(e){console.warn('[SB-EOS] backlog n/a pass failed:',e);}
+                try{sbFlattenControlsForCapture(capMap,cr);}
+                catch(e){console.warn('[SB-EOS] capture flatten failed:',e);}
+                try{capInfo=sbReflowEosCaptureClone(cr,EOS_CAP_W,EOS_CAP_PAD);}
+                catch(e){console.warn('[SB-EOS] capture reflow failed:',e);}
+            };
+            let capPromise;
+            try{capPromise=html2canvas(content,{backgroundColor:'#ffffff',scale:EOS_CAP_SCALE,useCORS:true,logging:false,scrollX:0,scrollY:0,windowWidth:winW,windowHeight:winH,onclone:flattenEosClone});}
+            catch(e){capPromise=Promise.reject(e);}
+            capPromise.finally(()=>sbUntagControlsForCapture(capMap)).then(canvas=>resolve({canvas,capInfo}),reject);
+        },150);
+    });
+}
+// (15.55.0) The whole capture as ONE tall PNG at 1:1 CSS size (~EOS_CAP_W px wide), used as the
+// clipboard's image/png flavour so a paste still works if a client drops the HTML images.
+function sbEosCombinedPngBlob(canvas,scale){
+    return new Promise((resolve,reject)=>{
+        try{
+            const sc=scale>0?scale:1;
+            const c=document.createElement('canvas');
+            c.width=Math.max(1,Math.round(canvas.width/sc));c.height=Math.max(1,Math.round(canvas.height/sc));
+            const g=c.getContext('2d');g.imageSmoothingEnabled=true;g.imageSmoothingQuality='high';
+            g.drawImage(canvas,0,0,c.width,c.height);
+            c.toBlob(b=>b?resolve(b):reject(new Error('PNG encode failed')),'image/png');
+        }catch(e){reject(e);}
+    });
+}
+
+// Capture the EOS Wash and open an email addressed to the site's boss ({SITE}-boss@amazon.com).
 // (15.49.0) KRB3 emails CC site leadership; body has "Inbound EOS" / "Outbound EOS" labels.
+// (15.55.0) No download step: the button (1) waits for the Backlog fetches (sbEosBacklogReady,
+// <= 15s) and re-reads IPT, (2) captures as before, (3) puts the full email body (greeting, labels,
+// section images as data: PNGs at 1:1, closing) on the clipboard as HTML + one combined PNG,
+// (4) opens a compose window via a short mailto: (To / Cc / Subject), (5) shows a "press Ctrl+V"
+// notice. Browsers cannot open a compose window WITH images, so the user pastes the body.
+// navigator.clipboard.write is called synchronously in the click (user activation) with
+// Promise<Blob> values that resolve after the capture; the mailto opens only after the write
+// resolves (so the mail app taking focus cannot break it). Fallbacks: GM_setClipboard(html,'html'),
+// then the old .eml download (warned in the console + the notice).
 function emailEOSWash(){
     if(!sbEosEnabled())return;   // (15.51.0) KRB3-only (button is hidden with the tab for other sites)
     const content=document.getElementById('eoswash-content');
@@ -9018,50 +9221,48 @@ function emailEOSWash(){
         KRB3:['Damien Baker <damibake@amazon.com>','Pablo Ucros <ucros@amazon.com>']
     };
     const cc=(EOS_EMAIL_CC[site]||[]).join(', ');
-    const shift=config.shiftType||'';
-    const dateStr=new Date().toLocaleDateString();
+    const ccAddrs=(EOS_EMAIL_CC[site]||[]).map(s=>{const m=/<([^>]+)>/.exec(s);return m?m[1]:s;});
     const subject=`${site} EOS Wash`;   // (15.51.2) user request: subject is just "KRB3 EOS Wash"
-    const isDark=document.getElementById('sb-root')?.classList.contains('dark-mode');
-    if(btn){btn.disabled=true;btn.textContent='\u23F3 Capturing...';}
-    // Give the browser a tick, then capture.
-    setTimeout(()=>{
-        // (15.48.3 / 15.50.0 / 15.53.0 / 15.53.1) In the CLONED document only (the live board is
-        // untouched), every manual input / textarea / select becomes plain wrapping text and the
-        // Safety Add PA / × / Add Row / Remove Row buttons are hidden. See sbFlattenControlsForCapture.
-        // (15.53.2) Stamp the LIVE controls + snapshot their values first; the stamps are removed
-        // in the finally below whether the capture succeeds or fails.
-        let capMap=null;
-        try{capMap=sbTagControlsForCapture(content);}catch(e){console.warn('[SB-EOS] capture tag failed:',e);}
-        // (15.53.3) Full-element capture: clone iframe = the full live page size (same media
-        // queries as the board), no scroll offset.
-        // (15.54.0) The cloned root is then REFLOWED to EOS_CAP_W CSS px (see
-        // sbReflowEosCaptureClone) and captured at EOS_CAP_SCALE for sharp text; the email shows
-        // each image at 1:1 CSS size, so Outlook no longer shrinks it.
-        const de=document.documentElement;
-        const liveW=Math.ceil(Math.max(content.scrollWidth,content.getBoundingClientRect().width));
-        const winW=Math.ceil(Math.max(window.innerWidth||0,de.clientWidth||0,de.scrollWidth||0,content.getBoundingClientRect().left+window.scrollX+liveW+2*EOS_CAP_PAD));
-        const winH=Math.ceil(Math.max(window.innerHeight||0,de.scrollHeight||0,content.getBoundingClientRect().top+window.scrollY+content.scrollHeight+2*EOS_CAP_PAD));
-        let capInfo=null;   // reflowed clone size + section spans (CSS px), set in onclone
-        const flattenEosClone=(clonedDoc)=>{
-            const cr=clonedDoc.getElementById('eoswash-content');
-            try{sbFlattenControlsForCapture(capMap,cr);}
-            catch(e){console.warn('[SB-EOS] capture flatten failed:',e);}
-            try{capInfo=sbReflowEosCaptureClone(cr,EOS_CAP_W,EOS_CAP_PAD);}
-            catch(e){console.warn('[SB-EOS] capture reflow failed:',e);}
-        };
-        let capPromise;
-        try{capPromise=html2canvas(content,{backgroundColor:isDark?'#1a1a2e':'#ffffff',scale:EOS_CAP_SCALE,useCORS:true,logging:false,scrollX:0,scrollY:0,windowWidth:winW,windowHeight:winH,onclone:flattenEosClone});}
-        catch(e){capPromise=Promise.reject(e);}
-        capPromise.finally(()=>sbUntagControlsForCapture(capMap)).then(canvas=>{
-            // Build an .eml file (standard email format) with the EOS Wash image embedded inline
-            // in the HTML body. Opening the .eml launches the DESKTOP Outlook app with a new
-            // message already addressed, subjected, and containing the image — ready to send.
-            // (15.54.0) One canvas, split between sections into images of at most EOS_SLICE_MAX_H
-            // CSS px (see sbEosSliceRanges), each shown at 1:1 CSS size (width = canvas.width /
-            // EOS_CAP_SCALE = EOS_CAP_W). Outlook desktop honours the width/height attributes;
-            // other clients use max-width:100% + height:auto. The PNGs keep the 2x resolution.
-            const images=sbEosSliceCanvas(canvas,capInfo,EOS_CAP_SCALE);
-            const eml=sbBuildEosEml({to,cc,subject,site,images,stamp:Date.now()});
+    const mailto=sbEosMailtoUrl(to,ccAddrs,subject);
+    if(btn){btn.disabled=true;btn.textContent='\u23F3 Loading backlog\u2026';}
+    const resetBtn=(ms)=>{if(btn)setTimeout(()=>{btn.textContent='\u2709 Email';btn.disabled=false;},ms||0);};
+    // Backlog ready -> capture -> section images + body HTML + combined PNG.
+    const job=sbEosBacklogReady(15000).then(()=>{
+        if(btn)btn.textContent='\u23F3 Capturing...';
+        return sbEosCaptureCanvas(content);
+    }).then(({canvas,capInfo})=>{
+        // (15.54.0) One canvas, split between sections into images of at most EOS_SLICE_MAX_H
+        // CSS px (see sbEosSliceRanges), each shown at 1:1 CSS size (width = canvas.width /
+        // EOS_CAP_SCALE = EOS_CAP_W). The PNGs keep the 2x resolution.
+        const images=sbEosSliceCanvas(canvas,capInfo,EOS_CAP_SCALE);
+        const html=sbEosBodyHtml(site,images,im=>'data:image/png;base64,'+im.b64);
+        return sbEosCombinedPngBlob(canvas,EOS_CAP_SCALE)
+            .catch(e=>{console.warn('[SB-EOS] combined PNG failed: '+(e&&e.message));return null;})
+            .then(png=>({images,html,png}));
+    });
+    job.catch(()=>{});   // handled below; avoids an "unhandled rejection" for the side branches
+    // Clipboard write created NOW, inside the click's user activation; its blobs resolve later.
+    let writeP;
+    try{
+        if(navigator.clipboard&&typeof navigator.clipboard.write==='function'&&typeof ClipboardItem==='function'){
+            const htmlP=job.then(j=>new Blob([j.html],{type:'text/html'}));
+            const pngP=job.then(j=>{if(!j.png)throw new Error('combined PNG unavailable');return j.png;});
+            htmlP.catch(()=>{});pngP.catch(()=>{});
+            writeP=navigator.clipboard.write([new ClipboardItem({'text/html':htmlP,'image/png':pngP})]);
+        }else writeP=Promise.reject(new Error('navigator.clipboard.write / ClipboardItem unavailable'));
+    }catch(e){writeP=Promise.reject(e);}
+    writeP.then(()=>job.then(()=>'clipboard'),err=>job.then(j=>{
+        console.warn('[SB-EOS] clipboard.write failed ('+(err&&err.message)+') \u2014 trying GM_setClipboard');
+        if(typeof GM_setClipboard==='function'){
+            try{GM_setClipboard(j.html,'html');return 'gm';}
+            catch(e){console.warn('[SB-EOS] GM_setClipboard failed: '+(e&&e.message));}
+        }
+        return 'eml';
+    })).then(mode=>job.then(j=>{
+        if(mode==='eml'){
+            // Last resort: the pre-15.55.0 .eml download (opens in Outlook with the images inline).
+            console.warn('[SB-EOS] clipboard unavailable \u2014 falling back to the .eml download');
+            const eml=sbBuildEosEml({to,cc,subject,site,images:j.images,stamp:Date.now()});
             const blob=new Blob([eml],{type:'message/rfc822'});
             const url=URL.createObjectURL(blob);
             const a=document.createElement('a');
@@ -9069,13 +9270,21 @@ function emailEOSWash(){
             a.download=(site||'EOS')+'_EOS_Wash_'+new Date().toISOString().slice(0,16).replace(/[T:]/g,'-')+'.eml';
             document.body.appendChild(a);a.click();document.body.removeChild(a);
             setTimeout(()=>URL.revokeObjectURL(url),4000);
-            if(btn){btn.textContent='\u2713 Opening Outlook\u2026';setTimeout(()=>{btn.textContent='\u2709 Email';btn.disabled=false;},4000);}
-        }).catch(e=>{
-            console.error('[SB-EOS] email capture failed:',e);
-            if(btn){btn.textContent='\u2709 Email';btn.disabled=false;}
-            alert('Screenshot failed: '+e.message);
-        });
-    },150);
+            sbEosEmailToast('Couldn\u2019t copy the EOS Wash to the clipboard \u2014 downloaded the .eml instead. Open it to send.','warn');
+            if(btn)btn.textContent='\u2713 .eml downloaded';
+            resetBtn(4000);
+            return;
+        }
+        sbOpenMailto(mailto);
+        dbg('[SB-EOS] email: body on clipboard via '+mode+', '+j.images.length+' image(s), mailto opened ('+mailto.length+' chars)');
+        sbEosEmailToast('Email opened \u2014 click in the message body and press Ctrl+V to paste the EOS Wash.','ok',mailto);
+        if(btn)btn.textContent='\u2713 Email opened';
+        resetBtn(4000);
+    })).catch(e=>{
+        console.error('[SB-EOS] email capture failed:',e);
+        if(btn){btn.textContent='\u2709 Email';btn.disabled=false;}
+        alert('Screenshot failed: '+(e&&e.message));
+    });
 }
 
 // === BOOT ===
