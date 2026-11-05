@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.59.0
+// @version      15.60.1
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -121,6 +121,14 @@ const SITE_SCHEDULES = {
 //   for any site not yet mapped; fill in other sites' block/ops as they're confirmed.
 const SHIFT_HOURS = { KRB3:{block:10, ops:9.25} };
 const SHIFT_HOURS_DEFAULT = {block:10, ops:9.25};
+// (15.60.0) EOS Wash shift-window lock. A shift that already ended stays the EOS Wash's shift for
+// SB_EOS_GRACE_MIN minutes after its fetch-window end (a 7 AM pull still shows the night that just
+// ended). The OM can override with the Auto | Days | Nights selector (persisted under this key).
+const SB_EOS_GRACE_MIN = 240;
+const SB_EOS_SHIFT_MODE_KEY = 'syncboard_eos_shift_mode';
+// (15.60.0) ICQA "current week" rolls to the new Sun-Sat week only at Sunday 08:00 local, so the
+// Saturday-night shift (which ends Sunday morning) stays in the week it started in.
+const SB_ICQA_WEEK_ROLL_HOUR = 8;
 const PROCESS_IDS = { stow:'1003035', palletStow:'1003041', pick:'1003065', sort:'1003009', obDock:'1003021', icqa:'1003030', vretPack:'1003056', vretPick:'1003034', rsr:'01003012',
     // OB NTP (Pack & Ship area, processId 1002991): actual-only metric, no plan. We read ItemPacked
     // Jobs (tfoot idx1) + ItemShipped Jobs (tfoot idx7) + Total Paid Hours (idx0). Combined jobs
@@ -210,7 +218,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.59.0';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.60.1';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -563,6 +571,102 @@ function getShiftDates(config){
     endDate.setHours(sched.full.eh,sched.full.em,0,0);
     if(config.shiftType==='Nights'&&now.getHours()<12){startDate.setDate(startDate.getDate()-1);endDate.setDate(endDate.getDate()-1);}
     return{startDate,endDate};
+}
+// ---- (15.60.0) EOS Wash shift-window resolver (pure; no DOM). getShiftDates above is the Sync
+// tab's and is NOT changed. All times are local; dates are stepped from local noon (DST-safe).
+// One occurrence of a shift that starts on calendar day `day`: start = day at full.sh:sm, end =
+// day at full.eh:em (+1 day when the window crosses midnight).
+function sbShiftOccurrence(sched,type,day){
+    const f=sched.full;
+    const base=new Date(day);base.setHours(12,0,0,0);
+    const start=new Date(base);start.setHours(f.sh,f.sm,0,0);
+    const end=new Date(base);
+    if(f.eh*60+f.em<=f.sh*60+f.sm)end.setDate(end.getDate()+1);
+    end.setHours(f.eh,f.em,0,0);
+    return{type:type,start:start,end:end,sched:sched};
+}
+// The most recent occurrence of `type` that has STARTED by `now` (in progress or ended).
+function sbShiftLatestStarted(cfg,type,now){
+    const sched=type==='Nights'?cfg.nights:cfg.days;
+    const today=new Date(now);today.setHours(12,0,0,0);
+    let o=sbShiftOccurrence(sched,type,today);
+    if(o.start.getTime()>now.getTime()){const y=new Date(today);y.setDate(y.getDate()-1);o=sbShiftOccurrence(sched,type,y);}
+    return o;
+}
+// The shift the EOS Wash reports on. mode 'Days' / 'Nights' = the latest started occurrence of that
+// shift (reason 'forced'). mode 'Auto': the shift that ended last stays locked until graceMin after
+// its end, even though the next shift has started (reason 'grace'); otherwise the shift in progress
+// (reason 'current'); otherwise the last ended one (reason 'last').
+// Returns {type,startDate,endDate,sched,reason,mode}.
+function sbEosResolveShift(cfg,mode,now,graceMin){
+    const t0=(now instanceof Date)?now:new Date();
+    const t=t0.getTime();
+    const g=((typeof graceMin==='number'&&graceMin>=0)?graceMin:SB_EOS_GRACE_MIN)*60000;
+    const m=(mode==='Days'||mode==='Nights')?mode:'Auto';
+    const mk=(o,reason)=>({type:o.type,startDate:new Date(o.start),endDate:new Date(o.end),sched:o.sched,reason:reason,mode:m});
+    if(m!=='Auto')return mk(sbShiftLatestStarted(cfg,m,t0),'forced');
+    const D=sbShiftLatestStarted(cfg,'Days',t0), N=sbShiftLatestStarted(cfg,'Nights',t0);
+    const inProg=(o)=>o.start.getTime()<=t&&t<o.end.getTime();
+    const cur=inProg(D)?D:(inProg(N)?N:null);
+    const ended=[D,N].filter(o=>o.end.getTime()<=t).sort((a,b)=>b.end.getTime()-a.end.getTime());
+    const prev=ended[0]||null;
+    if(prev&&t<prev.end.getTime()+g)return mk(prev,'grace');
+    if(cur)return mk(cur,'current');
+    if(prev)return mk(prev,'last');
+    return mk(D.start.getTime()>=N.start.getTime()?D:N,'current');
+}
+// "Nights · 10/19 17:45 → 10/20 05:30" (the fetch window, 24h).
+function sbEosShiftLabel(win){
+    try{
+        const p2=(n)=>String(n).padStart(2,'0');
+        const f=(d)=>p2(d.getMonth()+1)+'/'+p2(d.getDate())+' '+p2(d.getHours())+':'+p2(d.getMinutes());
+        return win.type+' \u00b7 '+f(win.startDate)+' \u2192 '+f(win.endDate);
+    }catch(e){return '';}
+}
+// Muted suffix that says why this shift was picked.
+function sbEosShiftSuffix(win){
+    const r=win&&win.reason;
+    if(r==='grace')return '(Auto \u00b7 last shift, 4h grace)';
+    if(r==='current')return '(Auto \u00b7 in progress)';
+    if(r==='last')return '(Auto \u00b7 last shift)';
+    if(r==='forced')return '(selected)';
+    return '';
+}
+// Tooltip: periods + SOS/EOS (P1 start -> P3 end) + the fetch window.
+function sbEosShiftTitle(win){
+    try{
+        const s=win.sched,hm=(h,m)=>String(h).padStart(2,'0')+':'+String(m).padStart(2,'0');
+        const per=(k)=>s[k]?k.toUpperCase()+' '+hm(s[k].sh,s[k].sm)+'\u2013'+hm(s[k].eh,s[k].em):'';
+        return [per('p1'),per('p2'),per('p3')].filter(Boolean).join(' \u00b7 ')+
+            (s.p1&&s.p3?' | SOS '+hm(s.p1.sh,s.p1.sm)+' \u2192 EOS '+hm(s.p3.eh,s.p3.em):'')+
+            ' | fetch window '+hm(s.full.sh,s.full.sm)+' \u2192 '+hm(s.full.eh,s.full.em)+
+            ' | Auto keeps the last shift for '+(SB_EOS_GRACE_MIN/60)+'h after it ends';
+    }catch(e){return '';}
+}
+function sbEosShiftMode(){try{const v=localStorage.getItem(SB_EOS_SHIFT_MODE_KEY);return(v==='Days'||v==='Nights')?v:'Auto';}catch(e){return 'Auto';}}
+function sbSetEosShiftMode(m){try{localStorage.setItem(SB_EOS_SHIFT_MODE_KEY,(m==='Days'||m==='Nights')?m:'Auto');}catch(e){}}
+// The EOS Wash window: the displayed wash's window when one is shown (so IPT / re-renders match the
+// data on screen), else what a fetch would use right now.
+function sbEosWindow(){
+    try{if(currentEOSWash&&currentEOSWash.shift)return currentEOSWash.shift;}catch(e){}
+    return sbEosResolveShift(loadConfig(),sbEosShiftMode());
+}
+function sbEosShiftIso(){try{return isoDate(sbEosWindow().startDate);}catch(e){return isoDate(new Date());}}
+// Header label next to the Shift selector: "Showing: <shift>" for the displayed wash, else
+// "Will fetch: <shift>" for what the next Fetch would use. Never throws.
+function sbEosUpdateShiftLabel(){
+    try{
+        if(!sbEosEnabled())return;
+        const el=document.getElementById('eos-shift-label');if(!el)return;
+        let shown=null;try{shown=(currentEOSWash&&currentEOSWash.shift)||null;}catch(e){shown=null;}
+        const win=shown||sbEosResolveShift(loadConfig(),sbEosShiftMode());
+        el.textContent=(shown?'Showing: ':'Will fetch: ')+sbEosShiftLabel(win)+' ';
+        const suf=document.createElement('span');
+        suf.style.cssText='opacity:.7;font-size:11px;';
+        suf.textContent=sbEosShiftSuffix(win);
+        el.appendChild(suf);
+        el.title=sbEosShiftTitle(win);
+    }catch(e){console.warn('[SB-EOS] shift label update failed: '+(e&&e.message));}
 }
 // Fetch FCLM HTML. Retries ONCE on a 5xx server error (e.g. the HTTP 500s FCLM throws during its
 // rolling version upgrades) after a short backoff, since those are usually transient. 4xx (auth)
@@ -1358,6 +1462,38 @@ function getWeekSunday(){
     const now=new Date();
     const sun=new Date(now);sun.setDate(now.getDate()-now.getDay());sun.setHours(0,0,0,0);
     return sun;
+}
+// (15.60.0) ICQA week start (Sunday 00:00 local) for `ref` (default now). Same as getWeekSunday,
+// except Sunday before SB_ICQA_WEEK_ROLL_HOUR (08:00) still belongs to the PREVIOUS Sun-Sat week, so
+// Saturday night's ICQA data isn't lost at midnight. Used by the ICQA paths only; getWeekSunday is
+// unchanged (it also feeds the ALPS LP-plan picker).
+function sbIcqaWeekSunday(ref){
+    const now=(ref instanceof Date)?new Date(ref):new Date();
+    const sun=new Date(now);sun.setHours(12,0,0,0);sun.setDate(sun.getDate()-now.getDay());
+    if(now.getDay()===0&&now.getHours()<SB_ICQA_WEEK_ROLL_HOUR)sun.setDate(sun.getDate()-7);
+    sun.setHours(0,0,0,0);
+    return sun;
+}
+// (15.60.0) Day slices for the Sync tab's ICQA WEEK RO rate (one 1-day Intraday PPR per slice).
+// weekSun..today, full days except today (ends at now). Inside the Sunday rollover grace (weekSun is
+// last week's Sunday) the 7 days of last week are full days and today's Sunday slice ends at
+// min(now, nightEnd) so only Saturday night's post-midnight hours count. Returns [{day,sh,sm,eh,em}].
+function sbIcqaWeekDaySlices(weekSun,now,nightEnd){
+    const out=[];
+    for(let i=0;i<8;i++){
+        const day=new Date(weekSun);day.setHours(12,0,0,0);day.setDate(day.getDate()+i);day.setHours(0,0,0,0);
+        if(day.getTime()>now.getTime())break;
+        const isToday=day.toDateString()===now.toDateString();
+        if(i===7){
+            if(!isToday)break;
+            let eh=now.getHours(),em=now.getMinutes();
+            if(nightEnd&&(nightEnd.eh*60+nightEnd.em)<(eh*60+em)){eh=nightEnd.eh;em=nightEnd.em;}
+            out.push({day:day,sh:0,sm:0,eh:eh,em:em});
+            break;
+        }
+        out.push({day:day,sh:0,sm:0,eh:isToday?now.getHours():23,em:isToday?now.getMinutes():59});
+    }
+    return out;
 }
 function isoDate(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
 // Walks the ALPS getPlanSelectionData response (array of {Metric:[...]} sections, each
@@ -3007,14 +3143,16 @@ async function fetchDaBacklog(site){
 // current Live plan's planId, then pulls that plan's weekly "support" (ICQA) grid and
 // reads the current week's Sunday column. Runs entirely in the background via
 // GM_xmlhttpRequest (uses your existing ALPS session cookies, same as the GCA fetch).
-function fetchAlpsLoadedRate(site,isRetry){
+// (15.60.0) `weekSun` (optional) picks the week; default = the ICQA week (sbIcqaWeekSunday, which
+// keeps last week until Sunday 08:00).
+function fetchAlpsLoadedRate(site,isRetry,weekSun){
     return new Promise(resolve=>{
-        const sunday=getWeekSunday();
+        const sunday=(weekSun instanceof Date)?new Date(weekSun):sbIcqaWeekSunday();
         const sundayStr=isoDate(sunday);
         const endDate=new Date(sunday);endDate.setDate(endDate.getDate()+6);
         const planUrl='https://alps-iad.iad.proxy.amazon.com/api/site/'+site+'/latest-completed-plan-by-tag?tagName=Live&siteType=FULFILLMENT_CENTER&polling=true';
         const retryOrFail=(reason)=>{
-            if(!isRetry){refreshAlpsSessionAndRetry(site,resolve);return;}
+            if(!isRetry){refreshAlpsSessionAndRetry(site,resolve,sunday);return;}
             console.warn('[SB] ALPS:',reason);resolve(null);
         };
         GM_xmlhttpRequest({method:'GET',url:planUrl,headers:{'Accept':'application/json'},
@@ -3051,7 +3189,7 @@ function fetchAlpsLoadedRate(site,isRetry){
 // Same silent-session-refresh trick as attemptLPFetch's GalaxyBI retry and the GCA
 // retry above: load ALPS Basecamp in a hidden iframe to pick up a fresh session cookie
 // off any still-valid Midway session, then retry once.
-function refreshAlpsSessionAndRetry(site,resolve){
+function refreshAlpsSessionAndRetry(site,resolve,weekSun){
     dbg('[SB] ALPS auth failed, refreshing session via iframe...');
     const iframe=document.createElement('iframe');
     iframe.style.cssText='position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;';
@@ -3060,7 +3198,7 @@ function refreshAlpsSessionAndRetry(site,resolve){
     setTimeout(()=>{
         if(iframe.parentNode)iframe.parentNode.removeChild(iframe);
         dbg('[SB] Retrying ALPS fetch after auth...');
-        fetchAlpsLoadedRate(site,true).then(resolve);
+        fetchAlpsLoadedRate(site,true,weekSun).then(resolve);
     },5000);
 }
 // Fetches the ALPS daily-plan "Capacity" (published target VOLUME in CARTONS) for a single
@@ -3483,16 +3621,17 @@ async function fetchIcqaRO(config,raw){
         // EACH day of the week so far (Sunday -> today), parse each with parseICQARow, and sum the
         // IC/QA/CS volume + hours across the days. Week RO rate = totalVol / totalHrs.
         try{
-            const weekSun=getWeekSunday();
+            // (15.60.0) ICQA week rolls at Sunday 08:00 (sbIcqaWeekSunday). Before that, last week's
+            // Sun..Sat plus today's slice up to the ICQA night-window end (Saturday night's tail).
             const today=new Date();
+            const weekSun=sbIcqaWeekSunday(today);
+            let nightEnd=null;
+            try{nightEnd=icqaTabWindows(config.site).night||null;}catch(e){nightEnd=null;}
             const dayFetches=[];
-            for(let d=new Date(weekSun);d<=today;d.setDate(d.getDate()+1)){
-                const day=new Date(d);
-                const isToday=day.toDateString()===today.toDateString();
-                const eh=isToday?today.getHours():23, em=isToday?today.getMinutes():59;
-                const url=buildPPRUrl(config.site,day,0,0,day,eh,em);   // 1-day Intraday PPR (server-rendered)
+            sbIcqaWeekDaySlices(weekSun,today,nightEnd).forEach(sl=>{
+                const url=buildPPRUrl(config.site,sl.day,sl.sh,sl.sm,sl.day,sl.eh,sl.em);   // 1-day Intraday PPR (server-rendered)
                 dayFetches.push(fetchHTML(url).then(h=>parseICQARow(new DOMParser().parseFromString(h,'text/html'))).catch(()=>({vol:0,hrs:0,rate:0})));
-            }
+            });
             const dayResults=await Promise.all(dayFetches);
             let totVol=0,totHrs=0;
             dayResults.forEach(r=>{totVol+=(r.vol||0);totHrs+=(r.hrs||0);});
@@ -3506,6 +3645,8 @@ async function fetchIcqaRO(config,raw){
             setEl('icqa-ro-week-actual','\u2014');setEl('icqa-ro-week-pct','\u2014');
         }
     }catch(e){console.warn('[SB] ICQA RO fetch error:',e.message);}
+    // (15.60.0) EOS Wash ICQA card (+ bridge visibility) follows the newest ICQA values.
+    try{if(typeof sbEosFillIcqa==='function')sbEosFillIcqa();}catch(e){}
 }
 
 // === ICQA: DC% (Direct Count %, target 70%) ===
@@ -3539,7 +3680,10 @@ async function fetchIcqaDC(config){
         // SBC / CC / Andon rates (JPH): parsed from the SAME shift fn-rollup HTML (no extra fetch).
         try{renderIcqaSyncRates(parseIcqaFnRates(shiftHtml));}catch(re){console.warn('[SB-ICQA-Rates] Sync tiles failed:',re&&re.message);}
 
-        const weekUrl=buildFnUrlWeek(site,PROCESS_IDS.icqa,getWeekSunday());
+        // (15.60.0) Sync ICQA hours changed -> refresh the EOS Wash ICQA card (no-op if not rendered).
+        try{if(typeof sbEosFillIcqa==='function')sbEosFillIcqa();}catch(e){}
+        // (15.60.0) ICQA week rolls at Sunday 08:00 (Saturday night stays in last week).
+        const weekUrl=buildFnUrlWeek(site,PROCESS_IDS.icqa,sbIcqaWeekSunday());
         const weekHtml=await fetchHTML(weekUrl);
         const weekDC=calcDCPercent(weekHtml);
         setEl('icqa-dc-week-actual',weekDC.totalHours>0?fmtPct(weekDC.pct):'\u2014');
@@ -4777,13 +4921,22 @@ function fetchVretGoalFromLP(planId,sundayStr,callback,dayName){
 }
 
 // Dark mode color helper for conditional formatting
+// (15.60.1) The dark / light palettes are named constants so the EOS email capture can map any
+// dark color baked into an inline style back to its light twin (sbEosLightenClone).
+const SB_CF_DARK={good:'#1b8a4a',warn:'#c77d00',bad:'#d32f2f',txt:'#fff'};
+const SB_CF_LIGHT={good:'rgba(52,211,153,0.15)',warn:'rgba(251,191,36,0.1)',bad:'rgba(220,38,38,0.12)',txt:''};
+const SB_CFD_DARK={goodBg:'#4caf50',goodTxt:'#fff',warnBg:'#ff9800',warnTxt:'#fff',badBg:'#f44336',badTxt:'#fff'};
+const SB_CFD_LIGHT={goodBg:'rgba(46,125,50,0.12)',goodTxt:'#2e7d32',warnBg:'rgba(230,81,0,0.1)',warnTxt:'#e65100',badBg:'rgba(198,40,40,0.1)',badTxt:'#c62828'};
+// Theme-aware good/bad TEXT colors (flow tables, VRETs delta).
+const SB_TXT_DARK={good:'#69f0ae',bad:'#ff5252'};
+const SB_TXT_LIGHT={good:'#2e7d32',bad:'#c62828'};
 function cfColors(){
     const dk=document.getElementById('sb-root')?.classList.contains('dark-mode');
-    return dk?{good:'#1b8a4a',warn:'#c77d00',bad:'#d32f2f',txt:'#fff'}:{good:'rgba(52,211,153,0.15)',warn:'rgba(251,191,36,0.1)',bad:'rgba(220,38,38,0.12)',txt:''};
+    return Object.assign({},dk?SB_CF_DARK:SB_CF_LIGHT);
 }
 function cfDensityColors(){
     const dk=document.getElementById('sb-root')?.classList.contains('dark-mode');
-    return dk?{goodBg:'#4caf50',goodTxt:'#fff',warnBg:'#ff9800',warnTxt:'#fff',badBg:'#f44336',badTxt:'#fff'}:{goodBg:'rgba(46,125,50,0.12)',goodTxt:'#2e7d32',warnBg:'rgba(230,81,0,0.1)',warnTxt:'#e65100',badBg:'rgba(198,40,40,0.1)',badTxt:'#c62828'};
+    return Object.assign({},dk?SB_CFD_DARK:SB_CFD_LIGHT);
 }
 
 function renderLPPercents(metrics){
@@ -6081,7 +6234,7 @@ function buildHTML(){return `
 </div></main>
 
 <main id="tab-eoswash" class="tab-content"><div class="eoswash-container">
-<div class="section-header"><h2 style="margin-right:14px;">EOS Wash</h2><button id="btn-fetch-eoswash" class="btn btn-primary">\u25B6 Fetch EOS Wash</button><button id="btn-email-eoswash" class="btn" style="background:#1565c0;color:#fff;border-color:#1565c0;">\u2709 Email</button><span id="eoswash-status" class="meta-text" style="margin-left:12px;"></span>
+<div class="section-header"><h2 style="margin-right:14px;">EOS Wash</h2><button id="btn-fetch-eoswash" class="btn btn-primary">\u25B6 Fetch EOS Wash</button><button id="btn-email-eoswash" class="btn" style="background:#1565c0;color:#fff;border-color:#1565c0;">\u2709 Email</button><label for="eos-shift-mode" style="margin-left:12px;font-size:12px;font-weight:600;">Shift</label> <select id="eos-shift-mode" class="btn btn-small" aria-label="EOS Wash shift" title="Auto keeps the last shift for 4h after it ends; pick Days or Nights to force one" style="margin-left:4px;"><option value="Auto">Auto</option><option value="Days">Days</option><option value="Nights">Nights</option></select> <span id="eos-shift-label" class="meta-text" style="margin-left:6px;"></span><span id="eoswash-status" class="meta-text" style="margin-left:12px;"></span>
 <span style="margin-left:auto;font-size:11px;color:#888;white-space:nowrap;">LP Shift Plan pulls from the Sync tab (Shift Plan Targets)</span></div>
 <div id="eoswash-content"></div>
 <div style="text-align:center;font-size:10px;color:#999;margin-top:10px;font-style:italic;">Inspired by ucros</div>
@@ -6577,6 +6730,11 @@ function buildCSS2(){return `
 .eoswash-section .metrics-table td:last-child{min-width:240px;width:260px;}
 .eos-bridge-ta{min-height:38px;line-height:1.3;overflow:hidden;background:#ffffcc!important;color:#000!important;}
 #sb-root.dark-mode .eos-bridge-ta{background:#fff3b0!important;color:#000!important;border-color:#777!important;}
+/* (15.60.0) Every EOS Wash bridge / reason box wraps and auto-grows (sbAutoGrowTa sets the height). */
+#eoswash-content textarea{white-space:pre-wrap;overflow-wrap:anywhere;word-break:normal;overflow-y:hidden;resize:vertical;box-sizing:border-box;}
+/* (15.60.0) Atlas / Piles / ICQA reason boxes keep their own lighter yellow (in dark mode too). */
+.eos-reason-ta{background:#fff7d6!important;color:#000!important;}
+#sb-root.dark-mode .eos-reason-ta{background:#fff7d6!important;color:#000!important;border-color:#d9b94a!important;}
 /* Support/indirect sub-group within an IB/OB section: compact, visually set off from the
    volume table above it so hours-only paths read as a distinct block (no blank Volume/Rate cells). */
 .eos-support-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:#777;margin:12px 0 4px 2px;}
@@ -6923,7 +7081,7 @@ function renderHourlyTables(hourlyData,totalHours){
     // outbound backlog HIGH = bad (<1.5h Healthy, 1.5-2h Warning, >=2h Critical).
     function buildOBFlowTable(){
         const dk=document.getElementById('sb-root')?.classList.contains('dark-mode');
-        const GREEN=dk?'#69f0ae':'#2e7d32',RED=dk?'#ff5252':'#c62828';
+        const GREEN=(dk?SB_TXT_DARK:SB_TXT_LIGHT).good,RED=(dk?SB_TXT_DARK:SB_TXT_LIGHT).bad;
         const site=(config.site||'').toUpperCase();
         const obRec=getSosRecord(site,'OB');
         const density=(obRec&&obRec.density>0)?obRec.density:flowCageDensity(site,'load');
@@ -6972,7 +7130,7 @@ function renderHourlyTables(hourlyData,totalHours){
     // 30-59m Warning, <=29m/empty Critical). Clear rate = whole stow team's throughput (cases stowed).
     function buildIBFlowTable(){
         const dk=document.getElementById('sb-root')?.classList.contains('dark-mode');
-        const GREEN=dk?'#69f0ae':'#2e7d32',RED=dk?'#ff5252':'#c62828';
+        const GREEN=(dk?SB_TXT_DARK:SB_TXT_LIGHT).good,RED=(dk?SB_TXT_DARK:SB_TXT_LIGHT).bad;
         const site=(config.site||'').toUpperCase();
         const ibRec=getSosRecord(site,'IB');
         const density=(ibRec&&ibRec.density>0)?ibRec.density:flowCageDensity(site,'stow');
@@ -7242,11 +7400,12 @@ function icqaTabSaveCache(cache){
 // Week rate target: ALPS ICQA loaded rate (memoized per site+week) -> ICQA RO target input
 // (Sync tab) -> this tab's fallback input. Never throws.
 async function icqaTabResolveTarget(site){
-    const key=site+'|'+isoDate(getWeekSunday());
+    const wkSun=sbIcqaWeekSunday();   // (15.60.0) week rolls at Sunday 08:00
+    const key=site+'|'+isoDate(wkSun);
     if(icqaTabAlpsMemo.key===key&&icqaTabAlpsMemo.val>0)return{val:icqaTabAlpsMemo.val,src:'ALPS'};
     try{
         // Cap the wait so a GM request that never calls back can't stall the tab render.
-        const v=await Promise.race([fetchAlpsLoadedRate(site),new Promise(r=>setTimeout(()=>r(null),20000))]);
+        const v=await Promise.race([fetchAlpsLoadedRate(site,false,wkSun),new Promise(r=>setTimeout(()=>r(null),20000))]);
         if(typeof v==='number'&&v>0){icqaTabAlpsMemo={key,val:v};return{val:v,src:'ALPS'};}
     }catch(e){console.warn('[SB-ICQA-Tab] ALPS target fetch failed:',e&&e.message);}
     return icqaTabFallbackTarget();
@@ -7275,7 +7434,7 @@ async function fetchICQATabData(){
         const site=loadConfig().site;
         setEl('sb-icqa-title',site+' ICQA Tracker');
         const now=new Date();
-        const sunday=getWeekSunday();
+        const sunday=sbIcqaWeekSunday(now);   // (15.60.0) keeps last week (Sat night) until Sunday 08:00
         const shifts=icqaTabBuildShifts(site,sunday,now);
         const cache=icqaTabLoadCache();
         const toFetch=[];let cachedN=0;
@@ -7572,7 +7731,7 @@ function updateVRETsPanel(v){
     const de=setEl('sync-vret-delta',fmt(delta));
     if(de){const dk=document.getElementById('sb-root')?.classList.contains('dark-mode');
         // setProperty(...,'important') so the dark-mode "#vret-panel *" color rule doesn't override it.
-        de.style.setProperty('color',delta>=0?(dk?'#69f0ae':'#2e7d32'):(dk?'#ff5252':'#c62828'),'important');}
+        de.style.setProperty('color',delta>=0?(dk?SB_TXT_DARK:SB_TXT_LIGHT).good:(dk?SB_TXT_DARK:SB_TXT_LIGHT).bad,'important');}
     setEl('sync-vret-today-pick',fmt(last.totalPick||0));
     setEl('sync-vret-today-pack',fmt(last.totalPack||0));
     const bar=document.getElementById('sync-vret-bar');if(bar)bar.style.width=Math.min(pct,100)+'%';
@@ -7670,8 +7829,11 @@ function sbApplyEosSiteGate(){
         if(syncBtn)syncBtn.click();
     }
 }
-// Fetch the full-shift PPR once and render the EOS Wash. Uses the same shift window as the
-// Sync tab (getShiftDates + full schedule).
+// Fetch the full-shift PPR once and render the EOS Wash. (15.60.0) The shift window is the EOS
+// Wash's own locked window (sbEosResolveShift with the Auto | Days | Nights selector), NOT the Sync
+// tab's: in Auto a shift that ended stays the wash's shift for 4h (a late pull still reports it).
+// Every report below (PPR, fn-rollups, 12hr Site CPLH, ICQA, backlog snapshot date, IPT date)
+// uses that window. The Sync tab's getShiftDates is unchanged.
 async function fetchEOSWashData(){
     if(!sbEosEnabled())return;   // (15.51.0) KRB3-only: no EOS requests for other sites
     const statusEl=document.getElementById('eoswash-status');
@@ -7682,11 +7844,17 @@ async function fetchEOSWashData(){
     if(content&&content.innerHTML.trim()==='')content.innerHTML='<div style="padding:20px;font-size:14px;">\u23F3 Fetching EOS Wash data\u2026</div>';
     try{
         const config=loadConfig();
-        const sched=config.shiftType==='Nights'?config.nights:config.days;
-        const {startDate}=getShiftDates(config);
-        let sDate=new Date(startDate);
-        if(sched.full.sh<12&&startDate.getHours()>=12){sDate.setDate(sDate.getDate()+1);}
-        let eDate=new Date(sDate);if(sched.full.eh<sched.full.sh)eDate.setDate(eDate.getDate()+1);
+        // (15.60.0) Locked EOS window (Auto grace / forced Days / Nights).
+        const win=sbEosResolveShift(config,sbEosShiftMode());
+        const sched=win.sched;
+        const startDate=new Date(win.startDate);
+        const sDate=new Date(win.startDate), eDate=new Date(win.endDate);
+        dbg('[SB-EOS] shift window '+sbEosShiftLabel(win)+' '+sbEosShiftSuffix(win));
+        // ICQA Plan Rate for the window's ICQA week (noon of the shift start day). Runs in the
+        // background; the wash renders with the Sync RO target first and updates when ALPS answers.
+        const icqaWkSun=(()=>{const n=new Date(win.startDate);n.setHours(12,0,0,0);return sbIcqaWeekSunday(n);})();
+        let icqaAlpsP=null;
+        try{icqaAlpsP=Promise.race([fetchAlpsLoadedRate(config.site,false,icqaWkSun),new Promise(r=>setTimeout(()=>r(null),20000))]).catch(()=>null);}catch(e){icqaAlpsP=null;}
         const pprUrl=buildPPRUrl(config.site,sDate,sched.full.sh,sched.full.sm,eDate,sched.full.eh,sched.full.em);
         // Also fetch case-based volumes from the function rollups (same source the Sync tab uses),
         // since the PPR reports pick/transfer-out in EACHES, not cases.
@@ -7703,7 +7871,7 @@ async function fetchEOSWashData(){
         const cplhSh=Math.floor((p1Start-15)/60), cplhSm=(p1Start-15)%60;
         const cplhEh=(cplhSh+12)%24, cplhEm=cplhSm;
         const cplhSched={sh:cplhSh<0?cplhSh+24:cplhSh,sm:cplhSm<0?cplhSm+60:cplhSm,eh:cplhEh,em:cplhEm};
-        const [pprHtml,stowH,palletH,pickH,toFluidH,toDockH,toSupportH,cplhData,palletizeToteH]=await Promise.all([
+        const [pprHtml,stowH,palletH,pickH,toFluidH,toDockH,toSupportH,cplhData,palletizeToteH,icqaFnH]=await Promise.all([
             fetchHTML(pprUrl),
             fetchHTML(buildFnUrl(config.site,S.stow,sDate,sched.full.sh,sched.full.sm,eDate,sched.full.eh,sched.full.em)),
             fetchHTML(buildFnUrl(config.site,S.palletStow,sDate,sched.full.sh,sched.full.sm,eDate,sched.full.eh,sched.full.em)),
@@ -7714,7 +7882,10 @@ async function fetchEOSWashData(){
             fetchPeriod(config.site,startDate,cplhSched),
             // (15.54.0) Palletize - Tote (shift window) so the wash's DA loaded total includes the
             // loaded totes exactly like the Sync tab's loadedUnits. Fail-soft: '' -> 0 jobs.
-            fetchHTML(buildFnUrl(config.site,S.palletizeTote,sDate,sched.full.sh,sched.full.sm,eDate,sched.full.eh,sched.full.em)).catch(e=>{console.warn('[SB-EOS] palletizeTote fetch failed:',e&&e.message);return '';})
+            fetchHTML(buildFnUrl(config.site,S.palletizeTote,sDate,sched.full.sh,sched.full.sm,eDate,sched.full.eh,sched.full.em)).catch(e=>{console.warn('[SB-EOS] palletizeTote fetch failed:',e&&e.message);return '';}),
+            // (15.60.0) ICQA fn-rollup for the locked window -> ICQA Actual Hours (same calc as the
+            // Sync tab's fetchIcqaDC: calcDCPercent().totalHours). Fail-soft: '' -> Sync fallback.
+            fetchHTML(buildFnUrl(config.site,S.icqa,sDate,sched.full.sh,sched.full.sm,eDate,sched.full.eh,sched.full.em)).catch(e=>{console.warn('[SB-EOS] ICQA fn fetch failed:',e&&e.message);return '';})
         ]);
         const ppr=parsePPRDetail(pprHtml);
         const stow=parseFnRollup(stowH),pallet=parseFnRollup(palletH),pick=parseFnRollup(pickH);
@@ -7807,12 +7978,30 @@ async function fetchEOSWashData(){
         // the 12hr rolling Site CPLH (same window + formula as the Sync tab).
         // sectionVol carries the IB stow total + OB loaded total so the Lead/PA & Problem Solve
         // support rows can compute Actual Rate = section volume / that path's actual hours.
-        currentEOSWash={ppr,caseVols,caseHrs,alpsTarget,syncCplh:{ib:ibCplhSync,da:daCplhSync,site:siteCplhSync,siteVol:siteThroughputVolSync,siteHrs:siteThroughputHrsSync},sectionVol:{ib:ibVolSync,ob:loadedUnitsSync},daLoaded:daLoadedSync};
+        // (15.60.0) ICQA Execution for the locked window: rate = this PPR's IC/QA/CS row, hours = the
+        // ICQA fn-rollup total, plan = ALPS loaded rate for the window's ICQA week (async, below),
+        // first seeded from the Sync RO target input.
+        let icqaHrs=0;
+        try{icqaHrs=icqaFnH?(calcDCPercent(icqaFnH).totalHours||0):0;}catch(e){icqaHrs=0;}
+        const icqaRate=pprSync.icqaRate||0;
+        const icqaPlan0=parseFloat(document.getElementById('icqa-ro-target')?.value)||0;
+        const icqa={plan:icqaPlan0,rate:icqaRate,hrs:icqaHrs,pct:(icqaPlan0>0&&icqaRate>0)?icqaRate/icqaPlan0*100:0};
+        currentEOSWash={ppr,caseVols,caseHrs,alpsTarget,syncCplh:{ib:ibCplhSync,da:daCplhSync,site:siteCplhSync,siteVol:siteThroughputVolSync,siteHrs:siteThroughputHrsSync},sectionVol:{ib:ibVolSync,ob:loadedUnitsSync},daLoaded:daLoadedSync,shift:win,icqa:icqa};
+        const thisWash=currentEOSWash;
         renderEOSWash(currentEOSWash);
         // Auto-pull the Backlog display spans (Inbound from AFT, DA from Rodeo ExSD). Fire from the
         // deliberate fetch path only so passive re-renders don't re-hit the endpoints.
         fillEosBacklog(config.site);
-        if(statusEl)statusEl.textContent='\u2713 Updated '+new Date().toLocaleTimeString();
+        if(statusEl)statusEl.textContent='\u2713 Updated '+new Date().toLocaleTimeString()+' \u00b7 '+sbEosShiftLabel(win);
+        sbEosUpdateShiftLabel();
+        if(icqaAlpsP)icqaAlpsP.then(v=>{
+            try{
+                if(!(typeof v==='number'&&v>0)||currentEOSWash!==thisWash)return;
+                icqa.plan=v;icqa.pct=icqa.rate>0?icqa.rate/v*100:0;
+                sbEosFillIcqa();
+                sbEosPrecaptureSchedule();   // the ICQA card changed -> cached Email image is stale
+            }catch(e){console.warn('[SB-EOS] ICQA plan update failed:',e&&e.message);}
+        });
     }catch(err){
         console.error('[SB-EOS] fetch failed:',err);
         if(statusEl)statusEl.textContent='\u26A0 '+err.message;
@@ -7829,13 +8018,16 @@ function setEosSafetyCount(n){try{localStorage.setItem(EOS_SAFETY_COUNT_KEY,Stri
 // handler can re-render just the tbody. Inputs are .eos-manual so they save/restore like the rest.
 function eosSafetyRowsHTML(n){
     const cell=(id)=>`<td><input type="text" class="support-input eos-manual" id="${id}" style="width:100%;box-sizing:border-box;background:#ffffcc;color:#000;border:1px solid #999;border-radius:3px;"></td>`;
+    // (15.60.0) The Safety "Bridge" note is a wrapping, auto-growing textarea (same id, so saved
+    // values restore) instead of a single-line input.
+    const bridgeCell=(id)=>`<td><textarea class="support-input eos-manual eos-bridge-ta" id="${id}" rows="1" aria-label="Safety bridge note" style="width:100%;box-sizing:border-box;background:#ffffcc;color:#000;border:1px solid #999;border-radius:3px;resize:vertical;font-family:inherit;"></textarea></td>`;
     // (15.53.0) PA Name cell: a stacked list of PA inputs + a small "+ Add PA" button. The FIRST
     // input keeps the original id eos-sf-pa-<i> (so pre-15.53 saved single-PA data restores as-is);
     // extra PAs are appended by wireEosSafetyPas()/eosSafetyPaAppend() from the saved list.
     const paCell=(i)=>`<td><div class="eos-sf-pa-list" data-row="${i}"><input type="text" class="support-input eos-manual eos-sf-pa-input" id="eos-sf-pa-${i}" aria-label="PA name 1" style="${EOS_PA_INPUT_CSS}"></div><button type="button" class="btn btn-small eos-sf-pa-btn eos-sf-pa-add" aria-label="Add PA" style="margin-top:4px;padding:1px 6px;font-size:10px;line-height:1.4;background:#2e7d32;color:#fff;border-color:#2e7d32;">+ Add PA</button></td>`;
     let html='';
     for(let i=0;i<n;i++){
-        html+='<tr>'+cell('eos-sf-name-'+i)+cell('eos-sf-rbi-'+i)+cell('eos-sf-audit-'+i)+cell('eos-sf-icare-'+i)+paCell(i)+cell('eos-sf-arc-'+i)+cell('eos-sf-bridge-'+i)+'</tr>';
+        html+='<tr>'+cell('eos-sf-name-'+i)+cell('eos-sf-rbi-'+i)+cell('eos-sf-audit-'+i)+cell('eos-sf-icare-'+i)+paCell(i)+cell('eos-sf-arc-'+i)+bridgeCell('eos-sf-bridge-'+i)+'</tr>';
     }
     return html;
 }
@@ -7929,6 +8121,7 @@ function addEosSafetyRow(){
         el.addEventListener('change',()=>{const d=loadSupport();document.querySelectorAll('.support-input,.callout-textarea,.eos-manual').forEach(e=>{if(e.id)d[e.id]=e.value;});saveSupport(d);});
     });
     wireEosSafetyPas(tbody);   // (15.53.0) restore extra PAs + wire "+ Add PA"
+    sbAutoGrowAll();           // (15.60.0) restored Bridge notes show in full
 }
 // Remove the LAST Safety row (for a misclick on + Add Row). Never drops below 1 row. Re-renders
 // the tbody and re-wires persistence, same as addEosSafetyRow. The removed row's saved values stay
@@ -7945,6 +8138,7 @@ function removeEosSafetyRow(){
         el.addEventListener('change',()=>{const d=loadSupport();document.querySelectorAll('.support-input,.callout-textarea,.eos-manual').forEach(e=>{if(e.id)d[e.id]=e.value;});saveSupport(d);});
     });
     wireEosSafetyPas(tbody);   // (15.53.0) restore extra PAs + wire "+ Add PA"
+    sbAutoGrowAll();           // (15.60.0) restored Bridge notes show in full
 }
 
 // Kicks off the EOS Wash Backlog auto-pulls (Inbound from AFT, DA from Rodeo ExSD) and writes
@@ -8003,18 +8197,34 @@ function sbBacklogDaysCell(backlog,info){
 // Starts all 4 fetches in parallel. Returns never-rejecting promises:
 //   ibP/daP -> {units,cases}|null, ibDaysP/daDaysP -> {units:cell|null,cases:cell|null,avgUnits,avgCases}|null,
 //   allP -> combined result (see below) | null. On success (any backlog >0) the memo + snapshot are saved.
-function sbComputeBacklog(site){
+// (15.60.0) opts (EOS Wash only; Sync callers pass nothing, so they keep one attempt and the
+// getShiftDates snapshot date): {snapIso:'YYYY-MM-DD' snapshot date override, retryMs:n retry each
+// source ONCE after n ms when it failed / came back empty}. Successful values are never changed.
+function sbComputeBacklog(site,opts){
     const S=String(site||'').toUpperCase();
+    const o=opts||{};
     // Wraps a fetch so it NEVER rejects (sync throw / reject -> null); lets one promise feed both the
     // backlog cells and the days cells without fetching twice.
     const safeP=(fn)=>{try{return Promise.resolve(fn()).catch(()=>null);}catch(e){return Promise.resolve(null);}};
-    const ibP=safeP(()=>fetchInboundBacklog(S));
-    const daP=safeP(()=>fetchDaBacklog(S));
+    const retryMs=(typeof o.retryMs==='number'&&o.retryMs>0)?o.retryMs:0;
+    const retry1=(label,fn,bad)=>{
+        const p=safeP(fn);
+        if(!retryMs)return p;
+        return p.then(r=>{
+            if(!bad(r))return r;
+            console.warn('[SB-EOS] '+label+' retry after '+Math.round(retryMs/1000)+'s');
+            return new Promise(res=>setTimeout(res,retryMs)).then(()=>safeP(fn));
+        });
+    };
+    const badBl=(r)=>!r||!((Number(r.units)>0)||(Number(r.cases)>0));
+    const badAlps=(r)=>!r||[].concat(r.units||[],r.cartons||[]).every(v=>v==null);
+    const ibP=retry1('IB backlog',()=>fetchInboundBacklog(S),badBl);
+    const daP=retry1('DA backlog',()=>fetchDaBacklog(S),badBl);
     // ALPS daily-view capacity for the shift day +0/+1/+2, both selections in parallel with the backlog fetches.
     let dates=[];
     try{dates=sbBacklogDayDates();}catch(e){dates=[];}
-    const ibAlpsP=safeP(()=>fetchAlpsBacklogDays(S,'inbound-joint',dates));
-    const daAlpsP=safeP(()=>fetchAlpsBacklogDays(S,'daOBDA-transferOut',dates));
+    const ibAlpsP=retry1('IB ALPS capacity',()=>fetchAlpsBacklogDays(S,'inbound-joint',dates),badAlps);
+    const daAlpsP=retry1('DA ALPS capacity',()=>fetchAlpsBacklogDays(S,'daOBDA-transferOut',dates),badAlps);
     const daysFor=(label,blP,alpsP)=>Promise.all([blP,alpsP]).then(([bl,alps])=>{
         const r=bl||{}, a=alps||{};
         const uInfo=sbBacklogAvgCap(a.units,dates,label+' units');
@@ -8037,7 +8247,7 @@ function sbComputeBacklog(site){
         const ok=[res.ib.units,res.ib.cases,res.da.units,res.da.cases].some(v=>v!=null);
         if(ok){
             _sbDeptBacklogMemo={site:S,ts:res.ts,result:res};
-            sbSaveBacklogSnapshot(res);
+            sbSaveBacklogSnapshot(res,o.snapIso);
         }else console.warn('[SB-DeptBacklog] '+S+': no backlog values returned \u2014 memo/snapshot not saved');
         return res;
     }).catch(e=>{console.warn('[SB-DeptBacklog] compute error: '+(e&&e.message));return null;});
@@ -8046,10 +8256,11 @@ function sbComputeBacklog(site){
 // Snapshot key date = the shift's production/start date (a Nights EOS at 5 AM saves under the
 // date the shift started), local calendar.
 function sbBacklogSnapKey(site,iso){return SB_BL_SNAP_PREFIX+String(site||'').toUpperCase()+'_'+iso;}
-function sbSaveBacklogSnapshot(res){
+// (15.60.0) isoOverride = the EOS Wash's locked shift date; without it, the Sync tab's shift date.
+function sbSaveBacklogSnapshot(res,isoOverride){
     try{
-        let iso;
-        try{iso=isoDate(getShiftDates(loadConfig()).startDate);}catch(e){iso=isoDate(new Date());}
+        let iso=(typeof isoOverride==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(isoOverride))?isoOverride:null;
+        if(!iso){try{iso=isoDate(getShiftDates(loadConfig()).startDate);}catch(e){iso=isoDate(new Date());}}
         const strip=(s)=>({units:s.units,cases:s.cases,daysUnits:s.daysUnits,daysCases:s.daysCases});
         const snap={ib:strip(res.ib),da:strip(res.da),avg:res.avg,dates:res.dates,ts:res.ts};
         const key=sbBacklogSnapKey(res.site,iso);
@@ -8090,22 +8301,32 @@ function sbReadBacklogSnapshot(site,iso){
 // (15.47.1) Publish the board's site to GM storage so the SandOP collector only stores that site's
 // table (called on board load, site change, and Get Data). Never throws.
 function sbPublishBoardSite(site){try{const S=String(site||'').toUpperCase();if(S&&typeof GM_setValue==='function')GM_setValue('sb_board_site',S);}catch(e){console.warn('[SB-IPT] board site publish failed: '+(e&&e.message));}}
-function sbShiftIso(){try{return isoDate(getShiftDates(loadConfig()).startDate);}catch(e){return isoDate(new Date());}}
+// (15.60.0) Optional `win` (an sbEosResolveShift window) returns that window's start date. No
+// argument = the Sync tab's shift date (unchanged behavior).
+function sbShiftIso(win){
+    if(win&&win.startDate instanceof Date)return isoDate(win.startDate);
+    try{return isoDate(getShiftDates(loadConfig()).startDate);}catch(e){return isoDate(new Date());}
+}
 // (15.55.0) IPT showed an em-dash when the collector had no column for the exact shift START date
 // (e.g. a Nights shift read at 02:00 looks up yesterday, but the Network Viewer's date columns
 // start at today, or SandOP was last opened the day before). For the CURRENT shift lookup the
 // candidates are now: shift start date -> today (local) -> the day before the shift date (nearest
 // previous stored date within 1 day). An explicit other date (Prior Day view) stays exact.
 // All dates are LOCAL (isoDate), never toISOString (UTC), matching the collector's isoOf.
+// (15.60.0) Fail-safe: the current lookup then also tries the shift date -2 and -3 days (the most
+// recent stored date within 3 days). The first three candidates are exactly the 15.55.0 ones; a
+// value from before the shift date is marked "(as of MM-DD)" by sbIptWriteCell.
 function sbIptCandidates(iso,todayIso,current){
     const out=[iso];
     if(!current)return out;
     if(todayIso&&out.indexOf(todayIso)===-1)out.push(todayIso);
     try{
         const p=String(iso).split('-').map(Number);
-        const d=new Date(p[0],p[1]-1,p[2],12,0,0,0);d.setDate(d.getDate()-1);
-        const prev=isoDate(d);
-        if(out.indexOf(prev)===-1)out.push(prev);
+        for(let k=1;k<=3;k++){
+            const d=new Date(p[0],p[1]-1,p[2],12,0,0,0);d.setDate(d.getDate()-k);
+            const prev=isoDate(d);
+            if(out.indexOf(prev)===-1)out.push(prev);
+        }
     }catch(e){}
     return out;
 }
@@ -8119,7 +8340,15 @@ function sbIptPick(obj,dir,cands){
     }
     return null;
 }
-function getIptValues(site,iso){
+// (15.60.0) ROOT CAUSE of "IPT not coming in for other users": IPT is read ONLY from GM storage
+// sb_ipt_v1_<SITE>, which is written by sbRunSandopIptCollector, and that runs only on
+// portal.sandop.a2z.com (S&OP Network Viewer, Inbound + Outbound views with the site selected) in
+// the SAME browser profile. GM storage is per browser / profile and is not shared between users, so
+// a user who never opens the Network Viewer has no IPT. The EOS Wash now shows the newest stored
+// value within 3 days ("as of MM-DD") and, when there is none, a link to open SandOP.
+// opts.current (EOS Wash): treat `iso` as the current shift date (nearby-date fallback) even when
+// it differs from the Sync tab's shift date. Without opts: unchanged (iso === sbShiftIso()).
+function getIptValues(site,iso,opts){
     const out={ib:null,da:null};
     try{
         const S=String(site||'').toUpperCase();
@@ -8129,31 +8358,64 @@ function getIptValues(site,iso){
         const raw=GM_getValue('sb_ipt_v1_'+S,null);
         let obj=null;
         try{obj=(typeof raw==='string')?JSON.parse(raw):raw;}catch(e){obj=null;}
-        const cands=sbIptCandidates(date,isoDate(new Date()),date===shiftIso);
+        const current=(opts&&opts.current!=null)?!!opts.current:(date===shiftIso);
+        const cands=sbIptCandidates(date,isoDate(new Date()),current);
         ['ib','da'].forEach(dir=>{out[dir]=sbIptPick(obj,dir,cands);});
         const keys=(dir)=>(obj&&obj[dir])?Object.keys(obj[dir]).sort().join(','):'';
         dbg('[SB-IPT] lookup site='+S+' iso='+date+' tried=['+cands.join(',')+'] ib='+(out.ib?out.ib.val+'@'+out.ib.date:'\u2014')+' da='+(out.da?out.da.val+'@'+out.da.date:'\u2014')+' keys=[ib:'+keys('ib')+' | da:'+keys('da')+']');
     }catch(e){console.warn('[SB-IPT] read failed: '+(e&&e.message));}
     return out;
 }
-function sbIptWriteCell(id,dir,entry,site){
+// Muted "(as of …)" suffix used by the IPT and backlog fail-safe cells. DOM-built (text only).
+function sbAsOfSpan(text){
+    const sp=document.createElement('span');
+    sp.className='sb-asof';
+    sp.style.cssText='font-weight:400;font-size:9px;opacity:.65;margin-left:3px;';
+    sp.textContent='('+text+')';
+    return sp;
+}
+const SB_SANDOP_NV_URL='https://portal.sandop.a2z.com/#!/network-viewer';
+// opts: {iso: the shift date looked up (older values get "(as of MM-DD)"), eos: true -> when no
+// value exists, show an "Open SandOP to load IPT" link instead of the em-dash}.
+function sbIptWriteCell(id,dir,entry,site,opts){
     const el=document.getElementById(id);if(!el)return;
+    const o=opts||{};
     if(entry){
         el.textContent=entry.val.toFixed(2);
         let when='unknown';
         try{if(entry.ts)when=new Date(entry.ts).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});}catch(e){}
-        el.title='SandOP Network Viewer \u00b7 Forecasted Days of End Transfer '+(dir==='ib'?'In':'Out')+' Backlog \u00b7 '+entry.date+' \u00b7 captured '+when;
+        let title='SandOP Network Viewer \u00b7 Forecasted Days of End Transfer '+(dir==='ib'?'In':'Out')+' Backlog \u00b7 '+entry.date+' \u00b7 captured '+when;
+        if(o.iso&&String(entry.date)<String(o.iso)){
+            el.appendChild(sbAsOfSpan('as of '+String(entry.date).slice(5)));
+            title+=' \u00b7 older value (no IPT stored for '+o.iso+')';
+        }
+        el.title=title;
+    }else if(o.eos){
+        el.textContent='';
+        const a=document.createElement('a');
+        a.className='sb-ipt-link';
+        a.href=SB_SANDOP_NV_URL;
+        a.target='_blank';
+        a.rel='noopener noreferrer';
+        a.style.cssText='font-size:10px;font-weight:600;';
+        a.textContent='Open SandOP to load IPT';
+        a.title='IPT comes from S&OP Network Viewer opened in THIS browser. Open it, select '+(site||'your site')+', then view Inbound and then Outbound once. The board picks it up automatically.';
+        el.appendChild(a);
+        el.title=a.title;
     }else{
         el.textContent='\u2014';
         el.title='Open S&OP Network Viewer (portal.sandop.a2z.com) for '+(site||'your site')+', view Inbound then Outbound, to capture IPT';
     }
 }
-function sbFillIptCells(ibId,daId,iso){
+// (15.60.0) opts are forwarded to getIptValues / sbIptWriteCell (the EOS Wash passes
+// {current:true,eos:true}); the Sync tab passes none (unchanged lookup, em-dash when missing).
+function sbFillIptCells(ibId,daId,iso,opts){
     try{
         const S=String((loadConfig()||{}).site||'').toUpperCase();
-        const r=getIptValues(S,iso);
-        sbIptWriteCell(ibId,'ib',r.ib,S);
-        sbIptWriteCell(daId,'da',r.da,S);
+        const r=getIptValues(S,iso,opts);
+        const w=Object.assign({},opts||{},{iso:iso||sbShiftIso()});
+        sbIptWriteCell(ibId,'ib',r.ib,S,w);
+        sbIptWriteCell(daId,'da',r.da,S,w);
     }catch(e){console.warn('[SB-IPT] fill failed: '+(e&&e.message));}
 }
 // --- Sync tab Dept Backlog (Shift Plan Targets panel, Current / Prior Day views) ---
@@ -8254,12 +8516,35 @@ function fillEosBacklog(site){
     ibDays.concat(daDays).forEach(id=>{spin(id);const el=document.getElementById(id);if(el)el.removeAttribute('title');});
     // Shared compute (one implementation of the backlog + days math, also used by the Sync tab's
     // Dept Backlog). Its promises NEVER reject; the snapshot/memo save happens inside it.
-    const c=sbComputeBacklog(S);
+    // (15.60.0) EOS: snapshot under the locked shift date, and retry each failed source once after 5s.
+    const snapIso=sbEosShiftIso();
+    const c=sbComputeBacklog(S,{snapIso:snapIso,retryMs:5000});
     // (15.55.0) Remember each finished cell (text + tooltip) so a passive re-render of the EOS Wash
     // (theme toggle, RSR LP edit) can restore it, and track the whole fill as one promise so the
     // Email capture can wait for it (sbEosBacklogReady).
+    // (15.60.0) A real value is also saved as the per-site last-good value; a failed / empty cell
+    // shows the last-good value (< 48h) with a muted "(as of …)" suffix instead of the em-dash.
     const cells={};_sbEosBacklogCells={site:S,cells:cells};
-    const rec=(ids)=>ids.forEach(id=>{const el=document.getElementById(id);if(el&&!el.querySelector('.sb-spin'))cells[id]={text:el.textContent,title:el.getAttribute('title')};});
+    const rec=(ids)=>ids.forEach(id=>{
+        const el=document.getElementById(id);
+        if(!el||el.querySelector('.sb-spin'))return;
+        const t=(el.textContent||'').trim();
+        if(t&&t!==DASH){
+            const title=el.getAttribute('title');
+            cells[id]={text:el.textContent,title:title};
+            sbEosBlCachePut(S,id,{text:el.textContent,title:title,ts:Date.now(),iso:snapIso});
+            return;
+        }
+        const fb=sbEosBlFallback(S,id,Date.now());
+        if(fb){
+            const title=sbEosBlAsOfTitle(fb);
+            sbEosBlWrite(id,fb.text,title,fb.ts);
+            cells[id]={text:fb.text,title:title,asOf:fb.ts};
+            console.warn('[SB-EOS] '+id+' live value unavailable \u2014 showing last good value from '+sbEosBlAsOfText(fb.ts));
+            return;
+        }
+        cells[id]={text:el.textContent,title:el.getAttribute('title')};
+    });
     const chains=[];
     chains.push(c.ibP.then(r=>{ if(!r){ib.forEach(dash);return;} put(ib[0],r.units); put(ib[1],r.cases); }).catch(()=>{ib.forEach(dash);}).then(()=>rec(ib)));
     chains.push(c.daP.then(r=>{ if(!r){da.forEach(dash);return;} put(da[0],r.units); put(da[1],r.cases); }).catch(()=>{da.forEach(dash);}).then(()=>rec(da)));
@@ -8297,12 +8582,82 @@ function sbEosBacklogReapply(){
         const c=_sbEosBacklogCells;
         if(!c||c.site!==S)return;
         Object.keys(c.cells).forEach(id=>{
-            const el=document.getElementById(id);if(!el)return;
             const v=c.cells[id];
-            el.textContent=v.text;
-            if(v.title)el.title=v.title;else el.removeAttribute('title');
+            sbEosBlWrite(id,v.text,v.title,v.asOf);   // (15.60.0) keeps the "(as of …)" suffix
         });
     }catch(e){console.warn('[SB-EOS] backlog reapply failed: '+(e&&e.message));}
+}
+// ---- (15.60.0) EOS backlog last-good cache (fail-safe) ----
+// localStorage 'sb_eos_bl_last_v1_<SITE>' = {cells:{<id>:{text,title,ts,iso}}} for the 8 non-IPT
+// backlog cells (IPT history already lives in GM storage). Used only when a live value is missing.
+var SB_EOS_BL_CACHE_PREFIX='sb_eos_bl_last_v1_';
+var SB_EOS_BL_CACHE_MAX_MS=48*3600*1000;
+function sbEosBlCacheIds(){return EOS_BL_IDS.filter(id=>id.indexOf('-ipt')===-1);}
+function sbEosBlCacheRead(site){
+    try{
+        const raw=localStorage.getItem(SB_EOS_BL_CACHE_PREFIX+String(site||'').toUpperCase());
+        const o=raw?JSON.parse(raw):null;
+        return(o&&o.cells&&typeof o.cells==='object')?o:{cells:{}};
+    }catch(e){return{cells:{}};}
+}
+function sbEosBlCachePut(site,id,cell){
+    try{
+        if(!site||!id||!cell||sbEosBlCacheIds().indexOf(id)===-1)return;
+        const o=sbEosBlCacheRead(site);
+        o.cells[id]={text:String(cell.text),title:cell.title||null,ts:Number(cell.ts)||Date.now(),iso:cell.iso||null};
+        localStorage.setItem(SB_EOS_BL_CACHE_PREFIX+String(site).toUpperCase(),JSON.stringify(o));
+    }catch(e){console.warn('[SB-EOS] backlog cache save failed: '+(e&&e.message));}
+}
+// The cached cell when it is at most 48h old, else null.
+function sbEosBlFallback(site,id,nowMs){
+    try{
+        const v=sbEosBlCacheRead(site).cells[id];
+        const now=typeof nowMs==='number'?nowMs:Date.now();
+        if(!v||!v.text||!(v.ts>0))return null;
+        if(now-v.ts>SB_EOS_BL_CACHE_MAX_MS||now-v.ts<0)return null;
+        return v;
+    }catch(e){return null;}
+}
+function sbEosBlAsOfText(ts){
+    try{
+        const d=new Date(ts),p2=(n)=>String(n).padStart(2,'0');
+        return p2(d.getMonth()+1)+'/'+p2(d.getDate())+' '+p2(d.getHours())+':'+p2(d.getMinutes());
+    }catch(e){return '';}
+}
+function sbEosBlAsOfTitle(v){
+    let when='';
+    try{when=new Date(v.ts).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});}catch(e){when=String(v.ts);}
+    return 'Live fetch failed \u2014 last good value from '+when+(v.iso?' (shift '+v.iso+')':'')+(v.title?' \u00b7 '+v.title:'');
+}
+// The one writer for an EOS backlog cell: text, optional muted "(as of MM/DD HH:MM)" suffix, title.
+function sbEosBlWrite(id,text,title,asOf){
+    const el=document.getElementById(id);if(!el)return;
+    el.textContent=text==null?'':String(text);
+    if(asOf)el.appendChild(sbAsOfSpan('as of '+sbEosBlAsOfText(asOf)));
+    if(title)el.title=title;else el.removeAttribute('title');
+}
+// Capture-time fail-safe: every non-IPT backlog cell still spinning / blank / em-dash gets the
+// last-good value (< 48h) when one exists. Returns the ids filled.
+function sbEosBlApplyCacheToPending(site){
+    const done=[];
+    try{
+        const S=String(site||'').toUpperCase();
+        if(!S)return done;
+        const now=Date.now();
+        sbEosBlCacheIds().forEach(id=>{
+            const el=document.getElementById(id);if(!el)return;
+            const t=(el.textContent||'').trim();
+            if(!(el.querySelector('.sb-spin')||!t||t==='\u2014'))return;
+            const fb=sbEosBlFallback(S,id,now);if(!fb)return;
+            const title=sbEosBlAsOfTitle(fb);
+            sbEosBlWrite(id,fb.text,title,fb.ts);
+            const c=_sbEosBacklogCells;
+            if(c&&c.site===S&&!c.cells[id])c.cells[id]={text:fb.text,title:title,asOf:fb.ts};
+            done.push(id);
+        });
+        if(done.length)console.warn('[SB-EOS] backlog still missing at capture \u2014 last good value used for: '+done.join(', '));
+    }catch(e){console.warn('[SB-EOS] backlog cache fallback failed: '+(e&&e.message));}
+    return done;
 }
 // (15.55.0) Resolves ('ok' | 'timeout') once the EOS Wash backlog fill has finished, at most
 // timeoutMs later. Starts a fill when none ran for this site. Then restores the finished values
@@ -8321,9 +8676,10 @@ function sbEosBacklogReady(timeoutMs){
         const to=new Promise(res=>{timer=setTimeout(()=>res('timeout'),ms);});
         return Promise.race([wait,to]).then(st=>{
             clearTimeout(timer);
-            if(st==='timeout')console.warn('[SB-EOS] backlog still loading after '+ms+'ms \u2014 capturing; missing cells show n/a');
+            if(st==='timeout')console.warn('[SB-EOS] backlog still loading after '+ms+'ms \u2014 capturing; missing cells use the last good value or show n/a');
+            sbEosBlApplyCacheToPending(S);   // (15.60.0) last-good value (< 48h) before n/a
             sbEosBacklogReapply();
-            sbFillIptCells('eos-bl-ib-ipt','eos-bl-da-ipt',sbShiftIso());
+            sbFillIptCells('eos-bl-ib-ipt','eos-bl-da-ipt',sbEosShiftIso(),{current:true,eos:true});
             return st;
         }).catch(()=>'ok');
     }catch(e){console.warn('[SB-EOS] backlog ready check failed: '+(e&&e.message));return Promise.resolve('ok');}
@@ -8365,6 +8721,99 @@ function updateAtlasThreshold(){
         }
         if(noteRow)noteRow.style.display=over?'':'none';
     });
+    sbAutoGrowAll();   // (15.60.0) a just-revealed reason box grows to its saved text
+}
+// ---- (15.60.0) ICQA Execution bridge bar ----
+// Shown only when ICQA Actual Rate is MORE than 100 below or above the ICQA Plan Rate (plan 1,900:
+// actual < 1,800 or > 2,000; exactly ±100 hides). Missing / non-numeric values never show it.
+function sbIcqaBridgeNeeded(plan,actual){
+    const num=(x)=>parseFloat(String(x==null?'':x).replace(/,/g,''));
+    const p=num(plan),a=num(actual);
+    return Number.isFinite(p)&&Number.isFinite(a)&&p>0&&a>0&&(a<p-100||a>p+100);
+}
+// Re-evaluates the bridge row from the card's current Plan / Actual values. Never throws.
+function sbEosIcqaBridgeUpdate(){
+    try{
+        const row=document.getElementById('eos-q-icqa-bridge-row');if(!row)return;
+        const pEl=document.getElementById('eos-q-icqa-plan'),aEl=document.getElementById('eos-q-icqa-rate');
+        const plan=pEl?pEl.value:'',actual=aEl?aEl.value:'';
+        const show=sbIcqaBridgeNeeded(plan,actual);
+        const was=row.style.display!=='none';
+        row.style.display=show?'':'none';
+        if(show)row.title='Actual '+actual+' vs plan '+plan+' (\u00b1100)';else row.removeAttribute('title');
+        sbAutoGrowAll();
+        if(show!==was&&typeof sbEosPrecaptureSchedule==='function')sbEosPrecaptureSchedule();   // the email image changes
+    }catch(e){console.warn('[SB-EOS] ICQA bridge update failed: '+(e&&e.message));}
+}
+// Locked (read-only, green) auto-filled EOS input. Empty / em-dash values leave the field as-is.
+function sbEosAutofill(targetId,val){
+    const el=document.getElementById(targetId);
+    if(el&&val!=null&&val!==''&&val!=='\u2014'){el.value=val;el.readOnly=true;el.style.background='#e8f5e9';el.style.cursor='not-allowed';el.title='Auto-filled from live data';}
+}
+// Fills the ICQA Execution card. Prefers the EOS Wash's own values for its locked window
+// (currentEOSWash.icqa); falls back to the Sync tab's ICQA cells only when the Sync tab's shift is
+// the same shift (same type and start date). Then re-evaluates the bridge bar.
+function sbEosFillIcqa(){
+    if(!sbEosEnabled())return;
+    try{
+        if(!document.getElementById('eos-q-icqa-plan'))return;
+        let q=null;try{q=(currentEOSWash&&currentEOSWash.icqa)||null;}catch(e){q=null;}
+        let syncOk=false;
+        try{
+            const cfg=loadConfig(),win=sbEosWindow();
+            syncOk=isoDate(getShiftDates(cfg).startDate)===isoDate(win.startDate)&&((cfg.shiftType==='Nights')?'Nights':'Days')===win.type;
+        }catch(e){syncOk=false;}
+        const txt=(id)=>{const e=document.getElementById(id);return e?(e.textContent||'').trim():'';};
+        const has=(v)=>typeof v==='number'&&isFinite(v)&&v>0;
+        const plan=(q&&has(q.plan))?fmt(q.plan):(syncOk?txt('icqa-ro-target-display'):'');
+        const rate=(q&&has(q.rate))?fmt(q.rate,2):(syncOk?txt('icqa-ro-shift-actual'):'');
+        const pct=(q&&has(q.pct))?fmtPct(q.pct):(syncOk?txt('icqa-ro-shift-pct'):'');
+        let hrs='';
+        if(q&&has(q.hrs))hrs=q.hrs.toFixed(2);
+        else if(syncOk&&typeof window._icqaTotalHours==='number'&&window._icqaTotalHours>0)hrs=window._icqaTotalHours.toFixed(2);
+        sbEosAutofill('eos-q-icqa-plan',plan);   // RO / plan target (e.g. 1,900)
+        sbEosAutofill('eos-q-icqa-rate',rate);   // shift RO rate (actual, e.g. 1,699.58)
+        sbEosAutofill('eos-q-icqa-ro',pct);      // shift % to RO (e.g. 89.5%)
+        sbEosAutofill('eos-q-icqa-hrs',hrs);     // ICQA total hours (the DC% denominator)
+    }catch(e){console.warn('[SB-EOS] ICQA fill failed: '+(e&&e.message));}
+    sbEosIcqaBridgeUpdate();
+}
+// ---- (15.60.0) Shared auto-grow for every EOS Wash textarea (bridge / reason / highlights) ----
+function sbAutoGrowTa(el){
+    try{
+        if(!el||el.tagName!=='TEXTAREA')return;
+        el.style.height='auto';
+        const h=el.scrollHeight;   // 0 while the box (or its row) is display:none -> keep auto
+        if(h>0){
+            // border-box heights include the borders, scrollHeight does not.
+            let extra=0;
+            try{const cs=window.getComputedStyle(el);if(cs.boxSizing==='border-box')extra=(parseFloat(cs.borderTopWidth)||0)+(parseFloat(cs.borderBottomWidth)||0);}catch(e){extra=0;}
+            el.style.height=(h+extra)+'px';
+        }
+        el.style.overflowY='hidden';
+    }catch(e){}
+}
+function sbAutoGrowAll(root){
+    try{
+        const r=root||document.getElementById('eoswash-content');if(!r)return;
+        r.querySelectorAll('textarea').forEach(sbAutoGrowTa);
+    }catch(e){}
+}
+var _sbAgResizeWired=false,_sbAgResizeTimer=null;
+// One delegated input listener on #eoswash-content (survives innerHTML re-renders) + one debounced
+// window resize listener (width changes re-wrap the text).
+function sbWireEosAutoGrow(){
+    try{
+        const c=document.getElementById('eoswash-content');
+        if(c&&c.dataset.sbAgWired!=='1'){
+            c.dataset.sbAgWired='1';
+            c.addEventListener('input',(e)=>{const t=e.target;if(t&&t.tagName==='TEXTAREA')sbAutoGrowTa(t);});
+        }
+        if(!_sbAgResizeWired){
+            _sbAgResizeWired=true;
+            window.addEventListener('resize',()=>{clearTimeout(_sbAgResizeTimer);_sbAgResizeTimer=setTimeout(()=>sbAutoGrowAll(),150);});
+        }
+    }catch(e){}
 }
 function refreshEosAtlasFromSync(){
     if(!sbEosEnabled())return;   // (15.51.0) KRB3-only; the Sync-tab ATLAS cells are untouched
@@ -9007,7 +9456,9 @@ function renderEOSWash(data){
     // ICQA Execution (teal = live auto-filled KPIs), Piles (amber = watch items). Each card is a
     // bordered panel with a tinted header strip, matching the board's dashboard language. All input
     // ids + the piles note-row ids are UNCHANGED so persistence and updatePilesThreshold still work.
-    const pileNote=(id,ph)=>`<label style="display:block;font-size:10px;color:#842029;margin:4px 0 2px;font-weight:600;">Reason (over threshold):</label><textarea class="support-input eos-manual" id="${id}" placeholder="${ph}" rows="2" style="width:100%;box-sizing:border-box;background:#fff7d6;color:#000;border:1px solid #d9b94a;border-radius:4px;resize:vertical;"></textarea>`;
+    // (15.60.0) Optional label; the textarea wraps + auto-grows (eos-bridge-ta + sbAutoGrowTa) and
+    // keeps its lighter yellow via eos-reason-ta. The label is tied to the textarea for screen readers.
+    const pileNote=(id,ph,label)=>`<label for="${id}" style="display:block;font-size:10px;color:#842029;margin:4px 0 2px;font-weight:600;">${label||'Reason (over threshold):'}</label><textarea class="support-input eos-manual eos-bridge-ta eos-reason-ta" id="${id}" placeholder="${ph}" rows="2" style="width:100%;box-sizing:border-box;background:#fff7d6;color:#000;border:1px solid #d9b94a;border-radius:4px;resize:vertical;font-family:inherit;"></textarea>`;
     // A compact labeled stat chip for the Piles / Atlas rows (label left, input right).
     const qStat=(label,id)=>`<div class="eos-q-stat"><span class="eos-q-stat-label">${label}</span>${inp(id)}</div>`;
     const qualityHTML=`<section class="eoswash-section eos-quality-section">
@@ -9030,6 +9481,7 @@ function renderEOSWash(data){
               ${qStat('ICQA Actual Rate','eos-q-icqa-rate')}
               ${qStat('ICQA % to RO','eos-q-icqa-ro')}
             </div>
+            <div id="eos-q-icqa-bridge-row" style="display:none;padding:0 10px 8px;text-align:left;">${pileNote('eos-q-icqa-bridge','Explain why ICQA rate is off plan\u2026','Bridge (ICQA rate off plan by more than 100):')}</div>
           </div>
           <div class="eos-q-card eos-q-piles">
             <div class="eos-q-card-head">\uD83D\uDCE6 Piles <span class="eos-q-sub">over threshold = add a reason</span></div>
@@ -9088,13 +9540,8 @@ function renderEOSWash(data){
             // the EOS Wash so the variance recalculates with the new value (no re-fetch needed).
             if(el.id==='eos-lp-rsr-support'&&currentEOSWash)renderEOSWash(currentEOSWash);
         });
-        // Bridge note textareas auto-grow to fit their text (no inner scrollbar): grow on input
-        // and once now so a restored/pre-filled note shows in full on load.
-        if(el.classList.contains('eos-bridge-ta')){
-            const autoGrow=()=>{el.style.height='auto';el.style.height=(el.scrollHeight)+'px';el.style.overflowY='hidden';};
-            el.addEventListener('input',autoGrow);
-            autoGrow();
-        }
+        // (15.60.0) Textarea auto-grow is now one delegated listener (sbWireEosAutoGrow) + a pass
+        // after the render below (sbAutoGrowAll), covering every bridge / reason box.
     });
     // (15.53.0) Safety PA Name lists: restore extra PAs (after the generic restore above) and
     // wire the "+ Add PA" buttons.
@@ -9106,7 +9553,8 @@ function renderEOSWash(data){
     // (15.55.0) Restore the last finished backlog values (re-render no longer blanks them).
     sbEosBacklogReapply();
     // (15.47.0) IPT Backlog (SandOP Network Viewer capture) for the shift START date.
-    sbFillIptCells('eos-bl-ib-ipt','eos-bl-da-ipt',sbShiftIso());
+    // (15.60.0) The EOS Wash's locked shift date, nearby-date fallback + "Open SandOP" link.
+    sbFillIptCells('eos-bl-ib-ipt','eos-bl-da-ipt',sbEosShiftIso(),{current:true,eos:true});
 
     // --- Piles thresholds: red cell + reveal a reason note when value is OVER the threshold ---
     // Per-row threshold (value STRICTLY over it is "over"): IB PS / DA PS / Sort PS = 0 (any value
@@ -9136,6 +9584,7 @@ function renderEOSWash(data){
             }
             if(noteRow)noteRow.style.display=over?'':'none';
         });
+        sbAutoGrowAll();   // (15.60.0) a just-revealed reason box grows to its saved text
     }
     // Additional live-update 'input' listeners (persistence 'change' listeners above are untouched).
     ['eos-q-piles-ibps','eos-q-piles-dmg','eos-q-piles-daps','eos-q-piles-sortps'].forEach(id=>{
@@ -9163,17 +9612,18 @@ function renderEOSWash(data){
         // updatePilesThreshold() above — do not force it visible here.
     })();
 
-    // Auto-fill ICQA Quality fields from the Sync tab's live ICQA panel. Auto-filled values are
-    // LOCKED (read-only) so they can't be manually changed.
-    const txt=id=>{const e=document.getElementById(id);return e?(e.textContent||'').trim():'';};
-    const autofill=(targetId,val)=>{const el=document.getElementById(targetId);if(el&&val!=null&&val!==''&&val!=='\u2014'){el.value=val;el.readOnly=true;el.style.background='#e8f5e9';el.style.cursor='not-allowed';el.title='Auto-filled from live data';}};
-    autofill('eos-q-icqa-plan',txt('icqa-ro-target-display'));   // RO / plan target (e.g. 2,400)
-    autofill('eos-q-icqa-rate',txt('icqa-ro-shift-actual'));     // shift RO rate (actual, e.g. 2,576.61)
-    autofill('eos-q-icqa-ro',txt('icqa-ro-shift-pct'));          // shift % to RO (e.g. 107.4%)
-    // ICQA Actual Hours = FCLM ICQA total hours (the DC% denominator computed in fetchIcqaDC).
-    if(typeof window._icqaTotalHours==='number'&&window._icqaTotalHours>0){
-        autofill('eos-q-icqa-hrs',window._icqaTotalHours.toFixed(2));
-    }
+    // Auto-fill ICQA Quality fields. Auto-filled values are LOCKED (read-only) so they can't be
+    // manually changed. (15.60.0) sbEosFillIcqa prefers the EOS Wash's own values for its locked
+    // window and falls back to the Sync tab's ICQA panel only when that is the same shift; it then
+    // shows / hides the ICQA bridge bar. Hand-typed Plan / Actual re-evaluate the bar too.
+    sbEosFillIcqa();
+    ['eos-q-icqa-plan','eos-q-icqa-rate'].forEach(id=>{
+        const el=document.getElementById(id);
+        if(el)el.addEventListener('input',sbEosIcqaBridgeUpdate);
+    });
+    // (15.60.0) Wrap + auto-grow every bridge / reason box (restored text shows in full).
+    sbWireEosAutoGrow();
+    sbAutoGrowAll(content);
     window.scrollTo(0,0);
     // (15.58.0) The Email image is pre-captured in the background; a re-render invalidates it.
     sbEosPrecaptureSchedule();
@@ -9224,9 +9674,71 @@ function sbUntagControlsForCapture(capMap){
     // Sweep too, in case a control was re-rendered/moved mid-capture.
     try{document.querySelectorAll('['+SB_CAP_ATTR+']').forEach(el=>el.removeAttribute(SB_CAP_ATTR));}catch(e){}
 }
-function sbFlattenControlsForCapture(capMap,cloneRoot){
+// (15.60.1) Dark-mode-only CONTROL colors from the #sb-root.dark-mode CSS (buildCSS / buildCSS2):
+// .eos-input/.eos-manual bg #4a4a1f text #ffe082; .target-input/.select-input/.table-input/
+// .sched-input/Fast Start inputs bg #1a1a2e (text #e0e0e0 / #ffd740); .dept-input bg #1e3a5f.
+const SB_DARK_CTRL_BG=['#4a4a1f','#1a1a2e','#1e3a5f'];
+const SB_DARK_CTRL_FG=['#ffe082','#ffd740'];
+// CSS color -> the browser's canonical form ("rgb(r, g, b)" / "rgba(r, g, b, a)") so hex,
+// shorthand and computed values compare equal. '' for an empty / invalid value.
+function sbNormColor(doc,v){
+    if(!v)return '';
+    try{const n=(doc||document).createElement('i');n.style.color=String(v);return n.style.color||'';}catch(e){return '';}
+}
+function sbIsDarkControlColor(doc,bg,fg){
+    const b=sbNormColor(doc,bg),f=sbNormColor(doc,fg);
+    return (!!b&&SB_DARK_CTRL_BG.some(c=>sbNormColor(doc,c)===b))||(!!f&&SB_DARK_CTRL_FG.some(c=>sbNormColor(doc,c)===f));
+}
+// (15.60.1) EOS email: every [dark bg, dark text] -> [light bg, light text] pair the theme-aware
+// palette helpers can bake into an inline style (cfDensityColors -> SB_CFD_*, cfColors -> SB_CF_*),
+// plus the text-only good/bad pair (SB_TXT_*). Built from the constants, so a palette edit is
+// picked up automatically.
+function sbEosLightPalettePairs(){
+    const p=[];
+    ['good','warn','bad'].forEach(k=>{
+        p.push({dBg:SB_CFD_DARK[k+'Bg'],dTxt:SB_CFD_DARK[k+'Txt'],lBg:SB_CFD_LIGHT[k+'Bg'],lTxt:SB_CFD_LIGHT[k+'Txt']});
+        p.push({dBg:SB_CF_DARK[k],dTxt:SB_CF_DARK.txt,lBg:SB_CF_LIGHT[k],lTxt:SB_CF_LIGHT.txt});
+    });
+    const t=['good','bad'].map(k=>({dTxt:SB_TXT_DARK[k],lTxt:SB_TXT_LIGHT[k]}));
+    return {bg:p,txt:t};
+}
+// (15.60.1) In the CLONED EOS root only: renderEOSWash bakes the current theme's colors into inline
+// styles (bg / hvColor / ... via cfDensityColors), so removing the dark-mode class does not
+// change them. Swap every dark palette color for its light twin (background + paired text color),
+// exactly what a light-mode render emits. Returns the number of elements changed.
+function sbEosLightenClone(root){
+    if(!root)return 0;
+    const doc=root.ownerDocument;
+    const pal=sbEosLightPalettePairs();
+    const bgMap=new Map(),txtMap=new Map();
+    pal.bg.forEach(x=>{const k=sbNormColor(doc,x.dBg);if(k)bgMap.set(k,x);});
+    pal.txt.forEach(x=>{const k=sbNormColor(doc,x.dTxt);if(k)txtMap.set(k,x.lTxt);});
+    let n=0;
+    [root].concat(Array.from(root.querySelectorAll('[style]'))).forEach(el=>{
+        try{
+            const s=el.style;if(!s)return;
+            const hit=s.backgroundColor?bgMap.get(s.backgroundColor):null;
+            if(hit){
+                s.setProperty('background-color',hit.lBg,s.getPropertyPriority('background-color'));
+                if(hit.lTxt)s.setProperty('color',hit.lTxt,s.getPropertyPriority('color'));else s.removeProperty('color');
+                n++;return;
+            }
+            const t=s.color?txtMap.get(s.color):null;
+            if(t){s.setProperty('color',t,s.getPropertyPriority('color'));n++;}
+        }catch(e){}
+    });
+    return n;
+}
+// (15.60.1) opts.light (EOS email only): the flattened box takes its background / text / border
+// colors from the CLONED control (the clone's #sb-root has no dark-mode class, so it resolves the
+// light-mode CSS) instead of the live, possibly dark, control; a dark control color that still
+// slips through falls back to the light .eos-manual look (#ffffcc / #000 / #999). Snip passes no
+// opts and keeps copying the live colors (it shows the board as-is, dark or light).
+function sbFlattenControlsForCapture(capMap,cloneRoot,opts){
     if(!capMap||!cloneRoot)return;
     const doc=cloneRoot.ownerDocument;
+    const light=!!(opts&&opts.light);
+    const cwin=doc.defaultView||window;
     const imp=(el,prop,val)=>{if(val)el.style.setProperty(prop,val,'important');};
     const wrap=(s)=>{s.whiteSpace='pre-wrap';s.overflowWrap='break-word';s.wordBreak='break-word';};
     Array.from(cloneRoot.querySelectorAll('['+SB_CAP_ATTR+']')).forEach(c=>{
@@ -9271,10 +9783,16 @@ function sbFlattenControlsForCapture(capMap,cloneRoot){
             if(val.trim()===''){
                 s.padding='0';s.border='0';s.background='transparent';
             }else{
-                imp(box,'background-color',cs.backgroundColor);
-                imp(box,'color',cs.color);
-                s.border='1px solid '+(cs.borderTopColor||'#999');
-                s.borderRadius=cs.borderTopLeftRadius||'3px';
+                let bgC=cs.backgroundColor,fgC=cs.color,bdC=cs.borderTopColor,rad=cs.borderTopLeftRadius;
+                if(light){
+                    let ccs=null;try{ccs=cwin.getComputedStyle(c);}catch(e){}
+                    if(ccs){bgC=ccs.backgroundColor;fgC=ccs.color;bdC=ccs.borderTopColor;rad=ccs.borderTopLeftRadius||rad;}
+                    if(sbIsDarkControlColor(doc,bgC,fgC)){bgC='#ffffcc';fgC='#000';bdC='#999';}
+                }
+                imp(box,'background-color',bgC);
+                imp(box,'color',fgC);
+                s.border='1px solid '+(bdC||'#999');
+                s.borderRadius=rad||'3px';
                 s.padding='2px 6px';
             }
             c.parentNode.replaceChild(box,c);
@@ -9582,7 +10100,7 @@ function sbEosPrecaptureRecheck(){
     try{
         if(!sbEosWashRendered(document.getElementById('eoswash-content')))return false;
         sbEosBacklogReapply();
-        sbFillIptCells('eos-bl-ib-ipt','eos-bl-da-ipt',sbShiftIso());
+        sbFillIptCells('eos-bl-ib-ipt','eos-bl-da-ipt',sbEosShiftIso(),{current:true,eos:true});
         const st=_sbEosPre;
         if(!sbEosPrecaptureFresh()||st.blSnap===sbEosBacklogSnap())return false;
         dbg('[SB-EOS] backlog / IPT changed since the pre-capture \u2014 recapturing');
@@ -9823,12 +10341,17 @@ function sbEosCaptureCanvas(content,opts){
                     EOS_BL_IDS.forEach(id=>{
                         const el=cr&&cr.querySelector('#'+id);if(!el)return;
                         const t=(el.textContent||'').trim();
-                        if(el.querySelector('.sb-spin')||!t||t==='\u2014'){el.textContent='n/a';na.push(id);}
+                        // (15.60.0) The "Open SandOP to load IPT" link means no IPT -> n/a too.
+                        if(el.querySelector('.sb-spin')||el.querySelector('.sb-ipt-link')||!t||t==='\u2014'){el.textContent='n/a';na.push(id);}
                     });
                     if(na.length)console.warn('[SB-EOS] backlog value unavailable, shown as n/a in the email: '+na.join(', '));
                 }catch(e){console.warn('[SB-EOS] backlog n/a pass failed:',e);}
-                try{sbFlattenControlsForCapture(capMap,cr);}
+                // (15.60.1) Light colors for the flattened boxes (from the light-themed clone), then
+                // swap any dark palette color baked into an inline style for its light twin.
+                try{sbFlattenControlsForCapture(capMap,cr,{light:true});}
                 catch(e){console.warn('[SB-EOS] capture flatten failed:',e);}
+                try{sbEosLightenClone(cr);}
+                catch(e){console.warn('[SB-EOS] capture light palette failed:',e);}
                 if(opts&&opts.labels){
                     try{
                         [['.eos-ib-section','Inbound EOS'],['.eos-da-section','Outbound EOS']].forEach(([sel,txt])=>{
@@ -10238,6 +10761,8 @@ function initBoard(){
         if(currentHourly&&currentHourly.data){renderHourlyTables(currentHourly.data,currentHourly.totalHours);}
         // Re-render the EOS Wash tab colors on theme change.
         if(currentEOSWash){renderEOSWash(currentEOSWash);}
+        // (15.60.1) A theme switch always invalidates the pre-captured Email image (and re-captures).
+        if(typeof sbEosPrecaptureSchedule==='function')sbEosPrecaptureSchedule();
         // Re-render the VRETs tab AND the compact Sync-tab panel (delta color is theme-aware).
         if(currentVRETs){renderVRETsTab(currentVRETs);updateVRETsPanel(currentVRETs);}};
     // Restore dark mode preference
@@ -10246,6 +10771,28 @@ function initBoard(){
     // internal VRETs refresh in doFetch don't inflate the count. One deliberate click = one ping.
     document.getElementById('btn-fetch-hourly')?.addEventListener('click',()=>{trackUsage('hourly');fetchHourlyData();});
     document.getElementById('btn-fetch-eoswash')?.addEventListener('click',()=>{trackUsage('eoswash');fetchEOSWashData();});
+    // (15.60.0) EOS Wash Shift selector (Auto | Days | Nights, persisted). Changing it while a wash
+    // is displayed re-fetches so the data matches the shown shift; otherwise only the label updates.
+    {
+        const sel=document.getElementById('eos-shift-mode');
+        if(sel){
+            sel.value=sbEosShiftMode();
+            sel.addEventListener('change',()=>{
+                sbSetEosShiftMode(sel.value);
+                let shown=false;try{shown=!!currentEOSWash;}catch(e){shown=false;}
+                sbEosUpdateShiftLabel();
+                if(shown)fetchEOSWashData();
+            });
+        }
+        sbEosUpdateShiftLabel();
+        setInterval(()=>{
+            try{
+                if(!document.getElementById('eos-shift-label'))return;
+                if(currentEOSWash&&currentEOSWash.shift)return;   // "Showing" label is fixed to the data
+                sbEosUpdateShiftLabel();
+            }catch(e){}
+        },60000);
+    }
     document.getElementById('btn-fetch-faststart')?.addEventListener('click',()=>{trackUsage('faststart');fetchFastStartData();});
     document.getElementById('btn-save-fs-sos')?.addEventListener('click',()=>saveFastStartSnapshot('SOS'));
     document.getElementById('btn-save-fs-break')?.addEventListener('click',()=>saveFastStartSnapshot('1st Break'));
@@ -10324,6 +10871,9 @@ function initBoard(){
             const et=document.getElementById('eoswash-content');
             if(et&&et.innerHTML.trim()===''){et.innerHTML='<div style="padding:20px;font-size:14px;color:#666;">Click <strong>\u25B6 Fetch EOS Wash</strong> to load.</div>';}
             // (15.58.0) A capture skipped while the tab was hidden runs now that it is visible.
+            // (15.60.0) Textareas rendered while the tab was hidden measured 0 high: grow them now.
+            sbAutoGrowAll();
+            sbEosUpdateShiftLabel();
             if(_sbEosPre.dirty)sbEosPrecaptureSchedule(800);
             else sbEosPrecaptureRecheck();   // IPT may have been captured in another tab meanwhile
         }
