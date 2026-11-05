@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.60.1
+// @version      15.60.3
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -218,7 +218,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.60.1';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.60.3';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -324,14 +324,16 @@ function applyUpdateStatus(behind,remote){
         if(badge){
             // (15.54.3) the new version is a clickable link to the raw .user.js -> Tampermonkey opens its
             // install/update page. `remote` is digits/dots only (regex above), so safe to put in HTML.
-            if(behind){badge.innerHTML='v'+SB_VERSION+' \u2191 update to <a href="'+SB_INSTALL_URL+'" target="_blank" rel="noopener noreferrer" style="color:#e65100;text-decoration:underline;font-weight:800;" title="Click to install v'+remote+'">v'+remote+'</a>';badge.style.color='#e65100';badge.style.fontWeight='800';badge.title='This board is behind. Latest is v'+remote+'. Click the version to update now.';}
-            else{badge.textContent='v'+SB_VERSION;badge.style.color='#888';badge.title='Up to date (latest on GitHub is v'+remote+').';}
+            // (15.60.2) BOTH the current and the new version are links to the install/update page.
+            const curLink='<a href="'+SB_INSTALL_URL+'" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:underline;" title="Click to open the update / install page">v'+SB_VERSION+'</a>';
+            if(behind){badge.innerHTML=curLink+' \u2191 update to <a href="'+SB_INSTALL_URL+'" target="_blank" rel="noopener noreferrer" style="color:#e65100;text-decoration:underline;font-weight:800;" title="Click to install v'+remote+'">v'+remote+'</a>';badge.style.color='#e65100';badge.style.fontWeight='800';badge.title='This board is behind. Latest is v'+remote+'. Click the version to update now.';}
+            else{badge.innerHTML=curLink;badge.style.color='#888';badge.title='Up to date (latest on GitHub is v'+remote+').';}
         }
         // Settings note
         const note=document.getElementById('sb-update-note');
         if(note){
             if(behind){note.innerHTML='\u26A0\uFE0F Running <strong>v'+SB_VERSION+'</strong> \u2014 latest is <a href="'+SB_INSTALL_URL+'" target="_blank" rel="noopener noreferrer" style="color:#c62828;font-weight:700;text-decoration:underline;">v'+remote+' (click to update)</a>.';note.style.color='#c62828';}
-            else{note.innerHTML='\u2713 Up to date (v'+SB_VERSION+', latest on GitHub v'+remote+').';note.style.color='#2e7d32';}
+            else{note.innerHTML='\u2713 Up to date (v'+SB_VERSION+', latest on GitHub <a href="'+SB_INSTALL_URL+'" target="_blank" rel="noopener noreferrer" style="color:#2e7d32;text-decoration:underline;">v'+remote+'</a>).';note.style.color='#2e7d32';}
         }
         // Once-per-day Slack ping when behind, so the creator sees stale boards in the usage channel.
         if(behind){
@@ -2663,6 +2665,150 @@ function sbRunSandopIptCollector(){
         const readBoardSite=()=>{
             try{const s=norm(GM_getValue('sb_board_site','')).toUpperCase();return SITE_RE.test(s)?s:'';}catch(e){return '';}
         };
+        // (15.60.3) AUTO-SWITCH: DA IPT only exists in the Outbound view and SandOP opens on Inbound,
+        // so a user who never clicked Outbound had IB but no DA. After a pass that captured exactly
+        // ONE direction for the board site, when the OTHER direction's stored data is stale (no value
+        // for today, or its Ts older than 6h), click the Network Viewer's "Inbound"/"Outbound" view
+        // control once, let the normal scan capture it (poll up to 20s), then click back to the
+        // original view (best effort). Guards: max 1 auto-switch per direction per page load, one at
+        // a time, never within 10s of a user click on a view control (and a user click during an
+        // auto-switch cancels the switch-back). Programmatic clicks are isTrusted=false, so they
+        // never count as user clicks.
+        const VIEW_LABEL={ib:'Inbound',da:'Outbound'};
+        const VIEW_STALE_MS=6*3600*1000, VIEW_WAIT_MS=20000, VIEW_USER_QUIET_MS=10000;
+        const VIEW_SEL='button,[role="tab"],[role="button"],[role="option"],[role="radio"],[role="menuitem"],[role="menuitemradio"],a,label,li,mat-button-toggle,.btn,.nav-link,.ag-tab,[class*="toggle" i],[class*="tab" i]';
+        const autoSwitched={ib:false,da:false};   // per page load
+        const noCtlLogged={ib:false,da:false};
+        let viewPending=null;                      // {dir, back, started, timer, poll}
+        let lastUserViewClick=0;
+        const ctlText=(el)=>{
+            try{
+                if(el.tagName==='INPUT'){
+                    const lb=(el.id&&document.querySelector('label[for="'+el.id.replace(/"/g,'\\"')+'"]'))||el.closest('label');
+                    return norm((lb&&lb.textContent)||el.value||el.getAttribute('aria-label'));
+                }
+                return norm(el.textContent)||norm(el.getAttribute('aria-label'))||norm(el.getAttribute('title'));
+            }catch(e){return '';}
+        };
+        const isViewWord=(s)=>/^(inbound|outbound)$/i.test(norm(s));
+        // -> {el, kind:'click'|'select', opt?} for the visible control whose text is exactly `label`
+        // (case-insensitive), else null. Buttons / tabs / radios first; never our badge or a data row.
+        const findViewCtl=(label)=>{
+            const want=label.toLowerCase();
+            const badge=document.getElementById(BADGE_ID);
+            const ok=(el)=>!(badge&&badge.contains(el))&&!el.closest('tbody')&&isVisible(el);
+            const sels=Array.from(document.querySelectorAll('select')).filter(ok);
+            for(let i=0;i<sels.length;i++){
+                const opt=Array.from(sels[i].options||[]).find(o=>norm(o.textContent).toLowerCase()===want);
+                if(opt)return {el:sels[i],kind:'select',opt:opt};
+            }
+            const radios=Array.from(document.querySelectorAll('input[type="radio"]')).filter(r=>ctlText(r).toLowerCase()===want&&(isVisible(r)||isVisible(r.closest('label')||r)));
+            const cands=Array.from(document.querySelectorAll(VIEW_SEL)).filter(el=>ok(el)&&ctlText(el).toLowerCase()===want);
+            const rank=(el)=>{
+                const t=el.tagName, r=(el.getAttribute('role')||'').toLowerCase();
+                if(t==='BUTTON'||r==='tab'||r==='button'||r==='radio')return 0;
+                if(r==='option'||r==='menuitem'||r==='menuitemradio'||t==='MAT-BUTTON-TOGGLE')return 1;
+                if(t==='A'||t==='LABEL')return 2;
+                return 3;
+            };
+            // Innermost wins among equal ranks (a wrapper div holding only the button has the same text).
+            cands.sort((a,b)=>rank(a)-rank(b)||(a.contains(b)?1:b.contains(a)?-1:0));
+            if(cands.length)return {el:cands[0],kind:'click'};
+            if(radios.length)return {el:radios[0],kind:'click'};
+            return null;
+        };
+        const viewCtlTexts=()=>{
+            const acc=new Set();
+            try{
+                document.querySelectorAll(VIEW_SEL+',select option').forEach(el=>{
+                    if(acc.size>=25)return;
+                    const s=ctlText(el);
+                    if(s&&s.length<=30&&(el.tagName==='OPTION'||isVisible(el)))acc.add(s);
+                });
+            }catch(e){}
+            return Array.from(acc);
+        };
+        const pressViewCtl=(c)=>{
+            if(c.kind==='select'){
+                c.el.value=c.opt.value;
+                c.opt.selected=true;
+                c.el.dispatchEvent(new Event('input',{bubbles:true}));
+                c.el.dispatchEvent(new Event('change',{bubbles:true}));
+            }else{
+                c.el.click();
+            }
+        };
+        // Stored data for dir is stale: no numeric value for today, or its timestamp older than 6h.
+        const dirStale=(site,dir)=>{
+            try{
+                const raw=GM_getValue('sb_ipt_v1_'+site,null);
+                const obj=(typeof raw==='string')?JSON.parse(raw):raw;
+                const v=obj&&obj[dir]&&obj[dir][isoOf(new Date())];
+                if(!(typeof v==='number'&&isFinite(v)))return true;
+                return (Date.now()-(Number(obj[dir+'Ts'])||0))>VIEW_STALE_MS;
+            }catch(e){return true;}
+        };
+        const endViewPending=(ok,why)=>{
+            const p=viewPending;if(!p)return;
+            viewPending=null;
+            clearTimeout(p.timer);clearInterval(p.poll);
+            const L=VIEW_LABEL[p.dir];
+            if(ok)console.log('[SB-IPT-Collector] auto-switch: '+p.dir+' captured from the '+L+' view after '+Math.round((Date.now()-p.started)/1000)+'s');
+            else console.warn('[SB-IPT-Collector] auto-switch: '+p.dir+' NOT captured from the '+L+' view ('+why+')');
+            if(why==='user changed the view'){console.log('[SB-IPT-Collector] auto-switch: user changed the view \u2014 not switching back');return;}
+            try{
+                const c=findViewCtl(VIEW_LABEL[p.back]);
+                if(!c){console.warn('[SB-IPT-Collector] auto-switch: "'+VIEW_LABEL[p.back]+'" control not found \u2014 could not switch back');return;}
+                pressViewCtl(c);
+                console.log('[SB-IPT-Collector] auto-switch: switched back to '+VIEW_LABEL[p.back]);
+            }catch(e){console.warn('[SB-IPT-Collector] auto-switch back failed (ignored):',e&&e.message);}
+        };
+        // Called at the end of every scan with the board site and that pass's taken map.
+        const autoSwitchView=(boardSite,taken)=>{
+            try{
+                if(!boardSite)return;
+                const got={ib:!!taken[boardSite+'|ib'],da:!!taken[boardSite+'|da']};
+                if(viewPending){
+                    if(got[viewPending.dir])endViewPending(true,'');
+                    return;
+                }
+                if(got.ib===got.da)return;   // nothing captured, or both views visible at once
+                const have=got.ib?'ib':'da', need=got.ib?'da':'ib';
+                if(autoSwitched[need]||!dirStale(boardSite,need))return;
+                if(Date.now()-lastUserViewClick<VIEW_USER_QUIET_MS){log('auto-switch: user changed the view <10s ago \u2014 waiting');return;}
+                const c=findViewCtl(VIEW_LABEL[need]);
+                if(!c){
+                    if(!noCtlLogged[need]){
+                        noCtlLogged[need]=true;
+                        console.warn('[SB-IPT-Collector] diag: auto-switch to '+VIEW_LABEL[need]+' to capture '+need+': no visible control with text "'+VIEW_LABEL[need]+'" (button/tab/option/radio/select). Candidate control texts: '+JSON.stringify(viewCtlTexts()));
+                    }
+                    return;
+                }
+                autoSwitched[need]=true;
+                console.log('[SB-IPT-Collector] auto-switch to '+VIEW_LABEL[need]+' to capture '+need+' for '+boardSite+' (stored '+need+' missing for today or older than 6h; '+have+' captured from '+VIEW_LABEL[have]+') via <'+c.el.tagName.toLowerCase()+'> "'+ctlText(c.el)+'"');
+                viewPending={dir:need,back:have,started:Date.now(),timer:null,poll:null};
+                viewPending.timer=setTimeout(()=>{try{endViewPending(false,'timed out after '+(VIEW_WAIT_MS/1000)+'s');}catch(e){}},VIEW_WAIT_MS);
+                viewPending.poll=setInterval(()=>{try{schedule();}catch(e){}},2000);
+                pressViewCtl(c);
+                schedule();
+            }catch(e){console.warn('[SB-IPT-Collector] auto-switch failed (ignored):',e&&e.message);}
+        };
+        // User clicks / select changes on an Inbound/Outbound control (trusted events only).
+        const onUserView=(e)=>{
+            try{
+                if(!e.isTrusted)return;
+                const t=e.target;
+                let hit=false;
+                if(t&&t.tagName==='SELECT')hit=Array.from(t.options||[]).some(o=>isViewWord(o.textContent));
+                else{
+                    let el=t&&t.nodeType===1?t:(t&&t.parentElement);
+                    for(let i=0;i<5&&el&&!hit;i++,el=el.parentElement)hit=isViewWord(ctlText(el));
+                }
+                if(!hit)return;
+                lastUserViewClick=Date.now();
+                if(viewPending)endViewPending(false,'user changed the view');
+            }catch(e){}
+        };
         const warned={};   // site|dir -> duplicate-table warning already printed this page session
         // (15.47.1) One-time cleanup: 15.47.0 stored another site's values under sb_ipt_v1_SDF4.
         // Deferred until the board site is known; skipped (but marked done) when SDF4 IS the board site.
@@ -2774,6 +2920,7 @@ function sbRunSandopIptCollector(){
             else if(!boardSite&&!anyTaken)hint();
             if(!anyTaken)diag(boardSite,'metric rows found but nothing accepted');
             showBadge();
+            autoSwitchView(boardSite,taken);   // (15.60.3) capture the other direction too
         };
         // Debounced (~1.5s) on DOM changes; never starved by a constantly-mutating page (max ~8s).
         let timer=null;
@@ -2802,6 +2949,9 @@ function sbRunSandopIptCollector(){
                 }).observe(root,{childList:true,subtree:true,characterData:true,attributes:true,attributeFilter:['class','style','hidden','aria-hidden','aria-selected','aria-expanded']});
                 window.addEventListener('hashchange',schedule);
                 window.addEventListener('popstate',schedule);
+                // (15.60.3) User view clicks (capture phase) pause / cancel the auto-switch.
+                document.addEventListener('click',onUserView,true);
+                document.addEventListener('change',onUserView,true);
                 setInterval(schedule,10000);
                 schedule();
                 log('collector running');
@@ -5904,7 +6054,7 @@ function updatePeriodDots(){
 
 // === HTML ===
 function buildHTML(){return `
-<nav class="topnav"><div class="topnav-left"><span class="logo"><svg width="28" height="28" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="46" fill="#333A44" stroke="#4a9eff" stroke-width="4"/><path d="M25 65 L25 40 L50 28 L75 40 L75 65 Z" fill="none" stroke="#E8EAED" stroke-width="3" stroke-linejoin="round"/><line x1="25" y1="65" x2="75" y2="65" stroke="#E8EAED" stroke-width="3"/><rect x="30" y="45" width="16" height="20" fill="none" stroke="#E8EAED" stroke-width="2"/><line x1="30" y1="50" x2="46" y2="50" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="55" x2="46" y2="55" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="60" x2="46" y2="60" stroke="#E8EAED" stroke-width="1.5"/><rect x="54" y="48" width="14" height="17" fill="none" stroke="#E8EAED" stroke-width="2"/><rect x="57" y="52" width="4" height="5" fill="#E8EAED"/><rect x="62" y="55" width="3" height="4" fill="#E8EAED"/></svg></span><h1 class="site-title">FC Sync Board<span style="display:block;font-size:11px;font-weight:800;color:#146EB4;letter-spacing:.3px;margin-top:-1px;">by snodgtyl <span id="sb-ver-badge" style="font-weight:600;color:#888;">v${SB_VERSION}</span></span></h1>
+<nav class="topnav"><div class="topnav-left"><span class="logo"><svg width="28" height="28" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="46" fill="#333A44" stroke="#4a9eff" stroke-width="4"/><path d="M25 65 L25 40 L50 28 L75 40 L75 65 Z" fill="none" stroke="#E8EAED" stroke-width="3" stroke-linejoin="round"/><line x1="25" y1="65" x2="75" y2="65" stroke="#E8EAED" stroke-width="3"/><rect x="30" y="45" width="16" height="20" fill="none" stroke="#E8EAED" stroke-width="2"/><line x1="30" y1="50" x2="46" y2="50" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="55" x2="46" y2="55" stroke="#E8EAED" stroke-width="1.5"/><line x1="30" y1="60" x2="46" y2="60" stroke="#E8EAED" stroke-width="1.5"/><rect x="54" y="48" width="14" height="17" fill="none" stroke="#E8EAED" stroke-width="2"/><rect x="57" y="52" width="4" height="5" fill="#E8EAED"/><rect x="62" y="55" width="3" height="4" fill="#E8EAED"/></svg></span><h1 class="site-title">FC Sync Board<span style="display:block;font-size:11px;font-weight:800;color:#146EB4;letter-spacing:.3px;margin-top:-1px;">by snodgtyl <span id="sb-ver-badge" style="font-weight:600;color:#888;"><a href="${SB_INSTALL_URL}" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:underline;" title="Click to open the update / install page">v${SB_VERSION}</a></span></span></h1>
 <div class="nav-tabs"><button class="nav-tab active" data-tab="sync">Sync IB-OB</button><button class="nav-tab" data-tab="hourly">Hourly</button><button class="nav-tab" data-tab="faststart">Fast Start</button><button class="nav-tab" data-tab="icqa">ICQA</button><button class="nav-tab" data-tab="vrets">VRETs</button><button class="nav-tab" data-tab="eoswash">EOS Wash</button><button class="nav-tab" data-tab="settings">Settings</button></div></div>
 <div id="sb-truck-road" title="SDC Sync Board"><div class="sb-banner"><span class="sb-banner-smile" aria-hidden="true"></span><span class="sb-banner-text">S D C &nbsp;&middot;&nbsp; S Y N C &nbsp;&middot;&nbsp; B O A R D</span><span class="sb-banner-smile" aria-hidden="true"></span></div></div>
 <div id="sb-truck-road-OLD" style="display:none;" title="Peccy at the beach"><svg class="sb-scene" viewBox="0 0 300 30" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="sbSky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#9fd8ff"/><stop offset="1" stop-color="#d8f1ff"/></linearGradient><linearGradient id="sbSea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2bb3c0"/><stop offset="1" stop-color="#1f8fb0"/></linearGradient><linearGradient id="sbSand" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f6e3b4"/><stop offset="1" stop-color="#eccf8c"/></linearGradient></defs><rect x="0" y="0" width="300" height="30" fill="url(#sbSky)"/><g class="sb-sun"><circle cx="252" cy="9" r="6" fill="#FFD34E"/><circle cx="252" cy="9" r="9" fill="#FFD34E" opacity=".25"/></g><g class="sb-cloud" opacity=".9"><ellipse cx="60" cy="7" rx="11" ry="3.4" fill="#fff"/><ellipse cx="70" cy="8" rx="8" ry="3" fill="#fff"/></g><g class="sb-cloud2" opacity=".8"><ellipse cx="150" cy="5" rx="9" ry="3" fill="#fff"/><ellipse cx="158" cy="6" rx="6" ry="2.4" fill="#fff"/></g><rect x="0" y="15" width="300" height="9" fill="url(#sbSea)"/><path class="sb-wave" d="M0 16 q10 2 20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0 t20 0" fill="none" stroke="#bfeef4" stroke-width="1" opacity=".7"/><rect x="0" y="23" width="300" height="7" fill="url(#sbSand)"/><g transform="translate(214,2)"><rect x="9" y="3" width="2.5" height="18" rx="1.2" fill="#8a5a2b"/><g class="sb-palm"><path d="M10 4 q-11 -3 -17 2 q10 -1 17 1" fill="#2e9b4e"/><path d="M10 4 q11 -3 17 2 q-10 -1 -17 1" fill="#36b05c"/><path d="M10 4 q-5 -9 -13 -9 q7 4 13 10" fill="#2e9b4e"/><path d="M10 4 q5 -9 13 -9 q-7 4 -13 10" fill="#36b05c"/></g><circle cx="7" cy="7" r="1.3" fill="#6b4423"/><circle cx="13" cy="7" r="1.3" fill="#6b4423"/></g><g class="sb-peccy-g" transform="translate(16,6)"><ellipse cx="12" cy="20" rx="11" ry="2" fill="rgba(0,0,0,.12)"/><rect x="2" y="0" width="20" height="20" rx="9" fill="#FF9D14"/><g class="sb-peccy-arm"><rect x="20" y="4" width="4" height="8" rx="2" fill="#FF9D14"/></g><g fill="#1a2733"><rect x="5" y="6" width="6.5" height="3.4" rx="1.4"/><rect x="12.5" y="6" width="6.5" height="3.4" rx="1.4"/><rect x="11" y="7" width="2" height="1.2"/></g><path d="M8 13 Q12 16.5 16 13" fill="none" stroke="#1a2733" stroke-width="1.3" stroke-linecap="round"/></g></svg></div>
@@ -8376,7 +8526,9 @@ function sbAsOfSpan(text){
 }
 const SB_SANDOP_NV_URL='https://portal.sandop.a2z.com/#!/network-viewer';
 // opts: {iso: the shift date looked up (older values get "(as of MM-DD)"), eos: true -> when no
-// value exists, show an "Open SandOP to load IPT" link instead of the em-dash}.
+// value exists, show an "Open SandOP to load IPT" link instead of the em-dash, oneMissing: true ->
+// (15.60.3) only THIS direction is missing (the other has a value): em-dash + a small per-direction
+// "Load IB IPT" / "Load DA IPT" link. Both links carry .sb-ipt-link (the EOS capture shows n/a)}.
 function sbIptWriteCell(id,dir,entry,site,opts){
     const el=document.getElementById(id);if(!el)return;
     const o=opts||{};
@@ -8390,6 +8542,18 @@ function sbIptWriteCell(id,dir,entry,site,opts){
             title+=' \u00b7 older value (no IPT stored for '+o.iso+')';
         }
         el.title=title;
+    }else if(o.oneMissing){
+        el.textContent='\u2014 ';
+        const a=document.createElement('a');
+        a.className='sb-ipt-link sb-ipt-dir-link';
+        a.href=SB_SANDOP_NV_URL;
+        a.target='_blank';
+        a.rel='noopener noreferrer';
+        a.style.cssText='font-size:9px;font-weight:600;margin-left:2px;';
+        a.textContent='Load '+(dir==='ib'?'IB':'DA')+' IPT';
+        a.title='Open S&OP Network Viewer with '+(site||'your site')+' selected; the board loads Inbound and Outbound IPT automatically.';
+        el.appendChild(a);
+        el.title=a.title;
     }else if(o.eos){
         el.textContent='';
         const a=document.createElement('a');
@@ -8414,8 +8578,12 @@ function sbFillIptCells(ibId,daId,iso,opts){
         const S=String((loadConfig()||{}).site||'').toUpperCase();
         const r=getIptValues(S,iso,opts);
         const w=Object.assign({},opts||{},{iso:iso||sbShiftIso()});
-        sbIptWriteCell(ibId,'ib',r.ib,S,w);
-        sbIptWriteCell(daId,'da',r.da,S,w);
+        // (15.60.3) Exactly one direction missing on a CURRENT lookup (EOS Wash, or the Sync tab's
+        // shift date; not the Prior Day view) -> that cell gets the per-direction "Load XX IPT" link.
+        const current=(opts&&opts.current!=null)?!!opts.current:(w.iso===sbShiftIso());
+        const one=current&&(!r.ib!==!r.da);
+        sbIptWriteCell(ibId,'ib',r.ib,S,Object.assign({},w,{oneMissing:one&&!r.ib}));
+        sbIptWriteCell(daId,'da',r.da,S,Object.assign({},w,{oneMissing:one&&!r.da}));
     }catch(e){console.warn('[SB-IPT] fill failed: '+(e&&e.message));}
 }
 // --- Sync tab Dept Backlog (Shift Plan Targets panel, Current / Prior Day views) ---
@@ -10342,6 +10510,8 @@ function sbEosCaptureCanvas(content,opts){
                         const el=cr&&cr.querySelector('#'+id);if(!el)return;
                         const t=(el.textContent||'').trim();
                         // (15.60.0) The "Open SandOP to load IPT" link means no IPT -> n/a too.
+                        // (15.60.3) So does the per-direction "Load IB/DA IPT" link (also .sb-ipt-link);
+                        // textContent='n/a' drops the link, so its text never reaches the email.
                         if(el.querySelector('.sb-spin')||el.querySelector('.sb-ipt-link')||!t||t==='\u2014'){el.textContent='n/a';na.push(id);}
                     });
                     if(na.length)console.warn('[SB-EOS] backlog value unavailable, shown as n/a in the email: '+na.join(', '));
