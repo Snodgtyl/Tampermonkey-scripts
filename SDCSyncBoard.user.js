@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.61.1
+// @version      15.62.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -116,17 +116,13 @@ const SITE_SCHEDULES = {
     KRB5: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:17,sm:30,eh:5,em:15},p1:{sh:18,sm:0,eh:21,em:30},p2:{sh:21,sm:31,eh:1,em:0},p3:{sh:1,sm:0,eh:4,em:30}} },
     ONT9: { days:{full:{sh:6,sm:0,eh:17,em:45},p1:{sh:6,sm:30,eh:10,em:0},p2:{sh:10,sm:1,eh:13,em:30},p3:{sh:13,sm:30,eh:17,em:0}}, nights:{full:{sh:17,sm:0,eh:4,em:45},p1:{sh:17,sm:30,eh:21,em:0},p2:{sh:21,sm:1,eh:0,em:30},p3:{sh:0,sm:30,eh:4,em:0}} },
 };
-// Per-site shift-hours used by the EOS Wash CTI/TOP Hours Variance:
-//   block = paid shift block per HC (e.g. a 10-hr site), ops = productive hours (shift minus
-//   breaks). KRB3 = block 10, ops 9.25 (10.5h shift - ~1.25h breaks). Default to KRB3's values
-//   for any site not yet mapped; fill in other sites' block/ops as they're confirmed.
-const SHIFT_HOURS = { KRB3:{block:10, ops:9.25} };
-const SHIFT_HOURS_DEFAULT = {block:10, ops:9.25};
 // (15.60.0) EOS Wash shift-window lock. A shift that already ended stays the EOS Wash's shift for
 // SB_EOS_GRACE_MIN minutes after its fetch-window end (a 7 AM pull still shows the night that just
-// ended). The OM can override with the Auto | Days | Nights selector (persisted under this key).
+// ended). (15.62.0) There is no selector: the EOS Wash always uses Auto. The key below only holds a
+// mode saved by 15.60.0-15.61.1 and is deleted on load.
 const SB_EOS_GRACE_MIN = 240;
 const SB_EOS_SHIFT_MODE_KEY = 'syncboard_eos_shift_mode';
+try{localStorage.removeItem(SB_EOS_SHIFT_MODE_KEY);}catch(e){}   // (15.62.0) drop any saved Days/Nights so nobody stays stuck on a forced shift
 // (15.60.0) ICQA "current week" rolls to the new Sun-Sat week only at Sunday 08:00 local, so the
 // Saturday-night shift (which ends Sunday morning) stays in the week it started in.
 const SB_ICQA_WEEK_ROLL_HOUR = 8;
@@ -173,7 +169,6 @@ const SORT_THROUGHPUT_KEYS=['sort20lb','sort5lb','sortEuro','sortManual'];
 //   denominator = report GRAND TOTAL paid hours (all functions), read from summary tfoot total row
 // e.g. (Other Library Deep 14.41 + SBC - Library Deep 2.50) / grand total 22.52 = ~75%
 const DC_NUMERATOR_FUNCTIONS=['SBC - Library Deep','Other Library Deep'];
-const DC_PERCENT_FUNCTIONS=['SBC - Library Deep','SBC - Pallet Single','Other Library Deep','Other Pallet Single'];
 const DEFAULT_CONFIG = {
     site:'KRB3', shiftType:'Days', schedType:'3P',
     days:{ full:{sh:5,sm:45,eh:17,em:30}, p1:{sh:6,sm:15,eh:9,em:45}, p2:{sh:10,sm:15,eh:13,em:15}, p3:{sh:13,sm:15,eh:16,em:45} },
@@ -191,12 +186,6 @@ const SITE_CAGE_DENSITY_LOAD = { AVP8:19, HGR5:28, KRB1:19, KRB2:19, KRB3:18, KR
 // Runway/backlog thresholds (hours). Inbound: LOW runway = bad. Outbound: HIGH backlog = bad.
 const RUNWAY_RED=0.5, RUNWAY_YELLOW=1.0;       // inbound stow: <30m red, <1h yellow
 const LOAD_BACKLOG_GREEN=1.5, LOAD_BACKLOG_RED=2.0; // outbound load: <=1.5h green, >2h red
-// Slack workflow webhooks. SOS = shift cage counts, JOB_BALANCE = a one-line summary each
-// time the flow view is fetched (so the team sees the tool being used). Fire-and-forget.
-// SECURITY: the URLs are NOT hardcoded here (a committed webhook URL is a secret and gets
-// flagged/leaked when pushed to a public repo). They live only in this browser's
-// localStorage and are entered once via Settings. If unset, the Slack posts are simply
-// skipped (no error). Rotate the Slack workflow trigger if a URL was ever committed.
 // Slack workflow webhooks. Hardcoded so the triggers ALWAYS fire for every user out of the
 // box (no setup). SOS = shift cage counts; JOB_BALANCE = a usage summary each flow fetch.
 // SECURITY NOTE: this file is published on public GitHub, so these URLs are exposed. Treat
@@ -222,7 +211,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.61.1';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.62.0';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -603,6 +592,7 @@ function sbShiftLatestStarted(cfg,type,now){
 // shift (reason 'forced'). mode 'Auto': the shift that ended last stays locked until graceMin after
 // its end, even though the next shift has started (reason 'grace'); otherwise the shift in progress
 // (reason 'current'); otherwise the last ended one (reason 'last').
+// (15.62.0) The board always passes 'Auto'. The Days/Nights branch is kept only so the pure resolver stays unit-testable.
 // Returns {type,startDate,endDate,sched,reason,mode}.
 function sbEosResolveShift(cfg,mode,now,graceMin){
     const t0=(now instanceof Date)?now:new Date();
@@ -632,9 +622,9 @@ function sbEosShiftLabel(win){
 // Muted suffix that says why this shift was picked.
 function sbEosShiftSuffix(win){
     const r=win&&win.reason;
-    if(r==='grace')return '(Auto \u00b7 last shift, 4h grace)';
-    if(r==='current')return '(Auto \u00b7 in progress)';
-    if(r==='last')return '(Auto \u00b7 last shift)';
+    if(r==='grace')return '(last shift, 4h hold)';
+    if(r==='current')return '(in progress)';
+    if(r==='last')return '(last shift)';
     if(r==='forced')return '(selected)';
     return '';
 }
@@ -646,26 +636,24 @@ function sbEosShiftTitle(win){
         return [per('p1'),per('p2'),per('p3')].filter(Boolean).join(' \u00b7 ')+
             (s.p1&&s.p3?' | SOS '+hm(s.p1.sh,s.p1.sm)+' \u2192 EOS '+hm(s.p3.eh,s.p3.em):'')+
             ' | fetch window '+hm(s.full.sh,s.full.sm)+' \u2192 '+hm(s.full.eh,s.full.em)+
-            ' | Auto keeps the last shift for '+(SB_EOS_GRACE_MIN/60)+'h after it ends';
+            ' | the last shift stays shown for '+(SB_EOS_GRACE_MIN/60)+'h after it ends';
     }catch(e){return '';}
 }
-function sbEosShiftMode(){try{const v=localStorage.getItem(SB_EOS_SHIFT_MODE_KEY);return(v==='Days'||v==='Nights')?v:'Auto';}catch(e){return 'Auto';}}
-function sbSetEosShiftMode(m){try{localStorage.setItem(SB_EOS_SHIFT_MODE_KEY,(m==='Days'||m==='Nights')?m:'Auto');}catch(e){}}
 // The EOS Wash window: the displayed wash's window when one is shown (so IPT / re-renders match the
 // data on screen), else what a fetch would use right now.
 function sbEosWindow(){
     try{if(currentEOSWash&&currentEOSWash.shift)return currentEOSWash.shift;}catch(e){}
-    return sbEosResolveShift(loadConfig(),sbEosShiftMode());
+    return sbEosResolveShift(loadConfig(),'Auto');
 }
 function sbEosShiftIso(){try{return isoDate(sbEosWindow().startDate);}catch(e){return isoDate(new Date());}}
-// Header label next to the Shift selector: "Showing: <shift>" for the displayed wash, else
+// Header label next to the Email button: "Showing: <shift>" for the displayed wash, else
 // "Will fetch: <shift>" for what the next Fetch would use. Never throws.
 function sbEosUpdateShiftLabel(){
     try{
         if(!sbEosEnabled())return;
         const el=document.getElementById('eos-shift-label');if(!el)return;
         let shown=null;try{shown=(currentEOSWash&&currentEOSWash.shift)||null;}catch(e){shown=null;}
-        const win=shown||sbEosResolveShift(loadConfig(),sbEosShiftMode());
+        const win=shown||sbEosResolveShift(loadConfig(),'Auto');
         el.textContent=(shown?'Showing: ':'Will fetch: ')+sbEosShiftLabel(win)+' ';
         const suf=document.createElement('span');
         suf.style.cssText='opacity:.7;font-size:11px;';
@@ -688,11 +676,6 @@ async function fetchHTML(url){
 }
 function buildFnUrl(site,pid,sd,sh,sm,ed,eh,em){return`/reports/functionRollup?reportFormat=HTML&warehouseId=${site}&processId=${pid}&maxIntradayDays=1&spanType=Intraday&startDateIntraday=${encodeURIComponent(fmtDate(sd))}&startHourIntraday=${sh}&startMinuteIntraday=${sm}&endDateIntraday=${encodeURIComponent(fmtDate(ed))}&endHourIntraday=${eh}&endMinuteIntraday=${em}`;}
 function buildPPRUrl(site,sd,sh,sm,ed,eh,em){return`/reports/processPathRollup?reportFormat=HTML&warehouseId=${site}&maxIntradayDays=1&spanType=Intraday&startDateIntraday=${encodeURIComponent(fmtDate(sd))}&startHourIntraday=${sh}&startMinuteIntraday=${sm}&endDateIntraday=${encodeURIComponent(fmtDate(ed))}&endHourIntraday=${eh}&endMinuteIntraday=${em}&_adjustPlanHours=on&_hideEmptyLineItems=on&employmentType=AllEmployees`;}
-// Same as buildPPRUrl but allows a multi-day INTRADAY window (maxIntradayDays=8) so a full week
-// can be requested while STILL getting the server-rendered PPR (spanType=Week renders client-side
-// and its rows aren't in the fetched HTML). Used for the weekly ICQA RO rate so it reuses the
-// exact shift calc (parseICQARow on the IC/QA/CS row) over a Sunday->now window.
-function buildPPRUrlMultiDay(site,sd,sh,sm,ed,eh,em){return`/reports/processPathRollup?reportFormat=HTML&warehouseId=${site}&maxIntradayDays=8&spanType=Intraday&startDateIntraday=${encodeURIComponent(fmtDate(sd))}&startHourIntraday=${sh}&startMinuteIntraday=${sm}&endDateIntraday=${encodeURIComponent(fmtDate(ed))}&endHourIntraday=${eh}&endMinuteIntraday=${em}&_adjustPlanHours=on&_hideEmptyLineItems=on&employmentType=AllEmployees`;}
 
 function parseFnRollup(html){
     const doc=new DOMParser().parseFromString(html,'text/html');
@@ -1192,67 +1175,9 @@ async function fetchTOTPpr(site,startDate,sched,shiftType){
 // (processPathRollup) report (see parseICQARow/parsePPR above) — same report already
 // used for IB/OB actuals. Shift reuses the "full" period PPR fetch the board already
 // makes (same start/end window as the rest of the board, no extra request needed).
-// Week needs one extra fetch, with the report's own Week span.
-function buildPPRUrlWeek(site,weekStartDate){
-    return'/reports/processPathRollup?reportFormat=HTML&warehouseId='+site+'&spanType=Week&startDateWeek='+encodeURIComponent(fmtDate(weekStartDate))+'&_adjustPlanHours=on&employmentType=AllEmployees';
-}
 // Function Rollup report scoped to the report's own Week span (used for ICQA DC% week view)
 function buildFnUrlWeek(site,pid,weekStartDate){
     return'/reports/functionRollup?reportFormat=HTML&warehouseId='+site+'&processId='+pid+'&spanType=Week&startDateWeek='+encodeURIComponent(fmtDate(weekStartDate));
-}
-// Walks a Function Rollup page and pulls the "Total Paid Hours" (first numeric cell in
-// the "Total" sub-row) for each named Function. From the Inspector, each function's
-// Total sub-row is a <tr class=" empl-all"> containing a <td> with text "Total" (the
-// size-total cell) plus <td class="numeric size-total highlighted"> cells.
-// The function name appears as link text in an earlier row of the same function block.
-function parseFunctionHoursByName(doc,names){
-    const result={};
-    names.forEach(n=>{result[n]=0;});
-    const allRows=doc.querySelectorAll('tr');
-    let currentFn=null;
-    for(let i=0;i<allRows.length;i++){
-        const row=allRows[i];
-        const rowText=row.textContent;
-        // Check if this row starts a new function block
-        for(const name of names){
-            if(rowText.indexOf(name)!==-1){
-                // Make sure it's actually the function name row, not just a coincidence
-                const links=row.querySelectorAll('a');
-                for(const a of links){
-                    if(a.textContent.trim()===name){currentFn=name;break;}
-                }
-                if(currentFn===name)break;
-                // Fallback: check td text directly
-                const tds=row.querySelectorAll('td');
-                for(const td of tds){
-                    if(td.textContent.trim()===name){currentFn=name;break;}
-                }
-                if(currentFn===name)break;
-            }
-        }
-        // Check if this is the "Total" sub-row for the current function
-        if(currentFn){
-            const tds=row.querySelectorAll('td');
-            let isTotalRow=false;
-            for(const td of tds){
-                const t=td.textContent.trim();
-                if(t==='Total'&&td.className.indexOf('size-total')!==-1){isTotalRow=true;break;}
-                if(t==='Total'&&td.className.indexOf('highlighted')!==-1){isTotalRow=true;break;}
-                if(t==='Total'&&!td.className.includes('numeric')){isTotalRow=true;break;}
-            }
-            if(isTotalRow){
-                // First cell whose class contains "numeric" = Total Paid Hours
-                for(const td of tds){
-                    if(td.className.indexOf('numeric')!==-1){
-                        const val=parseFloat(td.textContent.trim().replace(/,/g,''))||0;
-                        if(val>0){result[currentFn]=val;break;}
-                    }
-                }
-                currentFn=null;
-            }
-        }
-    }
-    return result;
 }
 // DC% (Direct Count %) = (SBC - Library Deep + Other Library Deep hours)
 //   / (report GRAND TOTAL paid hours), off the ICQA process Function Rollup.
@@ -4280,24 +4205,6 @@ function renderOsCount(elId,count){
 // session cookies automatically — no need to have that tab open, same idea as the
 // Fast Start fetch elsewhere in this file.
 const ICQA_GCA_REASONS=['MANUAL_QUALITY_COACHING_FOR_STOW','MANUAL_PRODUCTIVITY_COACHING_FOR_STOW','TOO_MANY_STOW_MULTIPLE_EVENT_DEFECTS','TOO_MANY_STOW_MULTIPLE_EVENT_NOT_SCANNED_DEFECTS','TOO_MANY_STOW_MULTIPLE_EVENT_WRONG_BIN_DEFECTS','TOO_MANY_NIKE_QUANTITY_STOW_MULTIPLE_EVENT_DEFECTS','TOO_MANY_NIKE_QUANTITY_STOW_OVERAGE_DEFECTS','TOO_MANY_NIKE_QUANTITY_STOW_LOW_UNITS_PER_TRANSACTION_DEFECTS','STOW_QUBIT_RISK_SCORE_TOO_HIGH','TOO_MANY_STOW_MACHINE_GUN_RISK_SIGNATURES','TOO_MANY_STOW_OUT_OF_SEQUENCE_RISK_SIGNATURES','TOO_MANY_STOW_PC99_RISK_SIGNATURES','TOO_MANY_STOW_SWITCH_RISK_SIGNATURES','TOO_MANY_STOW_SHORTAGE_RISK_SIGNATURES','TOO_MANY_STOW_OVERAGE_RISK_SIGNATURES','TOO_MANY_STOW_DAMAGE_RISK_SIGNATURES','TOO_MANY_STOW_BIN_COLLISION_RISK_SIGNATURES','TOO_MANY_STOW_AMNESTY_DIRTY_BIN_RISK_SIGNATURES','TOO_MANY_STOW_SHORTAGE_DEFECTS','TOO_MANY_STOW_OVERAGE_DEFECTS','TOO_MANY_NO_STOW_TURNAWAY_INDICATORS','TOO_MANY_STOW_AMNESTY_LAST_TOUCH_ERROR_INDICATORS','TOO_MANY_SCAN_WHILE_STOW_DEFECTS','TOO_MANY_STOW_HOLDING_MULTIPLE_ITEMS_DEFECTS','TOO_MANY_STOW_BLOCKING_CAMERA_DEFECTS','TOO_MANY_SWEEP_AFTER_STOW_DEFECTS','TOO_MANY_POD_FRICTION_NON_COMPLIANT_STOW_OVERRIDES','TOO_MANY_STOW_FIDO_TRIPS_ERROR_INDICATORS','TOO_MANY_STOW_FIDO_PROMPTS_ERROR_INDICATORS','MANUAL_QUALITY_COACHING_FOR_PICK','MANUAL_PRODUCTIVITY_COACHING_FOR_PICK','TOO_MANY_PICK_ERROR_INDICATORS','TOO_MANY_PICK_OVERAGE_ERROR_INDICATORS','TOO_MANY_PICK_SHORTAGE_ERROR_INDICATORS','TOO_MANY_PICK_DAMAGE_ERROR_INDICATORS','TOO_HIGH_PICK_DPMO','PICK_QUBIT_RISK_SCORE_TOO_HIGH','TOO_MANY_PICK_SHORTAGE_RISK_SIGNATURES','TOO_MANY_PICK_DAMAGE_RISK_SIGNATURES','TOO_MANY_PICK_SCANNED_WRONG_ASIN_RISK_SIGNATURES','TOO_MANY_PICK_REJECT_RISK_SIGNATURES','TOO_MANY_PICK_UNSCANNABLE_RISK_SIGNATURES','TOO_MANY_PICK_WRONG_ADJUSTMENT_DEFECTS','TOO_MANY_PICK_OVERFILLED_TOTE_ERROR_INDICATORS','TOO_MANY_PICK_AMNESTY_DIRTY_BIN_RISK_SIGNATURES','TOO_MANY_PICK_AMNESTY_LAST_TOUCH_ERROR_INDICATORS','TOO_MANY_PICK_FIDO_TRIPS_ERROR_INDICATORS','TOO_MANY_PICK_FIDO_PROMPTS_ERROR_INDICATORS','TOO_MANY_PICK_FALSE_DAMAGE_ERROR_INDICATORS','TOO_MANY_PICK_HIGH_REACH_WITHOUT_STEP_LADDER_DEFECTS','MANUAL_QUALITY_COACHING_FOR_INDUCT','MANUAL_PRODUCTIVITY_COACHING_FOR_INDUCT','TOO_MANY_INDUCT_ERROR_INDICATORS','TOO_MANY_INDUCT_SHORTAGE_ERROR_INDICATORS','TOO_MANY_INDUCT_DAMAGE_ERROR_INDICATORS','TOO_MANY_INDUCT_FALSE_DAMAGE_ERROR_INDICATORS','MANUAL_QUALITY_COACHING_FOR_REBIN','MANUAL_PRODUCTIVITY_COACHING_FOR_REBIN','TOO_MANY_AFE_REBIN_ERROR_INDICATORS','TOO_MANY_AFE_REBIN_SHORTAGE_ERROR_INDICATORS','TOO_MANY_AFE_REBIN_DAMAGE_ERROR_INDICATORS','TOO_HIGH_AFE_REBIN_DPMO','TOO_MANY_AFE_REBIN_FALSE_DAMAGE_ERROR_INDICATORS','TOO_MANY_BATCHY_REBIN_ERROR_INDICATORS','TOO_MANY_BATCHY_REBIN_SHORTAGE_ERROR_INDICATORS','TOO_MANY_BATCHY_REBIN_DAMAGE_ERROR_INDICATORS','TOO_HIGH_BATCHY_REBIN_DPMO','MANUAL_QUALITY_COACHING_FOR_RECEIVE','MANUAL_PRODUCTIVITY_COACHING_FOR_RECEIVE','TOO_MANY_RECEIVE_OVERAGE_ERROR_INDICATORS','TOO_MANY_RECEIVE_SHORTAGE_ERROR_INDICATORS','TOO_MANY_RECEIVE_ERROR_INDICATORS','TOO_MANY_RECEIVE_FALSE_DAMAGE_ERROR_INDICATORS','MANUAL_QUALITY_COACHING_FOR_ICQA','MANUAL_PRODUCTIVITY_COACHING_FOR_ICQA','TOO_MANY_ICQA_AMNESTY_DIRTY_BIN_RISK_SIGNATURES','TOO_MANY_ICQA_AMNESTY_LAST_TOUCH_ERROR_INDICATORS','TOO_MANY_ICQA_FIDO_TRIPS_ERROR_INDICATORS','TOO_MANY_ICQA_FIDO_PROMPTS_ERROR_INDICATORS','TOO_MANY_ICQA_FALSE_DAMAGE_ERROR_INDICATORS','MANUAL_QUALITY_COACHING_FOR_PACK','MANUAL_PRODUCTIVITY_COACHING_FOR_PACK','TOO_MANY_PACK_WRONG_CONTAINER_USED_DEFECTS','TOO_MANY_PACK_WEIGHT_OUT_OF_TOLERANCE_ERROR_INDICATORS','TOO_MANY_PACK_WRONG_CONTAINER_USED_ERROR_INDICATORS','TOO_MANY_PACK_DAMAGE_RISK_SIGNATURES','TOO_MANY_PACK_SHORTAGE_RISK_SIGNATURES','TOO_MANY_PACK_UNSCANNABLE_RISK_SIGNATURES','TOO_MANY_PACK_SERIAL_UNSCANNABLE_RISK_SIGNATURES','TOO_MANY_PACK_NO_SCANNABLE_ID_RISK_SIGNATURES','TOO_MANY_PACK_DUPLICATE_SERIAL_SCAN_RISK_SIGNATURES','TOO_MANY_PACK_NO_PACKING_SLIP_RISK_SIGNATURES','TOO_MANY_PACK_BROKEN_SET_DEFECTS','TOO_MANY_PACK_MASTER_PACK_DEFECTS','TOO_MANY_PACK_DAMAGE_DEFECTS','TOO_MANY_PACK_SHORTAGE_DEFECTS','TOO_MANY_PACK_OVERAGE_DEFECTS','TOO_MANY_PACK_MISSING_DUNNAGE_DEFECTS','TOO_MANY_PACK_INSUFFICIENT_DUNNAGE_DEFECTS','TOO_MANY_PACK_CONCESSION_APPLIED_ERROR_INDICATORS','TOO_MANY_PACK_CONCESSION_DEFECTS','TOO_MANY_PACK_OPEN_BOX_DEFECTS','TOO_MANY_PACK_LABEL_APPLICATION_DEFECTS','TOO_MANY_PACK_LABEL_PRINTING_DEFECTS','TOO_MANY_PACK_WRONG_BOX_MCF_DEFECTS','TOO_MANY_PACK_WRONG_BOX_DEFECTS','TOO_MANY_PACK_PACKAGE_PROTECTION_LEVEL_DEFECTS','TOO_MANY_PACK_FALSE_DAMAGE_ERROR_INDICATORS','MANUAL_QUALITY_COACHING_FOR_REVERSE_LOGISTICS','MANUAL_PRODUCTIVITY_COACHING_FOR_CUSTOMER_RETURNS','TOO_MANY_CUSTOMER_RETURNS_ITEM_MATCH_RISK_SIGNATURES','TOO_MANY_CUSTOMER_RETURNS_ITEM_DAMAGE_REMOVED_RISK_SIGNATURES','MANUAL_QUALITY_COACHING_FOR_SPACE_MANAGEMENT','MANUAL_QUALITY_COACHING_FOR_OUTBOUND_PROBLEM_SOLVE','TOO_MANY_POPS_MARKED_MISSING_ITEMS_FROM_CONTAINER_RISK_SIGNATURES','TOO_MANY_POPS_MARKED_MISSING_ITEMS_FROM_SPOOS_ERROR_INDICATORS','TOO_MANY_POPS_MARKED_MISSING_TOTE_BEFORE_PACK_ERROR_INDICATORS','TOO_MANY_POPS_MARKED_MISSING_TOTE_ERROR_INDICATORS','TOO_MANY_POPS_MARKED_MISSING_SHIPMENT_C15_DEFECTS','TOO_MANY_POPS_MARKED_MISSING_SHIPMENT_C704_DEFECTS','TOO_MANY_POPS_MARKED_MISSING_SHIPMENTS_ERROR_INDICATORS','TOO_MANY_POPS_REPROCESSED_SHIPMENTS_RISK_SIGNATURES','TOO_MANY_SLAM_OPERATOR_CONCESSION_ERROR_INDICATORS','TOO_MANY_OUTBOUND_PROBLEM_SOLVE_FALSE_DAMAGE_ERROR_INDICATORS','MANUAL_QUALITY_COACHING_FOR_INBOUND_PROBLEM_SOLVE','TOO_MANY_INBOUND_PROBLEM_SOLVE_EXCESSIVE_DELETES_DAMAGES','TOO_MANY_INBOUND_PROBLEM_SOLVE_FALSE_DAMAGE_ERROR_INDICATORS','MANUAL_QUALITY_COACHING_FOR_DECANT','MANUAL_PRODUCTIVITY_COACHING_FOR_DECANT','TOO_MANY_DECANT_ERROR_INDICATORS','MANUAL_QUALITY_COACHING_FOR_SHIP','MANUAL_PRODUCTIVITY_COACHING_FOR_SHIP','TOO_MANY_PACKAGE_MISSORTS','TOO_MANY_CONTAINER_MISSORTS','TOO_LOW_AMNESTY_FIND_RATE_RISK_SIGNATURES'];
-// --- GCA popup/diagnostic fix verification note ---
-// Changes (all inside fetchIcqaGCA onload + promptGcaLogin text):
-//  (1) Added console.warn('[SB-GCA] unexpected response ...') logging status + first 300 chars of
-//      the body, placed BEFORE the re-auth branch and only reached when the success guard did not
-//      return (never logs on success).
-//  (2) Failure branch BEFORE/AFTER:
-//        BEFORE: const looksLikeLogin=status===401||status===403||status===0&&/.../i.test(resp.responseText||'');
-//                if(looksLikeLogin){promptGcaLogin(config);}
-//                else setEl('icqa-gca-updated','GCA unavailable (retrying)');
-//        AFTER:  bodyTxt=String(resp.responseText||''); looksLikeLogin (same meaning, parens added);
-//                looksTransient=status>=500 -> silent retry status 'GCA unavailable (server N, retrying)';
-//                every other non-login/non-5xx response -> promptGcaLogin(config) (clickable link restored).
-//  (3) promptGcaLogin innerHTML BEFORE/AFTER:
-//        BEFORE: '\u26A0\uFE0F <a id="gca-login-link" ...>Log in to Guided Coaching</a>'
-//        AFTER:  '\u26A0\uFE0F GCA stuck \u2014 <a id="gca-login-link" ...>Log in to Guided Coaching</a>'
-//  Listener wiring, dataset.gcaPrompt guard, request body, interval, onerror, ontimeout, and
-//  openGcaLoginPopup are UNCHANGED. Brace/paren/backtick balance verified by reading: balanced
-//  (no backticks in region; if/else-if/else and GM_xmlhttpRequest/try-catch all close cleanly).
 function fetchIcqaGCA(config,isRetry){
     try{
         const site=(config||loadConfig()).site;
@@ -6590,7 +6497,7 @@ function buildHTML(){return `
 </div></main>
 
 <main id="tab-eoswash" class="tab-content"><div class="eoswash-container">
-<div class="section-header"><h2 style="margin-right:14px;">EOS Wash</h2><button id="btn-fetch-eoswash" class="btn btn-primary">\u25B6 Fetch EOS Wash</button><button id="btn-email-eoswash" class="btn" style="background:#1565c0;color:#fff;border-color:#1565c0;">\u2709 Email</button><label for="eos-shift-mode" style="margin-left:12px;font-size:12px;font-weight:600;">Shift</label> <select id="eos-shift-mode" class="btn btn-small" aria-label="EOS Wash shift" title="Auto keeps the last shift for 4h after it ends; pick Days or Nights to force one" style="margin-left:4px;"><option value="Auto">Auto</option><option value="Days">Days</option><option value="Nights">Nights</option></select> <span id="eos-shift-label" class="meta-text" style="margin-left:6px;"></span><span id="eoswash-status" class="meta-text" style="margin-left:12px;"></span>
+<div class="section-header"><h2 style="margin-right:14px;">EOS Wash</h2><button id="btn-fetch-eoswash" class="btn btn-primary">\u25B6 Fetch EOS Wash</button><button id="btn-email-eoswash" class="btn" style="background:#1565c0;color:#fff;border-color:#1565c0;">\u2709 Email</button><span id="eos-shift-label" class="meta-text" style="margin-left:12px;"></span><span id="eoswash-status" class="meta-text" style="margin-left:12px;"></span>
 <span style="margin-left:auto;font-size:11px;color:#888;white-space:nowrap;">LP Shift Plan pulls from the Sync tab (Shift Plan Targets)</span></div>
 <div id="eoswash-content"></div>
 <div style="text-align:center;font-size:10px;color:#999;margin-top:10px;font-style:italic;">Inspired by ucros</div>
@@ -7280,7 +7187,6 @@ async function fetchHourlyData(){
     // Calculate total minutes from SOS to EOS
     const sMins=hourlyStartH*60+hourlyStartM;
     const eMins=eosH*60+eosM;
-    let totalMins=eMins>sMins?eMins-sMins:(1440-sMins)+eMins;
 
     // Build hour slots: first = SOS to next full hour, middle = full hours, last = last full hour to EOS
     const hours=[];
@@ -7624,7 +7530,6 @@ function vretAmazonWeek(target){
 }
 function vretShiftGroup(dow){if(dow>=0&&dow<=2)return'FHD / FHN';if(dow===3)return'Wed DS / Wed NS';return'BHD / BHN';}
 function vretNightWindow(dow){return dow===3?{sh:17,sm:30,eh:5,em:30}:{sh:18,sm:30,eh:5,em:30};}
-function vretFmtDate(d){return d.getFullYear()+'/'+String(d.getMonth()+1).padStart(2,'0')+'/'+String(d.getDate()).padStart(2,'0');}
 function vretDayName(d){return['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()];}
 function vretDateShort(d){return String(d.getMonth()+1).padStart(2,'0')+'/'+String(d.getDate()).padStart(2,'0');}
 
@@ -7994,7 +7899,6 @@ function renderVRETsTab(v){
     const fmtN=n=>(n==null||isNaN(n))?'0':Number(n).toLocaleString();
     const perShiftGoal=Math.round(goal/14);
     const wtdPack=data.reduce((s,d)=>s+d.totalPack,0);
-    const wtdPick=data.reduce((s,d)=>s+d.totalPick,0);
     const daysElapsed=data.length;
     const wtdGoal=Math.round(goal*daysElapsed/7);
     const delta=wtdPack-wtdGoal;
@@ -8148,13 +8052,6 @@ function readEosPlanTargets(){
         transferOutPick:parse('ob-lp-plan-vol',saved.transferOutPick)
     };
 }
-// Persist the two manual plan inputs to localStorage, then re-render the EOS Wash so the
-// "% to Daily Plan" column reflects the new target immediately (no re-fetch needed).
-function saveEosPlanTargets(){
-    const t=readEosPlanTargets();
-    try{localStorage.setItem(EOS_PLAN_KEY,JSON.stringify(t));}catch(e){}
-    if(currentEOSWash)renderEOSWash(currentEOSWash);
-}
 // On first build, seed the two inputs from the saved values and wire change listeners.
 function initEosPlanInputs(){
     // The LP Shift Plan Volume inputs now live on the Sync tab (ib-lp-plan-vol / ob-lp-plan-vol).
@@ -8190,7 +8087,7 @@ function sbApplyEosSiteGate(){
     }
 }
 // Fetch the full-shift PPR once and render the EOS Wash. (15.60.0) The shift window is the EOS
-// Wash's own locked window (sbEosResolveShift with the Auto | Days | Nights selector), NOT the Sync
+// Wash's own locked window (sbEosResolveShift in Auto), NOT the Sync
 // tab's: in Auto a shift that ended stays the wash's shift for 4h (a late pull still reports it).
 // Every report below (PPR, fn-rollups, 12hr Site CPLH, ICQA, backlog snapshot date, IPT date)
 // uses that window. The Sync tab's getShiftDates is unchanged.
@@ -8204,8 +8101,8 @@ async function fetchEOSWashData(){
     if(content&&content.innerHTML.trim()==='')content.innerHTML='<div style="padding:20px;font-size:14px;">\u23F3 Fetching EOS Wash data\u2026</div>';
     try{
         const config=loadConfig();
-        // (15.60.0) Locked EOS window (Auto grace / forced Days / Nights).
-        const win=sbEosResolveShift(config,sbEosShiftMode());
+        // (15.60.0) Locked EOS window (Auto: the last shift is held for 4h after it ends).
+        const win=sbEosResolveShift(config,'Auto');
         const sched=win.sched;
         const startDate=new Date(win.startDate);
         const sDate=new Date(win.startDate), eDate=new Date(win.endDate);
@@ -9524,13 +9421,10 @@ function renderEOSWash(data){
     const seeded=(data&&data.alpsTarget)||{};
     const ibT=(manualTargets.caseTransferIn!=null)?manualTargets.caseTransferIn:(seeded.caseTransferIn!=null?seeded.caseTransferIn:null);
     const daT=(manualTargets.transferOutPick!=null)?manualTargets.transferOutPick:(seeded.transferOutPick!=null?seeded.transferOutPick:null);
-    const alpsTargetByName={'Case Transfer In':ibT,'Transfer Out Pick - Total':daT};
     // CTI/TOP Hours Variance inputs (closure vars used in procRow): the manual LP Target volumes
-    // (same as ibT/daT), and the per-site shift block/ops hours. eosShift falls back to the
-    // default (KRB3 values) for any unmapped site.
+    // (same as ibT/daT).
     const eosLpTargetIB=(ibT!=null&&ibT>0)?ibT:0;
     const eosLpTargetDA=(daT!=null&&daT>0)?daT:0;
-    const eosShift=SHIFT_HOURS[(loadConfig().site||'').toUpperCase()]||SHIFT_HOURS_DEFAULT;
     const dc=cfDensityColors();
     // Read existing Sync-tab plan inputs (no re-entry).
     const gv=id=>{const el=document.getElementById(id);if(!el)return 0;const raw=(el.value!=null&&el.value!=='')?el.value:el.textContent;return parseFloat(String(raw).replace(/,/g,''))||0;};
@@ -9615,23 +9509,9 @@ function renderEOSWash(data){
         const title='LP hrs '+fv(p.lpHrs,2)+' \u00b7 actual hrs '+fv(p.actHrs,2)+' \u00b7 '+(pct==null?'\u2014':pct.toFixed(1)+'%')+' of LP hours';
         return `<td style="${hvColor(pct)}" title="${title}">${txt}</td>`;
     };
-    // Hours Variance cell color: GREEN when the actual rate is within 3% of the LP rate (close to
-    // perfectly aligned), RED otherwise. gapPct = |actual - LP| / LP * 100. Returns a style string.
-    const varBand=(actRate,lpRate)=>{
-        if(!(actRate>0)||!(lpRate>0))return '';
-        const gapPct=Math.abs(actRate-lpRate)/lpRate*100;
-        return gapPct<=3?`background:${dc.goodBg};color:${dc.goodTxt};`:`background:${dc.badBg};color:${dc.badTxt};`;
-    };
-    // TOTALS coloring (IB TOTAL / DA TOTAL / THROUGHPUT): GREEN when actual rate (CPLH) is AT or
-    // ABOVE the LP rate (CPLH), RED when below. Straight above/below-plan check (not the 3% band).
-    const varAboveBelow=(actRate,lpRate)=>{
-        if(!(actRate>0)||!(lpRate>0))return '';
-        return actRate>=lpRate?`background:${dc.goodBg};color:${dc.goodTxt};`:`background:${dc.badBg};color:${dc.badTxt};`;
-    };
     // SHARED Hours Variance (owner spec). LP_volume read from the Sync-tab LP Shift Plan inputs by
     // dept: ib->ib-lp-plan-vol, ob->ob-lp-plan-vol, total->IB+OB combined (gv() parses value, 0 if
-    // absent). Formula A (useShiftMultiplier=false): (LP_volume/LP_rate) - actualHours. Formula B
-    // (true): ((LP_volume/LP_rate)*shiftHours) - actualHours, shiftHours=eosShift.block (10 KRB3).
+    // absent). Formula: (LP_volume/LP_rate) - actualHours.
     // + = used FEWER hours than plan (good). Returns null (blank cell) when LP_volume or LP_rate
     // is 0/unavailable, so the cell shows a dash, never 0/NaN.
     // (15.47.0) Parts form (lpVol, lpHrs, actHrs, variance) so the cell color/tooltip use the same base.
@@ -9665,10 +9545,10 @@ function renderEOSWash(data){
         return null; // eaches / other units are not cases
     };
     // "% to Daily Plan" cell: actual shift VOLUME vs the ALPS daily-plan Capacity target
-    // (cartons). Only the two rows in alpsTargetByName have a target; everything else (and any
+    // (cartons).
     // (The "% to Daily Plan" column + its dailyPlanCell() were removed per request. The IB/OB
-    // manual LP Target inputs / alpsTargetByName REMAIN because they feed the CTI/TOP labor-plan
-    // Hours Variance calc, which is still shown.)
+    // manual LP Target inputs (ibT/daT -> eosLpTargetIB/DA) REMAIN because they feed the CTI/TOP
+    // labor-plan Hours Variance calc, which is still shown.)
     function procRow(label,pprName){
         const d=ppr[pprName]||{};
         const showsVol=HAS_VOLUME.has(pprName);
@@ -10624,9 +10504,8 @@ function sbEosSliceCanvas(canvas,capInfo,scale){
 // (15.49.0) "Inbound EOS" / "Outbound EOS" section labels at the top of the body, each followed by
 // a blank line where the Inbound (Dock / Stow Area Readiness) and Outbound (Dock / Pick Area
 // Readiness) tables are pasted, then the EOS Wash text + image(s).
-// (15.55.0) The body HTML is shared with the clipboard email (sbEosBodyHtml); srcOf(im) gives each
-// <img> src (cid: for the .eml, a data: URI for the clipboard). The .eml is now only the last-resort
-// fallback when the clipboard cannot be written.
+// (15.55.0) The body HTML is shared by the .eml (cid: images) and the Outlook-on-the-web email
+// (data: URIs); srcOf(im) gives each <img> src.
 function sbEosBodyHtml(site,imgs,srcOf){
     const n=imgs.length;
     return ''+
@@ -10701,15 +10580,6 @@ function sbEosEmailToast(msg,kind,linkHref){
         el.style.display='flex';
         clearTimeout(el._sbHide);el._sbHide=setTimeout(()=>{el.style.display='none';},25000);
     }catch(e){console.warn('[SB-EOS] toast failed: '+(e&&e.message));}
-}
-// (15.55.0) Short mailto: URL (no body / image data, so no length limits): To + Cc + Subject.
-// Plain addresses joined with ';' (the separator Outlook desktop / new Outlook accept).
-function sbEosMailtoUrl(to,ccList,subject){
-    const enc=(s)=>encodeURIComponent(s).replace(/%40/g,'@');
-    const q=[];
-    if(ccList&&ccList.length)q.push('cc='+ccList.map(enc).join(';'));
-    q.push('subject='+encodeURIComponent(subject));
-    return 'mailto:'+enc(to)+'?'+q.join('&');
 }
 // (15.57.0) Email button mode: 'owa' = open the new Outlook (Outlook on the web) compose deeplink in
 // a new tab and let sbRunOutlookComposeFiller insert the body there; 'eml' = the 15.56.1 .eml
@@ -11076,15 +10946,8 @@ function sbEosCombinedPngBlob(canvas,scale){
 
 // Capture the EOS Wash and open an email addressed to the site's boss ({SITE}-boss@amazon.com).
 // (15.49.0) KRB3 emails CC site leadership; body has "Inbound EOS" / "Outbound EOS" labels.
-// (15.55.0) No download step: the button (1) waits for the Backlog fetches (sbEosBacklogReady,
-// <= 15s) and re-reads IPT, (2) captures as before, (3) puts the full email body (greeting, labels,
-// section images as data: PNGs at 1:1, closing) on the clipboard as HTML + one combined PNG,
-// (4) opens a compose window via a short mailto: (To / Cc / Subject), (5) shows a "press Ctrl+V"
-// notice. Browsers cannot open a compose window WITH images, so the user pastes the body.
-// navigator.clipboard.write is called synchronously in the click (user activation) with
-// Promise<Blob> values that resolve after the capture; the mailto opens only after the write
-// resolves (so the mail app taking focus cannot break it). Fallbacks: GM_setClipboard(html,'html'),
-// then the old .eml download (warned in the console + the notice).
+// (15.55.0) Waits for the backlog (sbEosBacklogReady, <= 15s) and re-reads IPT before capturing.
+// (15.62.0: the unused 15.55.0 clipboard + mailto variant was removed.)
 // (15.57.0) Default mode SB_EOS_EMAIL_MODE='owa': a new tab opens in the click, the finished email
 // goes to GM storage, the tab goes to the new Outlook compose deeplink and sbRunOutlookComposeFiller
 // inserts the body there (no download, no Ctrl+V). Falls back to the .eml download.
@@ -11109,7 +10972,6 @@ function emailEOSWash(){
     const cc=(EOS_EMAIL_CC[site]||[]).join(', ');
     const ccAddrs=(EOS_EMAIL_CC[site]||[]).map(s=>{const m=/<([^>]+)>/.exec(s);return m?m[1]:s;});
     const subject=`${site} EOS Wash`;   // (15.51.2) user request: subject is just "KRB3 EOS Wash"
-    const mailto=sbEosMailtoUrl(to,ccAddrs,subject);
     // (15.58.0) Default: open the system mail app (new / classic Outlook) + one-Ctrl+V clipboard image.
     if(SB_EOS_EMAIL_MODE==='app'){sbEosEmailAppClick({btn,site,to,cc,ccAddrs,subject});return;}
     // (15.59.0) Default: Outlook on the web, filled in automatically (blocked pop-up -> 'app').
@@ -11117,7 +10979,7 @@ function emailEOSWash(){
     // ---- 'eml' mode below (the 15.56.1 .eml download) ----
     if(btn){btn.disabled=true;btn.textContent='\u23F3 Loading backlog\u2026';}
     const resetBtn=(ms)=>{if(btn)setTimeout(()=>{btn.textContent='\u2709 Email';btn.disabled=false;},ms||0);};
-    // Backlog ready -> capture -> section images + body HTML + combined PNG.
+    // Backlog ready -> capture -> section images.
     const job=sbEosBacklogReady(15000).then(()=>{
         if(btn)btn.textContent='\u23F3 Capturing...';
         return sbEosCaptureCanvas(content);
@@ -11125,19 +10987,10 @@ function emailEOSWash(){
         // (15.54.0) One canvas, split between sections into images of at most EOS_SLICE_MAX_H
         // CSS px (see sbEosSliceRanges), each shown at 1:1 CSS size (width = canvas.width /
         // EOS_CAP_SCALE = EOS_CAP_W). The PNGs keep the 2x resolution.
-        const images=sbEosSliceCanvas(canvas,capInfo,EOS_CAP_SCALE);
-        const html=sbEosBodyHtml(site,images,im=>'data:image/png;base64,'+im.b64);
-        return sbEosCombinedPngBlob(canvas,EOS_CAP_SCALE)
-            .catch(e=>{console.warn('[SB-EOS] combined PNG failed: '+(e&&e.message));return null;})
-            .then(png=>({images,html,png}));
+        return {images:sbEosSliceCanvas(canvas,capInfo,EOS_CAP_SCALE)};
     });
     job.catch(()=>{});   // handled below; avoids an "unhandled rejection" for the side branches
-    // (15.56.1) ROLLBACK at user request: the clipboard + mailto flow wasn't sending. Go back to the
-    // proven pre-15.55.0 .eml download (opens in Outlook with images inline). Keeps the 15.55.0
-    // backlog wait + light-theme capture + Highlights-first order. Set SB_EOS_USE_CLIPBOARD=true
-    // to re-enable the clipboard flow later.
-    const SB_EOS_USE_CLIPBOARD=false;
-    // The 15.56.1 .eml download ('eml' mode only; 'owa' falls back to 'app' since 15.59.0).
+    // The 15.56.1 .eml download ('eml' mode only).
     const downloadEml=(j)=>{
         const eml=sbBuildEosEml({to,cc,subject,site,images:j.images,stamp:Date.now()});
         const blob=new Blob([eml],{type:'message/rfc822'});
@@ -11150,57 +11003,9 @@ function emailEOSWash(){
         if(btn)btn.textContent='\u2713 .eml downloaded';
         resetBtn(4000);
     };
-    // (15.59.0) The 'owa' hand-off moved to sbEosEmailOwaClick (pre-capture, sign-in-proof entry).
-    if(!SB_EOS_USE_CLIPBOARD){
-        job.then(j=>{
-            downloadEml(j);
-        }).catch(e=>{
-            console.error('[SB-EOS] email capture failed:',e);
-            if(btn){btn.textContent='\u2709 Email';btn.disabled=false;}
-            alert('Screenshot failed: '+(e&&e.message));
-        });
-        return;
-    }
-    // Clipboard write created NOW, inside the click's user activation; its blobs resolve later.
-    let writeP;
-    try{
-        if(navigator.clipboard&&typeof navigator.clipboard.write==='function'&&typeof ClipboardItem==='function'){
-            const htmlP=job.then(j=>new Blob([j.html],{type:'text/html'}));
-            const pngP=job.then(j=>{if(!j.png)throw new Error('combined PNG unavailable');return j.png;});
-            htmlP.catch(()=>{});pngP.catch(()=>{});
-            writeP=navigator.clipboard.write([new ClipboardItem({'text/html':htmlP,'image/png':pngP})]);
-        }else writeP=Promise.reject(new Error('navigator.clipboard.write / ClipboardItem unavailable'));
-    }catch(e){writeP=Promise.reject(e);}
-    writeP.then(()=>job.then(()=>'clipboard'),err=>job.then(j=>{
-        console.warn('[SB-EOS] clipboard.write failed ('+(err&&err.message)+') \u2014 trying GM_setClipboard');
-        if(typeof GM_setClipboard==='function'){
-            try{GM_setClipboard(j.html,'html');return 'gm';}
-            catch(e){console.warn('[SB-EOS] GM_setClipboard failed: '+(e&&e.message));}
-        }
-        return 'eml';
-    })).then(mode=>job.then(j=>{
-        if(mode==='eml'){
-            // Last resort: the pre-15.55.0 .eml download (opens in Outlook with the images inline).
-            console.warn('[SB-EOS] clipboard unavailable \u2014 falling back to the .eml download');
-            const eml=sbBuildEosEml({to,cc,subject,site,images:j.images,stamp:Date.now()});
-            const blob=new Blob([eml],{type:'message/rfc822'});
-            const url=URL.createObjectURL(blob);
-            const a=document.createElement('a');
-            a.href=url;
-            a.download=(site||'EOS')+'_EOS_Wash_'+new Date().toISOString().slice(0,16).replace(/[T:]/g,'-')+'.eml';
-            document.body.appendChild(a);a.click();document.body.removeChild(a);
-            setTimeout(()=>URL.revokeObjectURL(url),4000);
-            sbEosEmailToast('Couldn\u2019t copy the EOS Wash to the clipboard \u2014 downloaded the .eml instead. Open it to send.','warn');
-            if(btn)btn.textContent='\u2713 .eml downloaded';
-            resetBtn(4000);
-            return;
-        }
-        sbOpenMailto(mailto);
-        dbg('[SB-EOS] email: body on clipboard via '+mode+', '+j.images.length+' image(s), mailto opened ('+mailto.length+' chars)');
-        sbEosEmailToast('Email opened \u2014 click in the message body and press Ctrl+V to paste the EOS Wash.','ok',mailto);
-        if(btn)btn.textContent='\u2713 Email opened';
-        resetBtn(4000);
-    })).catch(e=>{
+    job.then(j=>{
+        downloadEml(j);
+    }).catch(e=>{
         console.error('[SB-EOS] email capture failed:',e);
         if(btn){btn.textContent='\u2709 Email';btn.disabled=false;}
         alert('Screenshot failed: '+(e&&e.message));
@@ -11457,19 +11262,9 @@ function initBoard(){
     // internal VRETs refresh in doFetch don't inflate the count. One deliberate click = one ping.
     document.getElementById('btn-fetch-hourly')?.addEventListener('click',()=>{trackUsage('hourly');fetchHourlyData();});
     document.getElementById('btn-fetch-eoswash')?.addEventListener('click',()=>{trackUsage('eoswash');fetchEOSWashData();});
-    // (15.60.0) EOS Wash Shift selector (Auto | Days | Nights, persisted). Changing it while a wash
-    // is displayed re-fetches so the data matches the shown shift; otherwise only the label updates.
+    // (15.60.0) EOS Wash shift label: refreshed every 60s until a wash is fetched (15.62.0: no
+    // selector, always Auto).
     {
-        const sel=document.getElementById('eos-shift-mode');
-        if(sel){
-            sel.value=sbEosShiftMode();
-            sel.addEventListener('change',()=>{
-                sbSetEosShiftMode(sel.value);
-                let shown=false;try{shown=!!currentEOSWash;}catch(e){shown=false;}
-                sbEosUpdateShiftLabel();
-                if(shown)fetchEOSWashData();
-            });
-        }
         sbEosUpdateShiftLabel();
         setInterval(()=>{
             try{
