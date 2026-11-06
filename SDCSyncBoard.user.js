@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.60.3
+// @version      15.61.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -38,6 +38,7 @@
 // @connect      portal.sandop.a2z.com
 // @connect      hooks.slack.com
 // @connect      raw.githubusercontent.com
+// @connect      maple-syrup.corp.amazon.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -146,7 +147,10 @@ const PROCESS_IDS = { stow:'1003035', palletStow:'1003041', pick:'1003065', sort
     // Transfer Out Support (its own FCLM functionRollup process). Provides the support hours shown
     // on the EOS Wash "Transfer Out Support" row + used in its Hours Variance. tfoot Total Paid
     // Hours is the value we read (e.g. 56.17 for the KRB3 10/8 night shift).
-    toSupport:'01785144518570' };
+    toSupport:'01785144518570',
+    // (15.61.0) Working Well Huddles: the functionRollup for this process has a WW_Huddle function
+    // table (one tbody row per associate who completed a huddle). EOS Wash "Dock & Huddles" -> WWH.
+    wwHuddle:'01002960' };
 // RC SORT process paths. Sort sites (e.g. QXX6) break sort into per-path FunctionRollup reports,
 // each measured in UNITS (jobs), not cases. We fetch each path and aggregate:
 //   - throughput paths (20lb / 5lb / Euro / Manual): contribute UNITS (jobs, tfoot index 1) and
@@ -218,7 +222,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.60.3';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.61.0';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -1133,11 +1137,7 @@ async function fetchAllData(config){
     const site=config.site,sched=config.shiftType==='Nights'?config.nights:config.days,{startDate}=getShiftDates(config);
     setStatus('Fetching all periods...');
     // Build TOT time window: 30 min before SOS to 15 min after EOS
-    const totSched={sh:sched.full.sh,sm:sched.full.sm-30,eh:sched.full.eh,em:sched.full.em+15};
-    if(totSched.sm<0){totSched.sh--;totSched.sm+=60;}
-    if(totSched.sh<0)totSched.sh+=24;
-    if(totSched.em>=60){totSched.eh++;totSched.em-=60;}
-    if(totSched.eh>=24)totSched.eh-=24;
+    const totSched=sbTotSched(sched.full);   // (15.61.0) shared with the EOS Wash TOT row
     // Build Site CPLH time window: 15 min before SOS to 15 min before next shift SOS
     // Days: P1 start - 15 min to next night P1 start - 15 min (approx 06:00-18:00)
     // Nights: P1 start - 15 min to next day P1 start - 15 min (approx 18:00-06:00)
@@ -1160,12 +1160,28 @@ async function fetchAllData(config){
     return{full,p1,p2,p3,fastStart,data24,totPpr,cplhData};
 }
 
+// TOT (Time Off Task) window: 30 min before the full-shift start to 15 min after its end.
+// (15.61.0) Shared by the Sync tab (fetchAllData) and the EOS Wash "TOT Remaining" row.
+function sbTotSched(full){
+    const t={sh:full.sh,sm:full.sm-30,eh:full.eh,em:full.em+15};
+    if(t.sm<0){t.sh--;t.sm+=60;}
+    if(t.sh<0)t.sh+=24;
+    if(t.em>=60){t.eh++;t.em-=60;}
+    if(t.eh>=24)t.eh-=24;
+    return t;
+}
+// The TOT PPR URL for a shift that starts at startDate (unchanged date logic from fetchTOTPpr).
+function buildTOTPprUrl(site,startDate,sched){
+    let sDate=new Date(startDate);
+    if(sched.sh<12&&startDate.getHours()>=12){sDate.setDate(sDate.getDate()+1);}
+    let eDate=new Date(sDate);if(sched.eh<sched.sh)eDate.setDate(eDate.getDate()+1);
+    return buildPPRUrl(site,sDate,sched.sh,sched.sm,eDate,sched.eh,sched.em);
+}
+// "Xh Ym" exactly like the Sync tab's #tot-value.
+function sbFmtTotHrs(totHrs){const hrs=Math.floor(totHrs);const mins=Math.round((totHrs-hrs)*60);return hrs+'h '+mins+'m';}
 async function fetchTOTPpr(site,startDate,sched,shiftType){
     try{
-        let sDate=new Date(startDate);
-        if(sched.sh<12&&startDate.getHours()>=12){sDate.setDate(sDate.getDate()+1);}
-        let eDate=new Date(sDate);if(sched.eh<sched.sh)eDate.setDate(eDate.getDate()+1);
-        const url=buildPPRUrl(site,sDate,sched.sh,sched.sm,eDate,sched.eh,sched.em);
+        const url=buildTOTPprUrl(site,startDate,sched);
         const html=await fetchHTML(url);
         return parsePPR(html);
     }catch(e){console.warn('[SB] TOT PPR fetch error:',e.message);return{totHrs:0};}
@@ -1845,6 +1861,143 @@ function sbOwaPendingEmail(maxAgeMs){
         return p;
     }catch(e){return null;}
 }
+// (15.61.0) Turns addresses into RESOLVED recipient chips in one OWA recipient well (To / Cc).
+// `well` = the well's contenteditable input; chips are looked for in the well's row (its
+// grandparent): elements with role=button / listitem or contenteditable=false whose aria-label /
+// text / title contains the address or the display name (names[i]). Per address not already a
+// chip: clear the raw text, insert the address (execCommand insertText = a real InputEvent React
+// sees; fallback beforeinput + text node + input), wait typeMs for OWA's suggestion lookup, commit
+// with OWA's first matching suggestion (click) when one shows, else Enter (keydown/keypress/keyup),
+// wait waitMs, verify; if not resolved retry once with ';'. Chips match the address, the name or
+// OWA's "Last, First" form ("Ucros, Pablo"). Resolved = a matching chip (or one more chip) AND the
+// raw text no longer holds the address.
+// Afterwards leftover raw text is cleared; unresolved addresses are typed back (raw) so the user can
+// press Enter on them. Logs "<well> resolved: <addr>" / a warning. NEVER sends, never throws.
+// Returns {already,resolved,unresolved}. Self-contained (runs on Outlook before board consts).
+async function sbOwaResolveRecipients(name,well,addrs,names,o){
+    const res={already:[],resolved:[],unresolved:[]};
+    const opt=o||{};
+    const log=opt.log||(()=>{}), warn=opt.warn||(()=>{});
+    const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
+    const typeMs=opt.typeMs>=0?opt.typeMs:800, waitMs=opt.waitMs>=0?opt.waitMs:700;
+    const lc=String(name||'').toLowerCase();
+    try{
+        const doc=well.ownerDocument, win=doc.defaultView||window;
+        const CHIP_SEL='[role="button"],[role="listitem"],[contenteditable="false"]';
+        const norm=(s)=>String(s||'').replace(/\s+/g,' ').trim().toLowerCase();
+        const scope=()=>(well.parentElement&&well.parentElement.parentElement)||well.parentElement||well;
+        const chips=()=>Array.from(scope().querySelectorAll(CHIP_SEL)).filter(el=>{
+            if(el===well||el.contains(well))return false;
+            const t=norm(el.getAttribute('aria-label')||el.textContent);
+            return !!t&&!/^(to|cc|bcc)$/.test(t);
+        });
+        const chipText=(el)=>norm(el.getAttribute('aria-label'))+' | '+norm(el.textContent)+' | '+norm(el.getAttribute('title'));
+        // What a resolved chip may show: the address, the display name as given ("Pablo Ucros") or
+        // OWA's "Last, First" form ("Ucros, Pablo").
+        const keysFor=(addr,nm)=>{
+            const k=[norm(addr)];
+            const n=norm(nm);
+            if(n){
+                k.push(n);
+                const parts=n.split(' ').filter(Boolean);
+                if(parts.length>=2)k.push(parts.slice(-1)[0]+', '+parts.slice(0,-1).join(' '));
+                if(n.indexOf(',')!==-1){const q=n.split(',').map(s=>s.trim()).filter(Boolean);if(q.length===2)k.push(q[1]+' '+q[0]);}
+            }
+            return k;
+        };
+        const hasChip=(addr,nm)=>{const k=keysFor(addr,nm);return chips().some(el=>{const t=chipText(el);return k.some(x=>t.indexOf(x)!==-1);});};
+        // OWA suggestion list: the first visible option naming the address, its alias (local part,
+        // e.g. "ucros") or the display name. Options inside the recipient row itself are ignored.
+        const suggestionFor=(addr,nm)=>{
+            try{
+                const alias=norm(String(addr).split('@')[0]);
+                const k=keysFor(addr,nm);
+                const opts=Array.from(doc.querySelectorAll('[role="listbox"] [role="option"],[role="option"]')).filter(el=>{
+                    if(scope().contains(el))return false;
+                    const r=el.getBoundingClientRect();return r.width>0&&r.height>0;
+                });
+                return opts.find(el=>{const t=chipText(el);return k.some(x=>t.indexOf(x)!==-1)||(alias.length>=3&&t.indexOf(alias)!==-1);})||null;
+            }catch(e){return null;}
+        };
+        const clickEl=(el)=>{
+            ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(type=>{
+                try{const C=(type.indexOf('pointer')===0&&win.PointerEvent)?win.PointerEvent:win.MouseEvent;el.dispatchEvent(new C(type,{bubbles:true,cancelable:true,view:win,button:0}));}catch(_){ }
+            });
+        };
+        // Raw (typed, unresolved) text = text nodes in the well that are not inside a chip.
+        const rawNodes=()=>{
+            const out=[],tw=doc.createTreeWalker(well,win.NodeFilter.SHOW_TEXT);
+            while(tw.nextNode()){const n=tw.currentNode,pe=n.parentElement,c=pe&&pe.closest(CHIP_SEL);if(c&&c!==well&&well.contains(c))continue;out.push(n);}
+            return out;
+        };
+        const rawText=()=>rawNodes().map(n=>n.nodeValue||'').join('');
+        const caretEnd=()=>{try{well.focus();const s=win.getSelection(),r=doc.createRange();r.selectNodeContents(well);r.collapse(false);s.removeAllRanges();s.addRange(r);}catch(e){}};
+        const fireInput=(type,data)=>{try{well.dispatchEvent(new win.InputEvent('input',{bubbles:true,inputType:type,data:data==null?null:data}));}catch(e){try{well.dispatchEvent(new win.Event('input',{bubbles:true}));}catch(_){ }}};
+        const clearRaw=()=>{
+            if(!rawText().trim())return;
+            const hasInnerChip=!!well.querySelector(CHIP_SEL);
+            let ok=false;
+            if(!hasInnerChip){try{well.focus();const s=win.getSelection(),r=doc.createRange();r.selectNodeContents(well);s.removeAllRanges();s.addRange(r);ok=doc.execCommand('delete',false,null);}catch(e){ok=false;}}
+            if(!ok||rawText().trim()){rawNodes().forEach(n=>{n.nodeValue='';});fireInput('deleteContentBackward');}
+        };
+        const insert=(text)=>{
+            caretEnd();
+            let ok=false;
+            try{ok=doc.execCommand('insertText',false,text);}catch(e){ok=false;}
+            if(!ok||rawText().indexOf(text)===-1){
+                try{well.dispatchEvent(new win.InputEvent('beforeinput',{bubbles:true,cancelable:true,inputType:'insertText',data:text}));}catch(_){ }
+                well.appendChild(doc.createTextNode(text));
+                fireInput('insertText',text);
+            }
+        };
+        const KEYS={Enter:{key:'Enter',code:'Enter',keyCode:13},';':{key:';',code:'Semicolon',keyCode:186}};
+        const press=(k)=>{
+            const d=KEYS[k];let prevented=false;
+            ['keydown','keypress','keyup'].forEach(type=>{
+                try{
+                    const ev=new win.KeyboardEvent(type,{key:d.key,code:d.code,keyCode:d.keyCode,which:d.keyCode,charCode:type==='keypress'?d.keyCode:0,bubbles:true,cancelable:true});
+                    // Chrome/Firefox leave keyCode 0 on synthetic events: define it for old-style handlers.
+                    try{if(!ev.keyCode)Object.defineProperty(ev,'keyCode',{get:()=>d.keyCode});if(!ev.which)Object.defineProperty(ev,'which',{get:()=>d.keyCode});}catch(_){ }
+                    if(!well.dispatchEvent(ev)&&type==='keydown')prevented=true;
+                }catch(_){ }
+            });
+            // A real ';' key also types the separator when the page does not handle it.
+            if(k===';'&&!prevented)insert(';');
+        };
+        for(let i=0;i<addrs.length;i++){
+            const addr=String(addrs[i]||'').trim(), nm=(names&&names[i])||'';
+            if(!addr)continue;
+            if(hasChip(addr,nm)){res.already.push(addr);log(lc+' already resolved: '+addr);continue;}
+            let ok=false;
+            // Resolved = a chip for this person (or one more chip) AND the typed address is gone
+            // from the input (OWA clears it when it makes the chip).
+            const resolvedNow=(before)=>(hasChip(addr,nm)||chips().length>before)&&norm(rawText()).indexOf(norm(addr))===-1;
+            for(const k of ['Enter',';']){
+                const before=chips().length;
+                clearRaw();
+                insert(addr);
+                await sleep(typeMs);
+                // Prefer OWA's own suggestion (first one naming the address / alias / name).
+                const sug=suggestionFor(addr,nm);
+                if(sug){
+                    clickEl(sug);
+                    await sleep(waitMs);
+                    if(resolvedNow(before)){ok=true;log(lc+' '+addr+' committed via the suggestion list');break;}
+                    log(lc+' '+addr+' suggestion click did not make a chip \u2014 trying '+k);
+                }
+                press(k);
+                await sleep(waitMs);
+                if(resolvedNow(before)){ok=true;break;}
+                log(lc+' '+addr+' not resolved after '+(k==='Enter'?'Enter \u2014 retrying with ;':'; \u2014 giving up'));
+            }
+            if(ok){res.resolved.push(addr);log(lc+' resolved: '+addr);}
+            else{res.unresolved.push(addr);warn(lc+' NOT resolved: '+addr+' \u2014 left as typed text for the user');}
+        }
+        clearRaw();   // leftover raw text (a stray ";" or a half-typed address)
+        if(res.unresolved.length)insert(res.unresolved.join('; '));
+    }catch(e){warn(lc+' recipient resolve failed (ignored): '+(e&&e.message));}
+    return res;
+}
 function sbRunOutlookComposeFiller(){
     const TAG='[SB-EOS-Outlook]';
     const log=(...a)=>{try{console.log(TAG,...a);}catch(_){ }};
@@ -2029,7 +2182,7 @@ function sbRunOutlookComposeFiller(){
         return hit;
     };
     // Recipient wells / subject: the deeplink normally fills them. Fill only when clearly empty.
-    const fillHeaders=(p)=>{
+    const fillHeaders=async(p)=>{
         try{
             const subj=document.querySelector('input[aria-label*="subject" i]');
             if(subj&&!subj.value&&p.subject){
@@ -2039,21 +2192,24 @@ function sbRunOutlookComposeFiller(){
                 subj.dispatchEvent(new Event('change',{bubbles:true}));
                 log('subject was empty — filled');
             }
-            const fillWell=(name,addrs)=>{
-                if(!addrs||!addrs.length)return;
+            // (15.61.0) Each To / Cc address must end up as a RESOLVED recipient chip. Before this, an
+            // ignored deeplink cc= left the Cc well empty and we typed "a; b;" + one Enter, which OWA
+            // left as raw text ("No results found"), so the CC might not go out. Now one address at a
+            // time is typed + committed (Enter, then ';') and verified (sbOwaResolveRecipients).
+            // Returns the wells that still have unresolved addresses (e.g. ['Cc']).
+            const fixWell=async(name,addrs,names)=>{
+                if(!addrs||!addrs.length)return false;
                 const w=document.querySelector('div[contenteditable="true"][aria-label="'+name+'"],div[role="textbox"][aria-label="'+name+'"]');
-                if(!w){log(name+' field not found — relying on the deeplink');return;}
-                const scope=(w.parentElement&&w.parentElement.parentElement)||w.parentElement||w;
-                const rest=(scope.textContent||'').replace(/\b(To|Cc|Bcc)\b/g,'').trim();
-                if(rest)return;   // recipients already present
-                w.focus();
-                document.execCommand('insertText',false,addrs.join(';')+';');
-                w.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}));
-                log(name+' was empty — typed '+addrs.length+' address(es)');
+                if(!w){log(name+' field not found \u2014 relying on the deeplink');return false;}
+                const r=await sbOwaResolveRecipients(name,w,addrs,names,{log,warn,typeMs:800,waitMs:700});
+                log(name+': '+r.already.length+'/'+addrs.length+' already resolved on arrival \u2014 deeplink '+name.toLowerCase()+'= '+(r.already.length===addrs.length?'applied':(r.already.length?'partly applied':'NOT applied (typed + committed instead)')));
+                return r.unresolved.length>0;
             };
-            fillWell('To',p.to?[p.to]:[]);
-            fillWell('Cc',Array.isArray(p.cc)?p.cc:[]);
-        }catch(e){warn('header check failed (ignored):',e&&e.message);}
+            const bad=[];
+            if(await fixWell('To',p.to?[p.to]:[],[]))bad.push('To');
+            if(await fixWell('Cc',Array.isArray(p.cc)?p.cc:[],Array.isArray(p.ccNames)?p.ccNames:[]))bad.push('Cc');
+            return bad;
+        }catch(e){warn('header check failed (ignored):',e&&e.message);return [];}
     };
     return (async()=>{
         try{
@@ -2104,7 +2260,12 @@ function sbRunOutlookComposeFiller(){
             // Another Outlook tab may have used the entry meanwhile.
             const again=sbOwaPendingEmail(MAX_AGE);
             if(!again||again.token!==p.token){log('entry already handled elsewhere — nothing to do');return 'skipped';}
-            fillHeaders(p);
+            // (15.61.0) Unresolved To / Cc addresses -> the user is told to check that line (every
+            // toast below carries the note). Never sends.
+            const badWells=await fillHeaders(p);
+            const rcptNote=(badWells&&badWells.length)?' Check the '+badWells.join(' / ')+' line \u2014 press Enter after each address if they aren\u2019t underlined.':'';
+            if(rcptNote)toast(rcptNote.trim(),true);
+            ed=findEditor()||ed;   // focus moved to the recipient wells; re-find the body
             stripPlaceholder(ed,p.placeholder);
             // (15.59.0) Verify by what was ADDED to the body: "team," (greeting) and the <img> count.
             const baseTeam=countOf(ed.textContent,'team,'),baseImgs=imgCount(ed);
@@ -2112,7 +2273,7 @@ function sbRunOutlookComposeFiller(){
             const done=(how)=>{
                 try{if(typeof GM_deleteValue==='function')GM_deleteValue(KEY);}catch(e){warn('GM_deleteValue failed:',e&&e.message);}
                 log('EOS Wash inserted via '+how+' \u2014 entry removed');
-                toast('EOS Wash inserted \u2014 review and press Send.',false);
+                toast('EOS Wash inserted \u2014 review and press Send.'+rcptNote,!!rcptNote);
                 return how;
             };
             const attempts=[
@@ -2147,7 +2308,7 @@ function sbRunOutlookComposeFiller(){
             if(!how){
                 warn('all insert methods failed \u2014 putting the EOS Wash on the clipboard');
                 try{if(typeof GM_setClipboard==='function')GM_setClipboard(html,'html');}catch(e){warn('GM_setClipboard failed:',e&&e.message);}
-                toast('Press Ctrl+V in the message body to paste the EOS Wash.',true);
+                toast('Press Ctrl+V in the message body to paste the EOS Wash.'+rcptNote,true);
                 return 'failed';
             }
             // (15.59.0) Text is in but OWA dropped the data: images -> paste them as image Files.
@@ -2161,7 +2322,7 @@ function sbRunOutlookComposeFiller(){
                     const imgsHtml=imgList.map(im=>'<img src="data:image/png;base64,'+im.b64+'" width="'+(im.width||'')+'" height="'+(im.height||'')+'" alt="EOS Wash" style="max-width:100%;height:auto;display:block;">').join('<br>');
                     try{if(imgsHtml&&typeof GM_setClipboard==='function')GM_setClipboard(imgsHtml,'html');}catch(e){warn('GM_setClipboard failed:',e&&e.message);}
                     try{if(typeof GM_deleteValue==='function')GM_deleteValue(KEY);}catch(e){warn('GM_deleteValue failed:',e&&e.message);}
-                    toast('The text is in, but the EOS Wash images didn\u2019t attach. Click above \u201CThank you,\u201D and press Ctrl+V in the message body to paste them.',true);
+                    toast('The text is in, but the EOS Wash images didn\u2019t attach. Click above \u201CThank you,\u201D and press Ctrl+V in the message body to paste them.'+rcptNote,true);
                     return how+'+no-images';
                 }
                 how+='+image-files';
@@ -6813,6 +6974,10 @@ function buildCSS2(){return `
 .eoswash-section.eos-safety-section h3{color:#2e7d32;}
 #sb-root.dark-mode .eoswash-section.eos-safety-section{background:#17351c!important;border-color:#2e7d32!important;}
 #sb-root.dark-mode .eoswash-section.eos-safety-section h3{color:#81c784!important;}
+/* (15.61.0) Dock & Huddles = slate section (KIPS trailers / TOT Remaining / WWH), below Safety. */
+.eoswash-section.eos-dock-section{border:3px solid #455a64;}
+.eoswash-section.eos-dock-section h3{color:#455a64;}
+#sb-root.dark-mode .eoswash-section.eos-dock-section h3{color:#b0bec5!important;}
 /* --- Quality section: three color-coded mini-cards (Atlas=red, ICQA=teal, Piles=amber) --- */
 .eoswash-section.eos-quality-section{border-left:4px solid #0097a7;}
 .eos-quality-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;}
@@ -8142,6 +8307,7 @@ async function fetchEOSWashData(){
         // Auto-pull the Backlog display spans (Inbound from AFT, DA from Rodeo ExSD). Fire from the
         // deliberate fetch path only so passive re-renders don't re-hit the endpoints.
         fillEosBacklog(config.site);
+        fillEosDock(config.site,win);   // (15.61.0) KIPS trailers + WWH (Dock & Huddles section)
         if(statusEl)statusEl.textContent='\u2713 Updated '+new Date().toLocaleTimeString()+' \u00b7 '+sbEosShiftLabel(win);
         sbEosUpdateShiftLabel();
         if(icqaAlpsP)icqaAlpsP.then(v=>{
@@ -8754,6 +8920,7 @@ function sbEosBacklogReapply(){
             sbEosBlWrite(id,v.text,v.title,v.asOf);   // (15.60.0) keeps the "(as of …)" suffix
         });
     }catch(e){console.warn('[SB-EOS] backlog reapply failed: '+(e&&e.message));}
+    try{sbEosDockReapply();}catch(e){}   // (15.61.0) Dock & Huddles cells (independent of backlog)
 }
 // ---- (15.60.0) EOS backlog last-good cache (fail-safe) ----
 // localStorage 'sb_eos_bl_last_v1_<SITE>' = {cells:{<id>:{text,title,ts,iso}}} for the 8 non-IPT
@@ -8839,18 +9006,302 @@ function sbEosBacklogReady(timeoutMs){
             dbg('[SB-EOS] backlog never pulled for '+S+' \u2014 starting it before the capture');
             fillEosBacklog(S);pend=_sbEosBacklogPending;
         }
-        const wait=(pend&&pend.site===S&&!pend.done)?pend.p.then(()=>'ok'):Promise.resolve('ok');
+        const blWait=(pend&&pend.site===S&&!pend.done)?pend.p:Promise.resolve();
+        // (15.61.0) The Dock & Huddles fill (KIPS + WWH) shares the same wait + timeout.
+        let dkWait=Promise.resolve();
+        try{dkWait=sbEosDockWaitP();}catch(e){dkWait=Promise.resolve();}
+        const wait=Promise.all([blWait.catch(()=>{}),dkWait.catch(()=>{})]).then(()=>'ok');
         let timer=null;
         const to=new Promise(res=>{timer=setTimeout(()=>res('timeout'),ms);});
         return Promise.race([wait,to]).then(st=>{
             clearTimeout(timer);
             if(st==='timeout')console.warn('[SB-EOS] backlog still loading after '+ms+'ms \u2014 capturing; missing cells use the last good value or show n/a');
             sbEosBlApplyCacheToPending(S);   // (15.60.0) last-good value (< 48h) before n/a
+            sbEosDockApplyCacheToPending(S); // (15.61.0) same for KIPS / WWH
             sbEosBacklogReapply();
             sbFillIptCells('eos-bl-ib-ipt','eos-bl-da-ipt',sbEosShiftIso(),{current:true,eos:true});
             return st;
         }).catch(()=>'ok');
     }catch(e){console.warn('[SB-EOS] backlog ready check failed: '+(e&&e.message));return Promise.resolve('ok');}
+}
+
+// ---- (15.61.0) EOS Wash "Dock & Huddles" section (last section, below Safety Summary) ----
+// Trailers Open in KIPS: the same source + count as the Oculus "Inbound Operations Copilot" dashboard
+//   (fetchKipsCount): GET https://maple-syrup.corp.amazon.com/<SITE>/kips/thermometer (HTML, Midway
+//   cookies via GM_xmlhttpRequest), count the rows of '#kips-gantt tbody' (or 'table.kips-table
+//   tbody'): rows with role="row" / data-ste-time, else every tbody <tr>; no tbody -> every
+//   tr[data-ste-time] on the page; nothing found -> unavailable. Point-in-time (NOT shift-bound), so
+//   the value always carries "(as of MM/DD HH:MM)". A DataTables "no data" placeholder row is not a trailer.
+// WWH (Working Well Huddles completed): FCLM functionRollup processId PROCESS_IDS.wwHuddle for the
+//   EOS Wash's locked shift window (sched.full, same buildFnUrl as every other EOS fn-rollup); count
+//   of DISTINCT associate IDs in the WW_Huddle function table's tbody (sbParseWwhHtml).
+// TOT Remaining: the Sync tab's TOT (Time Off Task) value for the EOS locked shift: same report
+//   (FC Summary PPR timeOffTask row -> parsePPR().totHrs), same window (sbTotSched: 30 min before
+//   the full-shift start -> 15 min after its end), same URL (buildTOTPprUrl) and "Xh Ym" format.
+// Each live value: one retry after SB_EOS_DOCK_RETRY_MS, then the per-site last-good value (< 48h;
+// WWH / TOT only for the SAME shift) with "(as of …)", else em-dash on the board / n/a in the email.
+// The fill is part of sbEosBacklogReady's wait (same timeout), so it never blocks the email.
+var EOS_DOCK_IDS=['eos-dk-kips','eos-dk-tot','eos-dk-wwh'];
+var _sbEosDockPending=null, _sbEosDockCells=null;
+var SB_EOS_DOCK_CACHE_PREFIX='sb_eos_dock_last_v1_';
+var SB_EOS_DOCK_RETRY_MS=5000;
+function sbKipsUrl(site){return 'https://maple-syrup.corp.amazon.com/'+encodeURIComponent(String(site||'').toUpperCase())+'/kips/thermometer';}
+// Maple Syrup KIPS thermometer HTML -> {count,ids,how} (ids = first non-empty cell of each trailer
+// row, for the tooltip), or null when no trailer table / rows are recognizable. Pure; never throws.
+function sbParseKipsHtml(html){
+    try{
+        if(!html||typeof html!=='string')return null;
+        const doc=new DOMParser().parseFromString(html,'text/html');
+        const tbody=doc.querySelector('#kips-gantt tbody')||doc.querySelector('table.kips-table tbody');
+        let rows,how;
+        if(tbody){
+            const r=tbody.querySelectorAll('tr[role="row"], tr[data-ste-time]');
+            rows=r.length?Array.from(r):Array.from(tbody.querySelectorAll('tr'));
+            how=r.length?'kips table rows (role=row / data-ste-time)':'kips table tbody rows';
+        }else{
+            const r=doc.querySelectorAll('tr[data-ste-time]');
+            if(!r.length)return null;
+            rows=Array.from(r);how='tr[data-ste-time] (no kips table)';
+        }
+        rows=rows.filter(tr=>!tr.querySelector('td.dataTables_empty'));
+        const ids=rows.map(tr=>{
+            const c=Array.from(tr.querySelectorAll('td,th')).map(x=>(x.textContent||'').replace(/\s+/g,' ').trim()).find(Boolean);
+            return c?c.slice(0,40):'';
+        }).filter(Boolean);
+        return {count:rows.length,ids:ids,how:how};
+    }catch(e){return null;}
+}
+// FCLM functionRollup HTML -> {count,names,how} for the WW_Huddle function, or null when the page is
+// not an FCLM report (sign-in page / garbage). Table: data-functionname="WW_Huddle", else the table
+// whose caption starts "WW_Huddle". Count = distinct associate IDs in tbody (tfoot Total excluded);
+// no IDs -> data-rowcount -> "Headcount: N" just above the table. Table absent on a real report -> 0.
+function sbParseWwhHtml(html){
+    try{
+        if(!html||typeof html!=='string')return null;
+        const doc=new DOMParser().parseFromString(html,'text/html');
+        let table=doc.querySelector('table[data-functionname="WW_Huddle"]');
+        if(!table)table=Array.from(doc.querySelectorAll('table')).find(t=>{const c=t.querySelector('caption');return !!(c&&/^\s*WW_Huddle\b/.test(c.textContent||''));})||null;
+        if(!table){
+            const ok=!!doc.querySelector('table.result-table,[data-functionname]')||/functionRollup/i.test(html);
+            return ok?{count:0,names:[],how:'no WW_Huddle table in the report'}:null;
+        }
+        // Column positions from the header row that has an "ID" cell (Type | ID | Name | Manager | …).
+        let idIdx=1,nameIdx=2;
+        const hdr=table.tHead?Array.from(table.tHead.rows):[];
+        for(const r of hdr){
+            const t=Array.from(r.cells).map(c=>(c.textContent||'').replace(/\s+/g,' ').trim().toLowerCase());
+            const i=t.indexOf('id');
+            if(i!==-1){idIdx=i;const n=t.indexOf('name');if(n!==-1)nameIdx=n;break;}
+        }
+        const seen=new Set(),names=[];
+        Array.from(table.tBodies).forEach(tb=>Array.from(tb.rows).forEach(tr=>{
+            const c=tr.cells;if(!c||c.length<=idIdx)return;
+            if(/^total$/i.test((c[0].textContent||'').trim()))return;
+            const id=(c[idIdx].textContent||'').replace(/\s+/g,' ').trim();
+            if(!id||/^total$/i.test(id)||seen.has(id))return;
+            seen.add(id);
+            const nm=c.length>nameIdx?(c[nameIdx].textContent||'').replace(/\s+/g,' ').trim():'';
+            names.push(nm||id);
+        }));
+        if(seen.size>0)return {count:seen.size,names:names,how:'distinct IDs in WW_Huddle'};
+        const rc=parseInt(table.getAttribute('data-rowcount'),10);
+        if(Number.isFinite(rc)&&rc>=0)return {count:rc,names:[],how:'WW_Huddle data-rowcount'};
+        const hc=(start)=>{let el=start;for(let k=0;el&&k<4;k++,el=el.previousElementSibling){const m=/Headcount:\s*(\d+)/i.exec(el.textContent||'');if(m)return parseInt(m[1],10);}return null;};
+        let n=hc(table.previousElementSibling);
+        if(n==null&&table.parentElement)n=hc(table.parentElement.previousElementSibling);
+        if(n!=null)return {count:n,names:[],how:'WW_Huddle Headcount'};
+        return {count:0,names:[],how:'WW_Huddle table empty'};
+    }catch(e){return null;}
+}
+// Live KIPS fetch (cross-origin, @connect maple-syrup.corp.amazon.com). Resolves parsed | null.
+function sbFetchKips(site){
+    return new Promise(resolve=>{
+        try{
+            if(typeof GM_xmlhttpRequest!=='function'){resolve(null);return;}
+            GM_xmlhttpRequest({method:'GET',url:sbKipsUrl(site),headers:{'Accept':'text/html'},timeout:30000,
+                onload:(r)=>{
+                    try{
+                        if(!r||r.status<200||r.status>=300){console.warn('[SB-EOS-KIPS] HTTP '+(r&&r.status));resolve(null);return;}
+                        if(/midway-auth|federate/i.test(String(r.finalUrl||''))){console.warn('[SB-EOS-KIPS] redirected to sign-in (Maple Syrup session)');resolve(null);return;}
+                        const p=sbParseKipsHtml(r.responseText||'');
+                        if(!p)console.warn('[SB-EOS-KIPS] no trailer table found in the thermometer page');
+                        resolve(p);
+                    }catch(e){resolve(null);}
+                },
+                onerror:()=>{console.warn('[SB-EOS-KIPS] request failed');resolve(null);},
+                ontimeout:()=>{console.warn('[SB-EOS-KIPS] request timed out');resolve(null);}});
+        }catch(e){resolve(null);}
+    });
+}
+// WW_Huddle fn-rollup for the locked EOS window (same-origin FCLM). Resolves parsed | null.
+function sbFetchWwh(site,win){
+    try{
+        const f=win.sched.full;
+        const url=buildFnUrl(site,PROCESS_IDS.wwHuddle,new Date(win.startDate),f.sh,f.sm,new Date(win.endDate),f.eh,f.em);
+        return fetchHTML(url).then(h=>{const p=sbParseWwhHtml(h);if(!p)console.warn('[SB-EOS-WWH] report did not look like an FCLM functionRollup (session?)');return p;})
+            .catch(e=>{console.warn('[SB-EOS-WWH] fetch failed: '+(e&&e.message));return null;});
+    }catch(e){return Promise.resolve(null);}
+}
+// TOT PPR for the locked EOS window -> {totHrs,window} | null (fetch error or not a PPR page).
+// Unlike fetchTOTPpr (which turns an error into 0) a failure stays null so the fail-safe applies.
+function sbFetchEosTot(site,win){
+    try{
+        const ts=sbTotSched(win.sched.full);
+        const url=buildTOTPprUrl(site,new Date(win.startDate),ts);
+        const hm=(h,m)=>String(h).padStart(2,'0')+':'+String(m).padStart(2,'0');
+        return fetchHTML(url).then(h=>{
+            if(!h||!/processPathRollup|fcSummary/i.test(h)){console.warn('[SB-EOS-TOT] response is not a PPR report (session?)');return null;}
+            const p=parsePPR(h);
+            return {totHrs:(p&&p.totHrs>0)?p.totHrs:0,window:hm(ts.sh,ts.sm)+' \u2192 '+hm(ts.eh,ts.em)};
+        }).catch(e=>{console.warn('[SB-EOS-TOT] fetch failed: '+(e&&e.message));return null;});
+    }catch(e){return Promise.resolve(null);}
+}
+// fn() resolves a value or null; on null retry ONCE after ms. Never rejects.
+function sbEosOnceRetry(fn,ms){
+    const run=()=>Promise.resolve().then(fn).catch(()=>null);
+    return run().then(v=>v!=null?v:new Promise(r=>setTimeout(r,ms)).then(run));
+}
+function sbEosDockShiftKey(win){try{return win.type+' '+isoDate(new Date(win.startDate));}catch(e){return '';}}
+// Last-good cache: localStorage sb_eos_dock_last_v1_<SITE> = {cells:{<id>:{text,title,ts,iso}}}
+// (iso = the shift key, e.g. "Nights 2026-11-05"; shown in the fallback tooltip).
+function sbEosDockCacheRead(site){
+    try{
+        const raw=localStorage.getItem(SB_EOS_DOCK_CACHE_PREFIX+String(site||'').toUpperCase());
+        const o=raw?JSON.parse(raw):null;
+        return(o&&o.cells&&typeof o.cells==='object')?o:{cells:{}};
+    }catch(e){return{cells:{}};}
+}
+function sbEosDockCachePut(site,id,cell){
+    try{
+        if(!site||EOS_DOCK_IDS.indexOf(id)===-1||!cell)return;
+        const o=sbEosDockCacheRead(site);
+        o.cells[id]={text:String(cell.text),title:cell.title||null,ts:Number(cell.ts)||Date.now(),iso:cell.iso||null};
+        localStorage.setItem(SB_EOS_DOCK_CACHE_PREFIX+String(site).toUpperCase(),JSON.stringify(o));
+    }catch(e){console.warn('[SB-EOS] dock cache save failed: '+(e&&e.message));}
+}
+// Cached cell when < 48h old (WWH: only when it is for the same shift), else null.
+function sbEosDockFallback(site,id,shiftKey,nowMs){
+    try{
+        const v=sbEosDockCacheRead(site).cells[id];
+        const now=typeof nowMs==='number'?nowMs:Date.now();
+        if(!v||!v.text||!(v.ts>0))return null;
+        if(now-v.ts>SB_EOS_BL_CACHE_MAX_MS||now-v.ts<0)return null;
+        if(id!=='eos-dk-kips'&&v.iso!==shiftKey)return null;   // WWH / TOT are shift-bound
+        return v;
+    }catch(e){return null;}
+}
+// Pulls KIPS + WWH into the Dock & Huddles spans for `win` (the EOS locked window). Returns the
+// pending state {site,key,done,p}. KRB3-only like every EOS fill. Never throws.
+function fillEosDock(site,win){
+    if(!sbEosEnabled())return null;
+    const S=String(site||'').toUpperCase();
+    if(!S)return null;
+    try{
+        const w=win||sbEosWindow();
+        const key=sbEosDockShiftKey(w);
+        sbEnsureSpinStyle();
+        EOS_DOCK_IDS.forEach(id=>{const el=document.getElementById(id);if(el){el.innerHTML='<span class="sb-spin" role="status" aria-label="Loading"></span>';el.removeAttribute('title');}});
+        const state={site:S,key:key,cells:{}};_sbEosDockCells=state;
+        const when=(ts)=>{try{return new Date(ts).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});}catch(e){return '';}};
+        const finish=(id,res,what)=>{
+            if(_sbEosDockCells!==state)return;   // a newer fill owns the cells
+            if(res){
+                sbEosBlWrite(id,res.text,res.title,res.asOf);
+                state.cells[id]={text:res.text,title:res.title,asOf:res.asOf||null};
+                sbEosDockCachePut(S,id,{text:res.text,title:res.title,ts:Date.now(),iso:key});
+                return;
+            }
+            const fb=sbEosDockFallback(S,id,key,Date.now());
+            if(fb){
+                const t=sbEosBlAsOfTitle(fb);
+                sbEosBlWrite(id,fb.text,t,fb.ts);
+                state.cells[id]={text:fb.text,title:t,asOf:fb.ts};
+                console.warn('[SB-EOS] '+what+' live value unavailable \u2014 showing last good value from '+sbEosBlAsOfText(fb.ts));
+                return;
+            }
+            const t=what+' unavailable (live fetch and retry failed, no recent value)';
+            sbEosBlWrite(id,'\u2014',t,null);
+            state.cells[id]={text:'\u2014',title:t,asOf:null};
+        };
+        const kipsP=sbEosOnceRetry(()=>sbFetchKips(S),SB_EOS_DOCK_RETRY_MS).then(r=>{
+            if(!r){finish('eos-dk-kips',null,'KIPS trailers');return;}
+            const now=Date.now();
+            const list=r.ids.length?' \u00b7 '+r.ids.slice(0,40).join(', ')+(r.ids.length>40?', \u2026':''):'';
+            finish('eos-dk-kips',{text:String(r.count),asOf:now,
+                title:'Trailers open in KIPS \u00b7 Maple Syrup KIPS thermometer ('+S+') \u00b7 live, not shift-bound \u00b7 pulled '+when(now)+list},'KIPS trailers');
+            dbg('[SB-EOS-KIPS] '+S+' count='+r.count+' via '+r.how);
+        }).catch(()=>finish('eos-dk-kips',null,'KIPS trailers'));
+        const wwhP=sbEosOnceRetry(()=>sbFetchWwh(S,w),SB_EOS_DOCK_RETRY_MS).then(r=>{
+            if(!r){finish('eos-dk-wwh',null,'WWH');return;}
+            const who=r.names.length?' \u00b7 '+r.names.join('; '):(r.count>0?'':' \u00b7 no WW_Huddle entries this shift');
+            finish('eos-dk-wwh',{text:String(r.count),asOf:null,
+                title:'Working Well Huddles completed \u00b7 FCLM WW_Huddle \u00b7 '+sbEosShiftLabel(w)+who},'WWH');
+            dbg('[SB-EOS-WWH] '+S+' '+key+' count='+r.count+' via '+r.how);
+        }).catch(()=>finish('eos-dk-wwh',null,'WWH'));
+        const totP=sbEosOnceRetry(()=>sbFetchEosTot(S,w),SB_EOS_DOCK_RETRY_MS).then(r=>{
+            if(!r){finish('eos-dk-tot',null,'TOT');return;}
+            finish('eos-dk-tot',{text:sbFmtTotHrs(r.totHrs),asOf:null,
+                title:'Time Off Task (same as the Sync tab TOT) \u00b7 FC Summary PPR timeOffTask \u00b7 '+sbEosShiftLabel(w)+' \u00b7 TOT window '+r.window},'TOT');
+            dbg('[SB-EOS-TOT] '+S+' '+key+' totHrs='+r.totHrs.toFixed(2));
+        }).catch(()=>finish('eos-dk-tot',null,'TOT'));
+        const pend={site:S,key:key,done:false,p:null};
+        pend.p=Promise.all([kipsP,wwhP,totP]).then(()=>{pend.done=true;},()=>{pend.done=true;});
+        _sbEosDockPending=pend;
+        // Spans change via textContent (no input event): refresh the pre-captured Email image.
+        pend.p.then(()=>{if(_sbEosDockPending===pend&&typeof sbEosPrecaptureSchedule==='function')sbEosPrecaptureSchedule();});
+        return pend;
+    }catch(e){console.warn('[SB-EOS] dock fill failed: '+(e&&e.message));return null;}
+}
+// Restores the finished Dock & Huddles values after a re-render (spinner for still-pending ones).
+function sbEosDockReapply(){
+    try{
+        const S=String((loadConfig()||{}).site||'').toUpperCase();
+        const c=_sbEosDockCells;
+        if(!c||c.site!==S||c.key!==sbEosDockShiftKey(sbEosWindow()))return;
+        const pend=_sbEosDockPending, busy=!!(pend&&pend.site===S&&pend.key===c.key&&!pend.done);
+        EOS_DOCK_IDS.forEach(id=>{
+            const v=c.cells[id];
+            if(v){sbEosBlWrite(id,v.text,v.title,v.asOf);return;}
+            if(busy){const el=document.getElementById(id);if(el&&!el.querySelector('.sb-spin')){sbEnsureSpinStyle();el.innerHTML='<span class="sb-spin" role="status" aria-label="Loading"></span>';}}
+        });
+    }catch(e){console.warn('[SB-EOS] dock reapply failed: '+(e&&e.message));}
+}
+// The pending Dock & Huddles fill for the current site + EOS shift (starts one if none). Never rejects.
+function sbEosDockWaitP(){
+    try{
+        if(!sbEosEnabled())return Promise.resolve();
+        const S=String((loadConfig()||{}).site||'').toUpperCase();
+        const w=sbEosWindow(), key=sbEosDockShiftKey(w);
+        let pend=_sbEosDockPending;
+        const c=_sbEosDockCells;
+        if(S&&!(pend&&pend.site===S&&pend.key===key)&&!(c&&c.site===S&&c.key===key)){
+            dbg('[SB-EOS] dock & huddles never pulled for '+S+' '+key+' \u2014 starting it before the capture');
+            pend=fillEosDock(S,w);
+        }
+        return (pend&&pend.site===S&&pend.key===key&&!pend.done)?pend.p.catch(()=>{}):Promise.resolve();
+    }catch(e){return Promise.resolve();}
+}
+// Capture-time fail-safe: a Dock cell still spinning / blank / em-dash gets the last-good value.
+function sbEosDockApplyCacheToPending(site){
+    const done=[];
+    try{
+        const S=String(site||'').toUpperCase();
+        if(!S||!sbEosEnabled())return done;
+        const key=sbEosDockShiftKey(sbEosWindow()), now=Date.now();
+        const c=_sbEosDockCells;
+        EOS_DOCK_IDS.forEach(id=>{
+            const el=document.getElementById(id);if(!el)return;
+            const t=(el.textContent||'').trim();
+            if(!(el.querySelector('.sb-spin')||!t||t==='\u2014'))return;
+            const fb=sbEosDockFallback(S,id,key,now);if(!fb)return;
+            const title=sbEosBlAsOfTitle(fb);
+            sbEosBlWrite(id,fb.text,title,fb.ts);
+            if(c&&c.site===S&&c.key===key&&!c.cells[id])c.cells[id]={text:fb.text,title:title,asOf:fb.ts};
+            done.push(id);
+        });
+        if(done.length)console.warn('[SB-EOS] dock & huddles still missing at capture \u2014 last good value used for: '+done.join(', '));
+    }catch(e){console.warn('[SB-EOS] dock cache fallback failed: '+(e&&e.message));}
+    return done;
 }
 
 // (15.47.0) EOS Wash Atlas Breakdown: THRESHOLD and DPMO are READ-ONLY copies of the Sync ICQA
@@ -9683,7 +10134,19 @@ function renderEOSWash(data){
 
     // (15.55.0) Highlights first (above Shift Accuracy). The email images / Snip follow this DOM
     // order (sections are split top-to-bottom in sbReflowEosCaptureClone / sbEosSliceRanges).
-    content.innerHTML=highlightsHTML+accuracyHTML+processHTML+backlogHTML+qualityHTML+safetyHTML;
+    // (15.61.0) Dock & Huddles, the last section (below Safety Summary). Read-only spans filled by
+    // fillEosDock (KIPS trailers = live Maple Syrup, WWH = FCLM WW_Huddle for the locked shift) and
+    // restored on re-render by sbEosDockReapply. TOT Remaining = the Sync tab's TOT for the locked shift.
+    const dockHTML=`<section class="eoswash-section eos-dock-section">
+        <h3>Dock &amp; Huddles</h3>
+        <table class="metrics-table" id="eos-dock-table"><thead><tr><th style="text-align:left;">Metric</th><th>Value</th></tr></thead><tbody>
+        <tr><td style="text-align:left;">Trailers Open in KIPS</td><td><span id="eos-dk-kips" style="font-weight:700;">\u2014</span></td></tr>
+        <tr><td style="text-align:left;">TOT Remaining</td><td><span id="eos-dk-tot" style="font-weight:700;">\u2014</span></td></tr>
+        <tr><td style="text-align:left;">Working Well Huddles Completed (WWH)</td><td><span id="eos-dk-wwh" style="font-weight:700;">\u2014</span></td></tr>
+        </tbody></table>
+    </section>`;
+
+    content.innerHTML=highlightsHTML+accuracyHTML+processHTML+backlogHTML+qualityHTML+safetyHTML+dockHTML;
 
     // Wire the Safety "+ Add Row" button (adds one more leader row, persists the new count).
     { const addBtn=document.getElementById('eos-safety-add'); if(addBtn)addBtn.addEventListener('click',addEosSafetyRow);
@@ -10259,7 +10722,7 @@ function sbEosPrecaptureSchedule(delayMs){
 }
 // The visible text of the 10 EOS backlog / IPT cells (compared against the snapshot taken at capture).
 function sbEosBacklogSnap(){
-    return EOS_BL_IDS.map(id=>{const el=document.getElementById(id);return el?(el.textContent||'').trim():'';}).join('\u0001');
+    return EOS_BL_IDS.concat(EOS_DOCK_IDS).map(id=>{const el=document.getElementById(id);return el?(el.textContent||'').trim():'';}).join('\u0001');
 }
 // (15.58.0) Synchronous re-check (as 15.57.0's click-time sbEosBacklogReady did): restore the finished
 // backlog values and re-read IPT from GM storage (the S&OP Network Viewer tab writes it). If the cells
@@ -10309,7 +10772,8 @@ function sbEosPrecapture(loop){
                 // Email click (loop): accept it like 15.57.0 did, unless the fill finished during
                 // the capture (then re-capture with the real values).
                 if(blSt==='timeout'){
-                    const p=_sbEosBacklogPending, done=!p||p.site!==S||p.done;
+                    const p=_sbEosBacklogPending, dk=_sbEosDockPending;
+                    const done=(!p||p.site!==S||p.done)&&(!dk||dk.site!==S||dk.done);
                     if(done){dbg('[SB-EOS] backlog finished during the pre-capture \u2014 recapturing');return;}
                     if(!loop){dbg('[SB-EOS] pre-capture taken on backlog timeout \u2014 not cached as fresh');return;}
                 }
@@ -10445,7 +10909,10 @@ function sbEosEmailOwaClick(ctx){
         try{const a=new Uint32Array(2);crypto.getRandomValues(a);token=a[0].toString(36)+a[1].toString(36);}
         catch(e){token=Math.random().toString(36).slice(2);}
         const deeplink=sbEosOwaDeeplink(ctx.to,ctx.ccAddrs,ctx.subject,SB_EOS_OWA_PLACEHOLDER);
-        GM_setValue('sb_eos_pending_email',{token,ts:Date.now(),to:ctx.to,cc:ctx.ccAddrs,subject:ctx.subject,html,
+        // (15.61.0) ccNames = display names (same order as cc) so the Outlook filler can recognize a
+        // resolved recipient chip that shows only the person's name.
+        const ccNames=String(ctx.cc||'').split(/,\s*/).map(s=>{const m=/^\s*(.*?)\s*<[^>]+>/.exec(s);return m?m[1]:'';});
+        GM_setValue('sb_eos_pending_email',{token,ts:Date.now(),to:ctx.to,cc:ctx.ccAddrs,ccNames,subject:ctx.subject,html,
             text:sbEosBodyText(ctx.site),placeholder:SB_EOS_OWA_PLACEHOLDER,images:images.length,
             imgs:images.map(im=>({b64:im.b64,width:im.width,height:im.height})),
             deeplink,redirects:0,redirectedAt:0});
@@ -10506,7 +10973,8 @@ function sbEosCaptureCanvas(content,opts){
                 // reads "n/a" in the email (never an empty cell), and is logged.
                 try{
                     const na=[];
-                    EOS_BL_IDS.forEach(id=>{
+                    // (15.61.0) + the Dock & Huddles cells (KIPS / WWH).
+                    EOS_BL_IDS.concat(EOS_DOCK_IDS).forEach(id=>{
                         const el=cr&&cr.querySelector('#'+id);if(!el)return;
                         const t=(el.textContent||'').trim();
                         // (15.60.0) The "Open SandOP to load IPT" link means no IPT -> n/a too.
