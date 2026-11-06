@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.62.2
+// @version      15.63.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -116,6 +116,50 @@ const SITE_SCHEDULES = {
     KRB5: { days:{full:{sh:6,sm:30,eh:18,em:15},p1:{sh:7,sm:0,eh:10,em:30},p2:{sh:10,sm:31,eh:14,em:0},p3:{sh:14,sm:30,eh:17,em:30}}, nights:{full:{sh:17,sm:30,eh:5,em:15},p1:{sh:18,sm:0,eh:21,em:30},p2:{sh:21,sm:31,eh:1,em:0},p3:{sh:1,sm:0,eh:4,em:30}} },
     ONT9: { days:{full:{sh:6,sm:0,eh:17,em:45},p1:{sh:6,sm:30,eh:10,em:0},p2:{sh:10,sm:1,eh:13,em:30},p3:{sh:13,sm:30,eh:17,em:0}}, nights:{full:{sh:17,sm:0,eh:4,em:45},p1:{sh:17,sm:30,eh:21,em:0},p2:{sh:21,sm:1,eh:0,em:30},p3:{sh:0,sm:30,eh:4,em:0}} },
 };
+// (15.63.0) Per-site shift overrides, auto-detected by the night's START day (local, 0=Sun..6=Sat).
+// When a site's Nights shift started on one of `dows`, `sched` replaces SITE_SCHEDULES[site].nights
+// for the Sync board (loadConfig -> getShiftDates, periods, hourly, CPLH/TOT windows) and Fast Start.
+// Regular nights on other days, Days, and all other sites are unchanged.
+// AVP8 RT = BHN RT shift, Thu/Fri/Sat nights 18:00 -> 06:30 (12h + 30-min unpaid lunch 03:30-04:00).
+// Break times supplied by AVP8: 21:15-21:30, 00:00-00:30, 03:30-04:00 (lunch). ADJUST HERE if they
+// change. The two 30-min breaks are the P1/P2/P3 boundaries; the 15-min 21:15 break sits inside P1.
+// `breaks` (when present) is the Fast Start WINDOW list; otherwise it comes from the period gaps.
+const AVP8_RT_SCHED={
+    full:{sh:18,sm:0, eh:6, em:30},   // RT shift 18:00 -> 06:30 (also the Sync fetch window)
+    p1:  {sh:18,sm:0, eh:0, em:0 },   // P1 18:00 -> 00:00 (includes the 21:15-21:30 break)
+    p2:  {sh:0, sm:30,eh:3, em:30},   // P2 00:30 -> 03:30 (after break 00:00-00:30)
+    p3:  {sh:4, sm:0, eh:6, em:30},   // P3 04:00 -> 06:30 (after lunch 03:30-04:00)
+    breaks:[
+        {start:'21:15',end:'21:30'},              // After Break 1
+        {start:'00:00',end:'00:30'},              // After Break 2 (shift start date + 1)
+        {start:'03:30',end:'04:00',name:'Lunch'}  // After Lunch  (shift start date + 1)
+    ]
+};
+const SITE_SHIFT_OVERRIDES={
+    AVP8:[{name:'RT',label:'Nights RT (12h)',dows:[4,5,6],sched:AVP8_RT_SCHED}]
+};
+// 'HH:MM' -> minutes since midnight, or null.
+function sbParseHM(s){const m=/^(\d{1,2}):(\d{2})$/.exec(String(s||'').trim());if(!m)return null;const h=+m[1],mi=+m[2];return(h<24&&mi<60)?h*60+mi:null;}
+// The override for a night shift of `site` that started on calendar day `startDay`, or null.
+function sbNightsOverride(site,startDay){
+    const list=SITE_SHIFT_OVERRIDES[site];
+    if(!list||!(startDay instanceof Date)||isNaN(startDay.getTime()))return null;
+    return list.find(ov=>ov.dows.indexOf(startDay.getDay())!==-1)||null;
+}
+// The Nights shift the Sync board pulls at `now` started today, or yesterday before noon (same
+// rule as getShiftDates). Returns that night's override schedule, else `base` (SITE_SCHEDULES).
+function sbEffectiveNights(site,base,now){
+    const d=(now instanceof Date)?new Date(now):new Date();
+    if(d.getHours()<12)d.setDate(d.getDate()-1);
+    const ov=sbNightsOverride(site,d);
+    return ov?ov.sched:base;
+}
+// Apply SITE_SCHEDULES (+ the night override for `now`) to a config object in place.
+function sbApplySiteSchedule(c,now){
+    const s=SITE_SCHEDULES[c.site];
+    if(s){c.days=s.days;c.nights=sbEffectiveNights(c.site,s.nights,now);}
+    return c;
+}
 // (15.60.0) EOS Wash shift-window lock. A shift that already ended stays the EOS Wash's shift for
 // SB_EOS_GRACE_MIN minutes after its fetch-window end (a 7 AM pull still shows the night that just
 // ended). (15.62.0) There is no selector: the EOS Wash always uses Auto. The key below only holds a
@@ -211,7 +255,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.62.2';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.63.0';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -420,7 +464,7 @@ function saveFastStartSnapshot(moment){
     // Don't label one window's numbers as the other (e.g. SOS results saved as "1st Break").
     const need=moment==='1st Break'?'Break1':'SOS';
     if(fsLastWindow&&fsLastWindow!==need){
-        fsShowStatus('\u26A0 Last run was '+(fsLastWindow==='Break1'?'After Break 1':'SOS')+' \u2014 set WINDOW to '+(need==='Break1'?'After Break 1':'SOS')+' and Run Fast Start before saving '+moment,'error');
+        fsShowStatus('\u26A0 Last run was '+(fsLastWindowLabel||fsLastWindow)+' \u2014 set WINDOW to '+(need==='Break1'?'After Break 1':'SOS')+' and Run Fast Start before saving '+moment,'error');
         return;
     }
     const snap=fastStartSnapshot(moment,site,goal);
@@ -547,8 +591,9 @@ function walkCages(hours,inflowKey,outflowKey,seedCages,density,cageProp){
 }
 
 function loadConfig(){try{const s=localStorage.getItem(STORAGE_KEY);if(s){const c={...DEFAULT_CONFIG,...JSON.parse(s)};
-    // Always use SITE_SCHEDULES for the selected site's period times (source of truth)
-    const siteSched=SITE_SCHEDULES[c.site];if(siteSched){c.days=siteSched.days;c.nights=siteSched.nights;}
+    // Always use SITE_SCHEDULES for the selected site's period times (source of truth);
+    // (15.63.0) nights follow SITE_SHIFT_OVERRIDES for the night being pulled (e.g. AVP8 RT).
+    sbApplySiteSchedule(c,new Date());
     return c;}return{...DEFAULT_CONFIG};}catch(e){return{...DEFAULT_CONFIG};}}
 function saveConfig(c){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(c));}catch(e){}}
 function loadActions(){try{const s=localStorage.getItem(ACTIONS_KEY);return s?JSON.parse(s):[];}catch(e){return[];}}
@@ -6508,7 +6553,8 @@ function buildHTML(){return `
 <div class="fs-controls" style="display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;background:#fff;border:2px solid #000;border-radius:4px;padding:10px 14px;margin-bottom:10px;">
 <div><label style="display:block;font-size:11px;font-weight:700;margin-bottom:4px;">SITE</label><select id="fs-site" class="select-input"></select></div>
 <div><label style="display:block;font-size:11px;font-weight:700;margin-bottom:4px;">SHIFT START (DATE / TIME)</label><input type="datetime-local" id="fs-start-datetime" class="select-input" style="width:210px;"></div>
-<div><label for="fs-window" style="display:block;font-size:11px;font-weight:700;margin-bottom:4px;">WINDOW</label><select id="fs-window" class="select-input" title="SOS = from shift start. After Break 1 = from the end of 1st break (from the site schedule), using the same shift start date."><option value="SOS">SOS</option><option value="Break1">After Break 1</option></select></div>
+<div><label for="fs-window" style="display:block;font-size:11px;font-weight:700;margin-bottom:4px;">WINDOW <span id="fs-shift-label" style="font-weight:600;color:#1565c0;"></span></label><select id="fs-window" class="select-input" title="SOS = from shift start. After Break N = from the end of that break in the site schedule (after midnight = shift start date + 1). Custom break = your own break times, saved per site."><option value="SOS">SOS</option><option value="Break1">After Break 1</option></select></div>
+<div id="fs-custom-wrap" style="display:none;"><label style="display:block;font-size:11px;font-weight:700;margin-bottom:4px;">CUSTOM BREAK (START \u2013 END)</label><input type="time" id="fs-custom-start" class="select-input" aria-label="Custom break start" style="width:110px;"> <input type="time" id="fs-custom-end" class="select-input" aria-label="Custom break end" style="width:110px;"></div>
 <div><label style="display:block;font-size:11px;font-weight:700;margin-bottom:4px;">GOAL (MIN)</label><input type="number" id="fs-goal-time" class="target-input" value="20" min="1" max="60" style="width:80px;"></div>
 <div><label style="display:flex;align-items:center;gap:6px;font-size:12px;font-weight:600;cursor:pointer;margin-bottom:2px;"><input type="checkbox" id="fs-remove-nonfc" checked style="width:15px;height:15px;">Remove NonFC</label></div>
 <button id="btn-fetch-faststart" class="btn btn-primary">\u25B6 Run Fast Start</button>
@@ -6897,7 +6943,7 @@ function buildCSS2(){return `
 #sb-root.dark-mode .fs-controls label{color:#e0e0e0!important;}
 #sb-root.dark-mode .fs-summary-grid .fs-card,#sb-root.dark-mode .fs-card .fs-card{background:#16213e!important;}
 #sb-root.dark-mode #fs-window-note,#sb-root.dark-mode #faststart-status{color:#aab4c4!important;}
-#sb-root.dark-mode .faststart-container input[type="number"],#sb-root.dark-mode .faststart-container input[type="text"],#sb-root.dark-mode .faststart-container input[type="datetime-local"]{background:#1a1a2e!important;color:#e0e0e0!important;border-color:#555!important;}
+#sb-root.dark-mode .faststart-container input[type="number"],#sb-root.dark-mode .faststart-container input[type="text"],#sb-root.dark-mode .faststart-container input[type="datetime-local"],#sb-root.dark-mode .faststart-container input[type="time"]{background:#1a1a2e!important;color:#e0e0e0!important;border-color:#555!important;}
 /* Settings tab: cards, tables, schedule inputs, config/slack panels */
 #sb-root.dark-mode .settings-card{background:#0f3460!important;border-color:#444!important;color:#e0e0e0!important;box-shadow:0 3px 14px rgba(0,0,0,.35)!important;}
 #sb-root.dark-mode .settings-card h2{color:#e0e0e0!important;}
@@ -11327,7 +11373,7 @@ function initBoard(){
         try{localStorage.setItem(SLACK_SOS_KEY,sos);localStorage.setItem(SLACK_JOB_BALANCE_KEY,jb);localStorage.setItem(SLACK_FASTSTART_KEY,fs);localStorage.setItem(METRICS_URL_KEY,mu);}catch(e){}
         const note=document.getElementById('slack-save-note');if(note){note.textContent='\u2713 Saved (this browser only)';setTimeout(()=>{note.textContent='';},2500);}
     });
-    sel.onchange=e=>{config.site=e.target.value;if(SITE_SCHEDULES[config.site]){config.days=SITE_SCHEDULES[config.site].days;config.nights=SITE_SCHEDULES[config.site].nights;}saveConfig(config);sbPublishBoardSite(config.site);refreshSettingsInputs();currentMetrics=null;clearBoard();updatePeriodDots();sbApplyEosSiteGate();};
+    sel.onchange=e=>{config.site=e.target.value;sbApplySiteSchedule(config,new Date());saveConfig(config);sbPublishBoardSite(config.site);refreshSettingsInputs();currentMetrics=null;clearBoard();updatePeriodDots();sbApplyEosSiteGate();};
     document.getElementById('shift-select').onchange=e=>{config.shiftType=e.target.value;saveConfig(config);currentMetrics=null;clearBoard();updatePeriodDots();doFetch();};
     document.querySelectorAll('.target-input').forEach(inp=>{inp.addEventListener('input',updateTargetRows);inp.addEventListener('change',()=>{saveTargetsUI();if(currentMetrics)renderTargets(currentMetrics);});});
     document.querySelectorAll('.nav-tab').forEach(tab=>tab.onclick=()=>{
@@ -11519,7 +11565,7 @@ async function doFetch(isRetry){
     // (or nothing). So treat ONLY string args as retries -> ping fires on genuine clicks only.
     const _realRetry=(typeof isRetry==='string');
     if(!_realRetry)trackUsage('getData');   // usage ping FIRST, before anything can throw/abort
-    config=loadConfig();config.site=document.getElementById('site-select').value;config.shiftType=document.getElementById('shift-select').value;saveConfig(config);sbPublishBoardSite(config.site);
+    config=loadConfig();config.site=document.getElementById('site-select').value;config.shiftType=document.getElementById('shift-select').value;sbApplySiteSchedule(config,new Date());saveConfig(config);sbPublishBoardSite(config.site);
     // Invalidate the day caches so they re-fetch for the (possibly new) site/day. Note which day
     // view is currently showing so we can refresh it after this fetch.
     const curDayVisible=document.getElementById('spt-current-view')?.style.display!=='none';
@@ -11819,33 +11865,111 @@ const FS_ACTION_MAP={CaseStowed:'CaseStow',PalletTransferred:'PalletTransIn',Ite
 // Tie-break when two processes share the identical first-scan timestamp.
 const FS_TIE_BREAK=['CaseStow','Pick'];
 let fsLastResults=[];   // kept so a target/goal change can re-render without re-fetching
-let fsLastWindow='';    // 'SOS' | 'Break1' — which window fsLastResults came from
+let fsLastWindow='';    // 'SOS' | 'BreakN' | 'Custom' — which window fsLastResults came from
+let fsLastWindowLabel=''; // its display label, e.g. "After Lunch (03:30–04:00)"
 let fsCurWin='SOS';     // window label for the [SB-FS] debug lines of the run in progress
 
-// Pick the site's Days or Nights schedule whose P1 (SOS) start is nearest the entered shift
-// start (circular, so 18:15 matches Nights even if the board config is set to Days).
+const FS_CUSTOM_KEY_PREFIX='syncboard_fs_custombreak_';   // + site -> {"start":"HH:MM","end":"HH:MM"}
+const fsHM=(h,m)=>String(h).padStart(2,'0')+':'+String(m).padStart(2,'0');
+const fsParseHM=sbParseHM;
+// Fast Start: the override (if any) whose clock window (sched.full) contains the entered shift
+// start d, on a night that started on one of its dows. 18:00-06:30 crosses midnight, so a time
+// before 06:30 belongs to the shift that started the previous day.
+function fsResolveOverride(site,d){
+    const list=SITE_SHIFT_OVERRIDES[site];
+    if(!list||!(d instanceof Date)||isNaN(d.getTime()))return null;
+    const m=d.getHours()*60+d.getMinutes();
+    for(const ov of list){
+        const f=ov.sched.full,s=f.sh*60+f.sm,e=f.eh*60+f.em;
+        let startDay=null;
+        if(e>s){if(m>=s&&m<e)startDay=new Date(d);}
+        else if(m>=s)startDay=new Date(d);
+        else if(m<e){startDay=new Date(d);startDay.setDate(startDay.getDate()-1);}
+        if(startDay&&ov.dows.indexOf(startDay.getDay())!==-1)return{ov,startDay};
+    }
+    return null;
+}
+// Pick the schedule for the entered shift start: a matching SITE_SHIFT_OVERRIDES entry first,
+// else the site's Days or Nights schedule whose P1 (SOS) start is nearest (circular, so 18:15
+// matches Nights even if the board config is set to Days).
 function fsPickSchedule(site,sosDate){
+    const hit=fsResolveOverride(site,sosDate);
+    if(hit)return{type:hit.ov.label||hit.ov.name,sched:hit.ov.sched,override:hit.ov.name};
     const s=SITE_SCHEDULES[site]||(()=>{const c=loadConfig();return{days:c.days,nights:c.nights};})();
     const m=sosDate.getHours()*60+sosDate.getMinutes();
     const dist=(p)=>{const d=Math.abs(m-(p.sh*60+p.sm))%1440;return Math.min(d,1440-d);};
     return dist(s.nights.p1)<dist(s.days.p1)?{type:'Nights',sched:s.nights}:{type:'Days',sched:s.days};
 }
-// Pure window math. SOS: [sos-LOOKBACK, sos+FORWARD], anchor = sos.
-// Break1: break = p1 end -> p2 start, placed relative to the entered SOS by minute offsets
-// (mod 24h), so night shifts that cross midnight roll to the next calendar day correctly.
-// Search opens at max(breakStart, breakEnd-LOOKBACK) — never before the break, so pre-break
-// scans can't be picked up — and runs FORWARD min past break end (same duration as SOS).
-function fsComputeWindow(sosDate,sched,which){
-    const MIN=60*1000;
-    if(which!=='Break1'){
-        return{which:'SOS',anchor:sosDate,searchStart:new Date(sosDate.getTime()-FS_LOOKBACK_MIN*MIN),searchEnd:new Date(sosDate.getTime()+FS_FORWARD_MIN*MIN)};
+// Every break in a schedule. sched.breaks (explicit [{start,end,name?}], e.g. AVP8 RT) wins; else
+// each positive gap between consecutive periods (p1->p2, p2->p3, ...) — touching periods (gap 0)
+// are period splits, not breaks. value 'BreakN' = Nth break (gap after period N).
+function fsScheduleBreaks(sched){
+    if(sched&&Array.isArray(sched.breaks)){
+        return sched.breaks.map((b,i)=>{
+            const s=fsParseHM(b.start),e=fsParseHM(b.end);if(s==null||e==null||s===e)return null;
+            const n=i+1,name=b.name||'';
+            return{value:'Break'+n,n,name,sh:Math.floor(s/60),sm:s%60,eh:Math.floor(e/60),em:e%60,
+                label:(name?'After '+name:'After Break '+n)+' ('+b.start+'\u2013'+b.end+')'};
+        }).filter(Boolean);
     }
-    const p1=sched.p1,p2=sched.p2,base=p1.sh*60+p1.sm;
-    const off=(h,m)=>(((h*60+m)-base)%1440+1440)%1440;
-    const breakStart=new Date(sosDate.getTime()+off(p1.eh,p1.em)*MIN);
-    const breakEnd=new Date(sosDate.getTime()+off(p2.sh,p2.sm)*MIN);
+    const keys=Object.keys(sched||{}).filter(k=>/^p\d+$/.test(k)&&sched[k]).sort((a,b)=>+a.slice(1)-+b.slice(1));
+    const out=[];
+    for(let i=0;i+1<keys.length;i++){
+        const a=sched[keys[i]],b=sched[keys[i+1]];
+        const gap=((b.sh*60+b.sm)-(a.eh*60+a.em)+1440)%1440;
+        if(gap<=0||gap>=720)continue;
+        const n=+keys[i].slice(1),name=(sched.breakNames&&sched.breakNames[n])||'';
+        out.push({value:'Break'+n,n,name,sh:a.eh,sm:a.em,eh:b.sh,em:b.sm,
+            label:(name?'After '+name:'After Break '+n)+' ('+fsHM(a.eh,a.em)+'\u2013'+fsHM(b.sh,b.sm)+')'});
+    }
+    return out;
+}
+// WINDOW options for a schedule: SOS, one per break, then Custom break (custom = {start,end} or null).
+function fsWindowOptions(sched,custom){
+    const p1=sched&&sched.p1;
+    const opts=[{value:'SOS',label:p1?'SOS ('+fsHM(p1.sh,p1.sm)+')':'SOS'}];
+    fsScheduleBreaks(sched).forEach(b=>opts.push({value:b.value,label:b.label}));
+    const cs=custom&&fsParseHM(custom.start),ce=custom&&fsParseHM(custom.end);
+    opts.push({value:'Custom',label:(cs!=null&&ce!=null)?'Custom break ('+custom.start+'\u2013'+custom.end+')':'Custom break\u2026'});
+    return opts;
+}
+function fsLoadCustom(site){try{const v=JSON.parse(localStorage.getItem(FS_CUSTOM_KEY_PREFIX+site)||'null');return v&&typeof v==='object'?v:null;}catch(e){return null;}}
+function fsSaveCustom(site,v){try{localStorage.setItem(FS_CUSTOM_KEY_PREFIX+site,JSON.stringify(v));}catch(e){}}
+// Pure window math. SOS: [sos-LOOKBACK, sos+FORWARD], anchor = sos.
+// BreakN: the schedule break after period N, placed on the shift's start day (the P1 occurrence
+// nearest the entered SOS) by clock offset from P1 (mod 24h), so breaks after midnight land on
+// start day + 1. Custom: custom = {start,end} 'HH:MM', first occurrence at/after the entered SOS;
+// an end earlier than start crosses midnight. Search opens at max(breakStart, breakEnd-LOOKBACK)
+// — never before the break, so pre-break scans can't be picked up — and runs FORWARD min past
+// break end (same duration as SOS). Returns null when the break isn't available.
+function fsComputeWindow(sosDate,sched,which,custom){
+    const MIN=60*1000;
+    let breakStart,breakEnd,label;
+    if(which==='Custom'){
+        const cs=custom&&fsParseHM(custom.start),ce=custom&&fsParseHM(custom.end);
+        if(cs==null||ce==null)return null;
+        const dur=(ce-cs+1440)%1440;if(dur<=0)return null;
+        const sosM=sosDate.getHours()*60+sosDate.getMinutes();
+        breakStart=new Date(sosDate.getTime()+((cs-sosM+1440)%1440)*MIN);
+        breakEnd=new Date(breakStart.getTime()+dur*MIN);
+        label='Custom break ('+custom.start+'\u2013'+custom.end+')';
+    }else if(/^Break\d+$/.test(String(which))){
+        const b=fsScheduleBreaks(sched).find(x=>x.value===which);if(!b)return null;
+        const base=sched.p1.sh*60+sched.p1.sm;
+        // P1 occurrence nearest the entered SOS (same minute when SOS = P1 start).
+        const shiftStart=new Date(sosDate);shiftStart.setHours(sched.p1.sh,sched.p1.sm,0,0);
+        const diff=shiftStart.getTime()-sosDate.getTime();
+        if(diff>12*60*MIN)shiftStart.setDate(shiftStart.getDate()-1);
+        else if(diff<-12*60*MIN)shiftStart.setDate(shiftStart.getDate()+1);
+        const at=(h,m)=>{const d=new Date(shiftStart);d.setMinutes(d.getMinutes()+((((h*60+m)-base)%1440+1440)%1440));return d;};
+        breakStart=at(b.sh,b.sm);breakEnd=at(b.eh,b.em);
+        if(breakEnd<=breakStart)breakEnd=new Date(breakEnd.getTime()+1440*MIN);
+        label=b.label;
+    }else{
+        return{which:'SOS',label:'SOS',anchor:sosDate,searchStart:new Date(sosDate.getTime()-FS_LOOKBACK_MIN*MIN),searchEnd:new Date(sosDate.getTime()+FS_FORWARD_MIN*MIN)};
+    }
     const searchStart=new Date(Math.max(breakStart.getTime(),breakEnd.getTime()-FS_LOOKBACK_MIN*MIN));
-    return{which:'Break1',breakStart,breakEnd,anchor:breakEnd,searchStart,searchEnd:new Date(breakEnd.getTime()+FS_FORWARD_MIN*MIN)};
+    return{which,label,breakStart,breakEnd,anchor:breakEnd,searchStart,searchEnd:new Date(breakEnd.getTime()+FS_FORWARD_MIN*MIN)};
 }
 
 function fsShowStatus(msg,type){
@@ -11950,11 +12074,11 @@ function fsComputeMetrics(times,goal){
     return{count:n,avg,tp90,overGoal,minutesLost};
 }
 // Resolve all associates: roster -> punch-in -> first activity -> minutes-to-first row.
-// win (optional) = fsComputeWindow() result. For win.which==='Break1': only "In" punches inside
+// win (optional) = fsComputeWindow() result. For any break window (win.which!=='SOS'): only "In" punches inside
 // the search window count (the return-from-meal punch); AAs with no punch (paid break) are
 // measured from break end; scans before the search start are ignored.
 async function fsProcessEmployees(attendance,processDataArray,site,startDate,endDate,attStartDate,removeNonFC,win){
-    const isBreak=!!(win&&win.which==='Break1');
+    const isBreak=!!(win&&win.which!=='SOS');
     const tzClean=(s)=>String(s).replace(/\s+(EST|EDT|PST|PDT|CST|CDT|MST|MDT)$/i,'');
     const employees=new Map();
     const nonFC=new Set();
@@ -12033,27 +12157,34 @@ async function fetchFastStartData(){
     const dt=document.getElementById('fs-start-datetime').value;
     const goal=parseInt(document.getElementById('fs-goal-time').value,10)||20;
     const removeNonFC=document.getElementById('fs-remove-nonfc').checked;
-    const which=(document.getElementById('fs-window')?.value)==='Break1'?'Break1':'SOS';
+    const which=document.getElementById('fs-window')?.value||'SOS';
     const btn=document.getElementById('btn-fetch-faststart');
     const content=document.getElementById('faststart-content');
     if(!site){fsShowStatus('Select a site','error');return;}
     if(!dt){fsShowStatus('Enter a shift start date/time','error');return;}
+    let custom=null;
+    if(which==='Custom'){
+        custom={start:document.getElementById('fs-custom-start')?.value||'',end:document.getElementById('fs-custom-end')?.value||''};
+        if(fsParseHM(custom.start)==null||fsParseHM(custom.end)==null||custom.start===custom.end){fsShowStatus('Enter a custom break start and end time','error');return;}
+        fsSaveCustom(site,custom);
+    }
     // Persist inputs
     try{localStorage.setItem(FS_GOAL_KEY,String(goal));localStorage.setItem(FS_DT_KEY,dt);localStorage.setItem(FS_NONFC_KEY,removeNonFC?'1':'0');localStorage.setItem(FS_WINDOW_KEY,which);}catch(e){}
     const sosDate=new Date(dt);
     const pick=fsPickSchedule(site,sosDate);
-    const win=fsComputeWindow(sosDate,pick.sched,which);
-    fsCurWin=win.which;
+    const win=fsComputeWindow(sosDate,pick.sched,which,custom);
+    if(!win){fsShowStatus('That WINDOW isn\u2019t in the '+site+' '+pick.type+' schedule \u2014 pick another WINDOW','error');fsRefreshWindowOptions();return;}
+    fsCurWin=win.label;
     // startDate = the anchor minutes are measured from; attStartDate..endDate = search window.
     const startDate=win.anchor;
     const endDate=win.searchEnd;
     const attStartDate=win.searchStart;
     const hhmm=(d)=>String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
-    dbg('[SB-FS] window='+win.which+' shift='+pick.type+' sos='+sosDate.toISOString()+(win.breakStart?' breakStart='+win.breakStart.toISOString()+' breakEnd='+win.breakEnd.toISOString():'')+' start='+attStartDate.toISOString()+' end='+endDate.toISOString());
+    dbg('[SB-FS] window='+win.label+' start='+attStartDate.toISOString()+' end='+endDate.toISOString()+' value='+win.which+' shift='+pick.type+' sos='+sosDate.toISOString()+(win.breakStart?' breakStart='+win.breakStart.toISOString()+' breakEnd='+win.breakEnd.toISOString():''));
     const note=document.getElementById('fs-window-note');
-    if(note)note.innerHTML=win.which==='Break1'
-        ?'<b>'+site+'</b> \u00b7 <b>After Break 1</b> ('+pick.type+') \u00b7 break <b>'+hhmm(win.breakStart)+' \u2013 '+hhmm(win.breakEnd)+'</b> \u00b7 searching <b>'+fmtDate(attStartDate)+' '+hhmm(attStartDate)+' \u2013 '+hhmm(endDate)+'</b> (break end \u2192 '+FS_FORWARD_MIN+' min after; no return punch = timed from break end) \u00b7 goal '+goal+' min'
-        :'<b>'+site+'</b> \u00b7 shift start <b>'+hhmm(startDate)+'</b> \u00b7 searching <b>'+hhmm(attStartDate)+' \u2013 '+hhmm(endDate)+'</b> ('+FS_LOOKBACK_MIN+' min before \u2192 '+FS_FORWARD_MIN+' min after) \u00b7 goal '+goal+' min';
+    if(note)note.innerHTML=win.which!=='SOS'
+        ?'<b>'+site+'</b> \u00b7 <b>'+win.label+'</b> ('+pick.type+') \u00b7 break <b>'+hhmm(win.breakStart)+' \u2013 '+hhmm(win.breakEnd)+'</b> \u00b7 searching <b>'+fmtDate(attStartDate)+' '+hhmm(attStartDate)+' \u2013 '+hhmm(endDate)+'</b> (break end \u2192 '+FS_FORWARD_MIN+' min after; no return punch = timed from break end) \u00b7 goal '+goal+' min'
+        :'<b>'+site+'</b> \u00b7 '+(pick.override?'<b>'+pick.type+'</b> \u00b7 ':'')+'shift start <b>'+hhmm(startDate)+'</b> \u00b7 searching <b>'+hhmm(attStartDate)+' \u2013 '+hhmm(endDate)+'</b> ('+FS_LOOKBACK_MIN+' min before \u2192 '+FS_FORWARD_MIN+' min after) \u00b7 goal '+goal+' min';
     if(btn){btn.disabled=true;btn.textContent='\u23F3 Running...';}
     if(content)content.innerHTML='<div style="padding:20px;font-size:14px;">\u23F3 Querying Fast Start data\u2026 this can take a minute.</div>';
     fsShowStatus('Querying data\u2026','info');
@@ -12065,11 +12196,12 @@ async function fetchFastStartData(){
             ...Object.entries(uniqueProcesses).map(([id,name])=>fsFetchProcess(site,id,attStartDate,endDate,name))
         ]);
         const results=await fsProcessEmployees(attendance,processData,site,startDate,endDate,attStartDate,removeNonFC,win);
-        dbg('[SB-FS] window='+win.which+' start='+attStartDate.toISOString()+' end='+endDate.toISOString()+' url=(per-AA activityDetails) rows='+results.length);
+        dbg('[SB-FS] window='+win.label+' start='+attStartDate.toISOString()+' end='+endDate.toISOString()+' url=(per-AA activityDetails) rows='+results.length);
         fsLastResults=results;
         fsLastWindow=win.which;
+        fsLastWindowLabel=win.label;
         renderFastStart(results,goal);
-        fsShowStatus('\u2713 Complete ('+(win.which==='Break1'?'After Break 1':'SOS')+') \u2014 '+results.length+' associates \u00b7 '+new Date().toLocaleTimeString(),'success');
+        fsShowStatus('\u2713 Complete ('+win.label+') \u2014 '+results.length+' associates \u00b7 '+new Date().toLocaleTimeString(),'success');
     }catch(err){
         console.error('[SB-FastStart] error:',err);
         if(content)content.innerHTML='<div style="padding:20px;font-size:14px;color:#c62828;">\u26A0 Fast Start failed: '+(err&&err.message?err.message:err)+'</div>';
@@ -12128,8 +12260,6 @@ function initFastStartControls(){
     if(goal){const g=localStorage.getItem(FS_GOAL_KEY);if(g)goal.value=g;}
     const nonfc=document.getElementById('fs-remove-nonfc');
     if(nonfc){const n=localStorage.getItem(FS_NONFC_KEY);if(n!=null)nonfc.checked=n==='1';}
-    const winSel=document.getElementById('fs-window');
-    if(winSel){const w=localStorage.getItem(FS_WINDOW_KEY);if(w==='SOS'||w==='Break1')winSel.value=w;}
     const dt=document.getElementById('fs-start-datetime');
     if(dt&&!dt.value){
         const saved=localStorage.getItem(FS_DT_KEY);
@@ -12142,6 +12272,45 @@ function initFastStartControls(){
             dt.value=d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'T'+pad(d.getHours())+':'+pad(d.getMinutes());
         }
     }
+    // (15.63.0) WINDOW options follow the site + shift start (and any auto-detected override).
+    if(siteSel&&!siteSel.dataset.fsWired){
+        siteSel.dataset.fsWired='1';
+        siteSel.addEventListener('change',()=>fsRefreshWindowOptions(true));
+        dt?.addEventListener('change',()=>fsRefreshWindowOptions());
+        document.getElementById('fs-window')?.addEventListener('change',()=>fsRefreshWindowOptions());
+        const onCustom=()=>{
+            const s=document.getElementById('fs-custom-start')?.value||'',e=document.getElementById('fs-custom-end')?.value||'';
+            if(fsParseHM(s)!=null&&fsParseHM(e)!=null)fsSaveCustom(siteSel.value,{start:s,end:e});
+            fsRefreshWindowOptions();
+        };
+        document.getElementById('fs-custom-start')?.addEventListener('change',onCustom);
+        document.getElementById('fs-custom-end')?.addEventListener('change',onCustom);
+    }
+    fsRefreshWindowOptions(true);
+}
+// Rebuild the WINDOW list (SOS + every break in the picked schedule + Custom break), keep the
+// current/saved choice when it still exists, show the detected override label (e.g. "Nights RT
+// (12h)") and the custom break inputs. loadCustom=true reloads the site's saved custom times.
+function fsRefreshWindowOptions(loadCustom){
+    const site=document.getElementById('fs-site')?.value;
+    const winSel=document.getElementById('fs-window');
+    if(!site||!winSel)return;
+    const cs=document.getElementById('fs-custom-start'),ce=document.getElementById('fs-custom-end');
+    if(loadCustom&&cs&&ce){const c=fsLoadCustom(site);cs.value=c&&c.start||'';ce.value=c&&c.end||'';}
+    const custom=(cs&&ce&&cs.value&&ce.value)?{start:cs.value,end:ce.value}:null;
+    const dtv=document.getElementById('fs-start-datetime')?.value;
+    const sosDate=dtv?new Date(dtv):new Date();
+    let pick;try{pick=fsPickSchedule(site,isNaN(sosDate.getTime())?new Date():sosDate);}catch(e){return;}
+    const prev=winSel.options.length&&winSel.dataset.fsBuilt?winSel.value:(localStorage.getItem(FS_WINDOW_KEY)||'SOS');
+    const opts=fsWindowOptions(pick.sched,custom);
+    winSel.innerHTML='';
+    opts.forEach(o=>{const el=document.createElement('option');el.value=o.value;el.textContent=o.label;winSel.appendChild(el);});
+    winSel.value=opts.some(o=>o.value===prev)?prev:'SOS';
+    winSel.dataset.fsBuilt='1';
+    const lbl=document.getElementById('fs-shift-label');
+    if(lbl)lbl.textContent=pick.override?'\u00b7 '+pick.type:'';
+    const wrap=document.getElementById('fs-custom-wrap');
+    if(wrap)wrap.style.display=winSel.value==='Custom'?'':'none';
 }
 
 ensureLaunchBtn();
