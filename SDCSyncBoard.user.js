@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.61.0
+// @version      15.61.1
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -222,7 +222,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.61.0';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.61.1';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -1866,20 +1866,23 @@ function sbOwaPendingEmail(maxAgeMs){
 // grandparent): elements with role=button / listitem or contenteditable=false whose aria-label /
 // text / title contains the address or the display name (names[i]). Per address not already a
 // chip: clear the raw text, insert the address (execCommand insertText = a real InputEvent React
-// sees; fallback beforeinput + text node + input), wait typeMs for OWA's suggestion lookup, commit
-// with OWA's first matching suggestion (click) when one shows, else Enter (keydown/keypress/keyup),
-// wait waitMs, verify; if not resolved retry once with ';'. Chips match the address, the name or
-// OWA's "Last, First" form ("Ucros, Pablo"). Resolved = a matching chip (or one more chip) AND the
-// raw text no longer holds the address.
-// Afterwards leftover raw text is cleared; unresolved addresses are typed back (raw) so the user can
-// press Enter on them. Logs "<well> resolved: <addr>" / a warning. NEVER sends, never throws.
+// sees; fallback beforeinput + text node + input), then (15.61.1, event-driven: MutationObserver +
+// ~100ms poll, each wait ends the moment its condition holds) wait <= sugMs (1200) for OWA's first
+// matching suggestion and click it, wait <= chipMs (1500) for the chip; else Enter
+// (keydown/keypress/keyup) + wait <= chipMs; else ';' + wait <= chipMs. The next address starts as
+// soon as the chip is verified. Chips match the address, the name or OWA's "Last, First" form
+// ("Ucros, Pablo"). Resolved = a matching chip (or one more chip) AND the raw text no longer holds
+// the address. Afterwards leftover raw text is cleared; unresolved addresses are typed back (raw) so
+// the user can press Enter on them. Logs "<well> resolved: <addr> in <ms>ms (via
+// deeplink|suggestion|enter|semicolon|typed)" / a warning. NEVER sends, never throws.
 // Returns {already,resolved,unresolved}. Self-contained (runs on Outlook before board consts).
 async function sbOwaResolveRecipients(name,well,addrs,names,o){
     const res={already:[],resolved:[],unresolved:[]};
     const opt=o||{};
     const log=opt.log||(()=>{}), warn=opt.warn||(()=>{});
-    const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
-    const typeMs=opt.typeMs>=0?opt.typeMs:800, waitMs=opt.waitMs>=0?opt.waitMs:700;
+    // (15.61.1) Upper bounds only (each wait ends the moment its condition is met).
+    const sugMs=opt.sugMs>=0?opt.sugMs:1200, chipMs=opt.chipMs>=0?opt.chipMs:1500, pollMs=opt.pollMs>0?opt.pollMs:100;
+    const deeplinkMs=opt.deeplinkMs>=0?opt.deeplinkMs:0;
     const lc=String(name||'').toLowerCase();
     try{
         const doc=well.ownerDocument, win=doc.defaultView||window;
@@ -1964,34 +1967,50 @@ async function sbOwaResolveRecipients(name,well,addrs,names,o){
             // A real ';' key also types the separator when the page does not handle it.
             if(k===';'&&!prevented)insert(';');
         };
+        // (15.61.1) Event-driven wait: resolves with test()'s first truthy value as soon as the DOM
+        // changes (MutationObserver) or on the ~100ms poll, else null after ms. No fixed sleeps.
+        const waitFor=(test,ms)=>new Promise(resolve=>{
+            let done=false,mo=null,iv=null,to=null;
+            const fin=(v)=>{if(done)return;done=true;try{mo&&mo.disconnect();}catch(_){ }clearInterval(iv);clearTimeout(to);resolve(v);};
+            const chk=()=>{try{const v=test();if(v)fin(v);}catch(_){ }};
+            try{mo=new win.MutationObserver(chk);mo.observe(doc.body||doc.documentElement,{childList:true,subtree:true,characterData:true,attributes:true});}catch(_){ }
+            iv=setInterval(chk,pollMs);to=setTimeout(()=>fin(null),ms);
+            chk();
+        });
+        // (15.61.1) The compose deeplink's to= / cc= usually makes the chips itself: give it up to
+        // deeplinkMs (ends early once every address is a chip) before typing anything.
+        const allChips=()=>addrs.every((a,i)=>!String(a||'').trim()||hasChip(String(a).trim(),(names&&names[i])||''));
+        if(deeplinkMs>0&&!allChips())await waitFor(allChips,deeplinkMs);
         for(let i=0;i<addrs.length;i++){
             const addr=String(addrs[i]||'').trim(), nm=(names&&names[i])||'';
             if(!addr)continue;
-            if(hasChip(addr,nm)){res.already.push(addr);log(lc+' already resolved: '+addr);continue;}
-            let ok=false;
+            if(hasChip(addr,nm)){res.already.push(addr);log(lc+' resolved: '+addr+' in 0ms (via deeplink)');continue;}
+            const t0=Date.now();
+            let via='';
             // Resolved = a chip for this person (or one more chip) AND the typed address is gone
             // from the input (OWA clears it when it makes the chip).
-            const resolvedNow=(before)=>(hasChip(addr,nm)||chips().length>before)&&norm(rawText()).indexOf(norm(addr))===-1;
-            for(const k of ['Enter',';']){
-                const before=chips().length;
-                clearRaw();
-                insert(addr);
-                await sleep(typeMs);
-                // Prefer OWA's own suggestion (first one naming the address / alias / name).
-                const sug=suggestionFor(addr,nm);
-                if(sug){
-                    clickEl(sug);
-                    await sleep(waitMs);
-                    if(resolvedNow(before)){ok=true;log(lc+' '+addr+' committed via the suggestion list');break;}
-                    log(lc+' '+addr+' suggestion click did not make a chip \u2014 trying '+k);
-                }
-                press(k);
-                await sleep(waitMs);
-                if(resolvedNow(before)){ok=true;break;}
-                log(lc+' '+addr+' not resolved after '+(k==='Enter'?'Enter \u2014 retrying with ;':'; \u2014 giving up'));
+            const before=chips().length;
+            const resolvedNow=()=>(hasChip(addr,nm)||chips().length>before)&&norm(rawText()).indexOf(norm(addr))===-1;
+            clearRaw();
+            insert(addr);
+            // 1. OWA's own suggestion (first one naming the address / alias / name): click it as soon
+            //    as it shows (<= sugMs), then wait for the chip (<= chipMs).
+            const sug=await waitFor(()=>resolvedNow()?'chip':suggestionFor(addr,nm),sugMs);
+            if(sug==='chip')via='typed';   // OWA made the chip from the typed address alone (rare)
+            else if(sug){
+                clickEl(sug);
+                if(await waitFor(resolvedNow,chipMs))via='suggestion';
+                else log(lc+' '+addr+' suggestion click did not make a chip \u2014 trying Enter');
             }
-            if(ok){res.resolved.push(addr);log(lc+' resolved: '+addr);}
-            else{res.unresolved.push(addr);warn(lc+' NOT resolved: '+addr+' \u2014 left as typed text for the user');}
+            // 2. Enter, 3. ';' (each waits <= chipMs for the chip; resolves the moment it appears).
+            if(!via){press('Enter');if(await waitFor(resolvedNow,chipMs))via='enter';}
+            if(!via){
+                if(norm(rawText()).indexOf(norm(addr))===-1){clearRaw();insert(addr);}
+                press(';');
+                if(await waitFor(resolvedNow,chipMs))via='semicolon';
+            }
+            if(via){res.resolved.push(addr);log(lc+' resolved: '+addr+' in '+(Date.now()-t0)+'ms (via '+via+')');}
+            else{res.unresolved.push(addr);warn(lc+' NOT resolved: '+addr+' after '+(Date.now()-t0)+'ms \u2014 left as typed text for the user');}
         }
         clearRaw();   // leftover raw text (a stray ";" or a half-typed address)
         if(res.unresolved.length)insert(res.unresolved.join('; '));
@@ -2004,6 +2023,15 @@ function sbRunOutlookComposeFiller(){
     const warn=(...a)=>{try{console.warn(TAG,...a);}catch(_){ }};
     const KEY='sb_eos_pending_email';
     const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
+    // (15.61.1) Resolves true as soon as test() holds (MutationObserver + ~100ms poll), else false after ms.
+    const waitUntil=(test,ms)=>new Promise(resolve=>{
+        let done=false,mo=null,iv=null,to=null;
+        const fin=(v)=>{if(done)return;done=true;try{mo&&mo.disconnect();}catch(_){ }clearInterval(iv);clearTimeout(to);resolve(v);};
+        const chk=()=>{try{if(test())fin(true);}catch(_){ }};
+        try{mo=new MutationObserver(chk);mo.observe(document.documentElement,{childList:true,subtree:true,characterData:true});}catch(_){ }
+        iv=setInterval(chk,100);to=setTimeout(()=>fin(false),ms);
+        chk();
+    });
     // Small dismissible notice in the Outlook page (role=status so screen readers announce it).
     const toast=(msg,isWarn)=>{
         try{
@@ -2197,17 +2225,31 @@ function sbRunOutlookComposeFiller(){
             // left as raw text ("No results found"), so the CC might not go out. Now one address at a
             // time is typed + committed (Enter, then ';') and verified (sbOwaResolveRecipients).
             // Returns the wells that still have unresolved addresses (e.g. ['Cc']).
+            // (15.61.1) Speed: event-driven waits (no fixed sleeps), deeplink chips accepted without
+            // typing, and this runs BEFORE the body insert (it no longer waits for the placeholder).
+            const sel=(name)=>'div[contenteditable="true"][aria-label="'+name+'"],div[role="textbox"][aria-label="'+name+'"]';
+            const findWell=(name)=>new Promise(resolve=>{   // <= 1500ms, ~100ms poll
+                const t0=Date.now();
+                const chk=()=>{const w=document.querySelector(sel(name));if(w||Date.now()-t0>=1500){clearInterval(iv);resolve(w||null);return true;}return false;};
+                const iv=setInterval(chk,100);chk();
+            });
+            // One shared 1000ms grace for the deeplink's chips (To and Cc render together), so Cc
+            // only gets what To did not use.
+            const DEEPLINK_GRACE_MS=1000;
             const fixWell=async(name,addrs,names)=>{
                 if(!addrs||!addrs.length)return false;
-                const w=document.querySelector('div[contenteditable="true"][aria-label="'+name+'"],div[role="textbox"][aria-label="'+name+'"]');
+                const w=await findWell(name);
                 if(!w){log(name+' field not found \u2014 relying on the deeplink');return false;}
-                const r=await sbOwaResolveRecipients(name,w,addrs,names,{log,warn,typeMs:800,waitMs:700});
-                log(name+': '+r.already.length+'/'+addrs.length+' already resolved on arrival \u2014 deeplink '+name.toLowerCase()+'= '+(r.already.length===addrs.length?'applied':(r.already.length?'partly applied':'NOT applied (typed + committed instead)')));
+                const grace=Math.max(0,DEEPLINK_GRACE_MS-(Date.now()-tAll));
+                const r=await sbOwaResolveRecipients(name,w,addrs,names,{log,warn,sugMs:1200,chipMs:1500,pollMs:100,deeplinkMs:grace});
+                log(name+': '+r.already.length+'/'+addrs.length+' already resolved on arrival \u2014 deeplink '+name.toLowerCase()+'= '+(r.already.length===addrs.length?'applied (no typing)':(r.already.length?'partly applied':'NOT applied (typed + committed instead)')));
                 return r.unresolved.length>0;
             };
+            const tAll=Date.now();
             const bad=[];
             if(await fixWell('To',p.to?[p.to]:[],[]))bad.push('To');
             if(await fixWell('Cc',Array.isArray(p.cc)?p.cc:[],Array.isArray(p.ccNames)?p.ccNames:[]))bad.push('Cc');
+            log('recipients done in '+(Date.now()-tAll)+'ms total'+(bad.length?' \u2014 unresolved on: '+bad.join(' / '):' \u2014 all resolved'));
             return bad;
         }catch(e){warn('header check failed (ignored):',e&&e.message);return [];}
     };
@@ -2249,23 +2291,24 @@ function sbRunOutlookComposeFiller(){
                 return 'no-editor';
             }
             log('compose body found');
-            // Let the deeplink body (placeholder) land so OWA does not overwrite our insert.
-            for(let i=0;i<20;i++){
-                const cur=findEditor()||ed;ed=cur;
-                if(p.placeholder&&(ed.textContent||'').indexOf(p.placeholder)!==-1)break;
-                await sleep(250);
-            }
-            await sleep(400);
-            ed=findEditor()||ed;
+            const tReady=Date.now();
             // Another Outlook tab may have used the entry meanwhile.
-            const again=sbOwaPendingEmail(MAX_AGE);
-            if(!again||again.token!==p.token){log('entry already handled elsewhere — nothing to do');return 'skipped';}
+            if(!stillMine(p.token)){log('entry already handled elsewhere \u2014 nothing to do');return 'skipped';}
+            // (15.61.1) Recipients FIRST, right away: they don't depend on the body, and the deeplink
+            // body placeholder keeps landing meanwhile (so the body wait below is usually instant).
+            // Not in parallel: both use the page's single focus / selection.
             // (15.61.0) Unresolved To / Cc addresses -> the user is told to check that line (every
             // toast below carries the note). Never sends.
             const badWells=await fillHeaders(p);
+            log('recipients finished '+(Date.now()-tReady)+'ms after the compose editor was ready');
             const rcptNote=(badWells&&badWells.length)?' Check the '+badWells.join(' / ')+' line \u2014 press Enter after each address if they aren\u2019t underlined.':'';
             if(rcptNote)toast(rcptNote.trim(),true);
+            // Let the deeplink body (placeholder) land so OWA does not overwrite our insert
+            // (event-driven, <= 5s; ends as soon as the placeholder is in the body).
+            if(p.placeholder)await waitUntil(()=>{const e=findEditor();return !!(e&&(e.textContent||'').indexOf(p.placeholder)!==-1);},5000);
+            await sleep(250);   // short settle after OWA writes the placeholder
             ed=findEditor()||ed;   // focus moved to the recipient wells; re-find the body
+            if(!stillMine(p.token)){log('entry already handled elsewhere \u2014 nothing to do');return 'skipped';}
             stripPlaceholder(ed,p.placeholder);
             // (15.59.0) Verify by what was ADDED to the body: "team," (greeting) and the <img> count.
             const baseTeam=countOf(ed.textContent,'team,'),baseImgs=imgCount(ed);
@@ -2299,7 +2342,9 @@ function sbRunOutlookComposeFiller(){
                 caretStart(ed);
                 log('inserting via '+name);
                 try{fn(ed);}catch(e){warn(name+' insert threw:',e&&e.message);}
-                await sleep(1500);
+                // (15.61.1) <= 1500ms, ends early once the greeting AND every image are in (a text-only
+                // early exit could re-paste images OWA was still converting).
+                await waitUntil(()=>{const s0=state();return s0.text&&s0.imgs>=nImgs;},1500);
                 const s=state();
                 log(name+': greeting '+(s.text?'present':'missing')+', images '+s.imgs+'/'+nImgs);
                 if(s.text||(nImgs>0&&s.imgs>=nImgs)){how=name;ed=s.ed;break;}
@@ -9030,8 +9075,8 @@ function sbEosBacklogReady(timeoutMs){
 //   (fetchKipsCount): GET https://maple-syrup.corp.amazon.com/<SITE>/kips/thermometer (HTML, Midway
 //   cookies via GM_xmlhttpRequest), count the rows of '#kips-gantt tbody' (or 'table.kips-table
 //   tbody'): rows with role="row" / data-ste-time, else every tbody <tr>; no tbody -> every
-//   tr[data-ste-time] on the page; nothing found -> unavailable. Point-in-time (NOT shift-bound), so
-//   the value always carries "(as of MM/DD HH:MM)". A DataTables "no data" placeholder row is not a trailer.
+//   tr[data-ste-time] on the page; nothing found -> unavailable. Point-in-time (NOT shift-bound); the
+//   pull time is in the tooltip only (15.61.1: value only, no visible "as of"). A DataTables "no data" placeholder row is not a trailer.
 // WWH (Working Well Huddles completed): FCLM functionRollup processId PROCESS_IDS.wwHuddle for the
 //   EOS Wash's locked shift window (sched.full, same buildFnUrl as every other EOS fn-rollup); count
 //   of DISTINCT associate IDs in the WW_Huddle function table's tbody (sbParseWwhHtml).
@@ -9161,6 +9206,9 @@ function sbEosOnceRetry(fn,ms){
     const run=()=>Promise.resolve().then(fn).catch(()=>null);
     return run().then(v=>v!=null?v:new Promise(r=>setTimeout(r,ms)).then(run));
 }
+// (15.61.1) KIPS shows the value only (no visible "(as of …)"; the time stays in the tooltip, incl.
+// the last-good fallback). WWH / TOT fallbacks keep the visible suffix.
+function sbEosDockAsOf(id,ts){return id==='eos-dk-kips'?null:(ts||null);}
 function sbEosDockShiftKey(win){try{return win.type+' '+isoDate(new Date(win.startDate));}catch(e){return '';}}
 // Last-good cache: localStorage sb_eos_dock_last_v1_<SITE> = {cells:{<id>:{text,title,ts,iso}}}
 // (iso = the shift key, e.g. "Nights 2026-11-05"; shown in the fallback tooltip).
@@ -9213,9 +9261,9 @@ function fillEosDock(site,win){
             }
             const fb=sbEosDockFallback(S,id,key,Date.now());
             if(fb){
-                const t=sbEosBlAsOfTitle(fb);
-                sbEosBlWrite(id,fb.text,t,fb.ts);
-                state.cells[id]={text:fb.text,title:t,asOf:fb.ts};
+                const t=sbEosBlAsOfTitle(fb), a=sbEosDockAsOf(id,fb.ts);
+                sbEosBlWrite(id,fb.text,t,a);
+                state.cells[id]={text:fb.text,title:t,asOf:a};
                 console.warn('[SB-EOS] '+what+' live value unavailable \u2014 showing last good value from '+sbEosBlAsOfText(fb.ts));
                 return;
             }
@@ -9227,7 +9275,7 @@ function fillEosDock(site,win){
             if(!r){finish('eos-dk-kips',null,'KIPS trailers');return;}
             const now=Date.now();
             const list=r.ids.length?' \u00b7 '+r.ids.slice(0,40).join(', ')+(r.ids.length>40?', \u2026':''):'';
-            finish('eos-dk-kips',{text:String(r.count),asOf:now,
+            finish('eos-dk-kips',{text:String(r.count),asOf:null,   // (15.61.1) value only; time stays in the tooltip
                 title:'Trailers open in KIPS \u00b7 Maple Syrup KIPS thermometer ('+S+') \u00b7 live, not shift-bound \u00b7 pulled '+when(now)+list},'KIPS trailers');
             dbg('[SB-EOS-KIPS] '+S+' count='+r.count+' via '+r.how);
         }).catch(()=>finish('eos-dk-kips',null,'KIPS trailers'));
@@ -9294,9 +9342,9 @@ function sbEosDockApplyCacheToPending(site){
             const t=(el.textContent||'').trim();
             if(!(el.querySelector('.sb-spin')||!t||t==='\u2014'))return;
             const fb=sbEosDockFallback(S,id,key,now);if(!fb)return;
-            const title=sbEosBlAsOfTitle(fb);
-            sbEosBlWrite(id,fb.text,title,fb.ts);
-            if(c&&c.site===S&&c.key===key&&!c.cells[id])c.cells[id]={text:fb.text,title:title,asOf:fb.ts};
+            const title=sbEosBlAsOfTitle(fb), a=sbEosDockAsOf(id,fb.ts);
+            sbEosBlWrite(id,fb.text,title,a);
+            if(c&&c.site===S&&c.key===key&&!c.cells[id])c.cells[id]={text:fb.text,title:title,asOf:a};
             done.push(id);
         });
         if(done.length)console.warn('[SB-EOS] dock & huddles still missing at capture \u2014 last good value used for: '+done.join(', '));
