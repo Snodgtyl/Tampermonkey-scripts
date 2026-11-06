@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.62.1
+// @version      15.62.2
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -211,7 +211,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.62.1';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.62.2';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -7763,9 +7763,9 @@ function renderICQATab(st){
         if(d==null||isNaN(d))return dash;
         const r=r2(d);
         const txt=(r>0?'+':r<0?'\u2212':'')+fmt(Math.abs(r),2);
-        // (15.62.1) sign flipped: + = used MORE hours than planned (red), - = fewer (green).
-        if(r>0)return'<span class="sb-icqa-bad" title="Over plan (more hours than planned)">'+txt+'</span>';
-        if(r<0)return'<span class="sb-icqa-good" title="Under plan (favorable)">'+txt+'</span>';
+        // (15.62.2, user request) + = green, - = red (Hrs Delta = Actual - Planned).
+        if(r>0)return'<span class="sb-icqa-good" title="More hours than planned">'+txt+'</span>';
+        if(r<0)return'<span class="sb-icqa-bad" title="Fewer hours than planned">'+txt+'</span>';
         return txt;
     };
     const fmtRate=r=>{
@@ -7850,7 +7850,7 @@ function renderICQATab(st){
         card('ANDON RATE (WTD)',fmtJph(wkR.andon))+'</div>';
     const subtitle='<div class="sb-icqa-subtitle">Week of Sun '+icqaTabMD(sunday)+' \u2013 Sat '+icqaTabMD(sat)+', '+sat.getFullYear()+' \u00b7 Source: FCLM Portal Process Path Rollup</div>';
     const legend='<div class="sb-icqa-legend">'+
-        '<div><strong>Hrs Delta</strong> = Actual Hours \u2212 Plan Hours, where Plan Hours = Volume \u00f7 Week Rate Target (negative <span class="sb-icqa-good">\u2212green</span> = under plan / favorable, positive <span class="sb-icqa-bad">+red</span> = over plan).</div>'+
+        '<div><strong>Hrs Delta</strong> = Actual Hours \u2212 Plan Hours, where Plan Hours = Volume \u00f7 Week Rate Target (positive <span class="sb-icqa-good">+green</span> = more hours than planned, negative <span class="sb-icqa-bad">\u2212red</span> = fewer hours than planned).</div>'+
         '<div><strong>Rate color:</strong> <span class="sb-icqa-good">green</span> = at/below target \u00d7 1.03, <span class="sb-icqa-bad">red</span> = above.</div>'+
         '<div><strong>SBC/CC/Andon Rate</strong> = JPH from the ICQA Function Rollup; weekly = total jobs \u00f7 total hours.</div>'+
         '<div><strong>Shift codes:</strong> FHD/FHN = Front Half Day/Night (Sun\u2013Tue) \u00b7 X-Day/X-Night = Wednesday crossover \u00b7 BHD/BHN = Back Half Day/Night (Thu\u2013Sat).</div>'+
