@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.63.0
+// @version      15.64.1
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -120,6 +120,8 @@ const SITE_SCHEDULES = {
 // When a site's Nights shift started on one of `dows`, `sched` replaces SITE_SCHEDULES[site].nights
 // for the Sync board (loadConfig -> getShiftDates, periods, hourly, CPLH/TOT windows) and Fast Start.
 // Regular nights on other days, Days, and all other sites are unchanged.
+// (15.64.0) A user Nights override saved in Settings for the site wins over these (see
+// sbApplySiteSchedule / fsPickSchedule); with no user override the behavior is unchanged.
 // AVP8 RT = BHN RT shift, Thu/Fri/Sat nights 18:00 -> 06:30 (12h + 30-min unpaid lunch 03:30-04:00).
 // Break times supplied by AVP8: 21:15-21:30, 00:00-00:30, 03:30-04:00 (lunch). ADJUST HERE if they
 // change. The two 30-min breaks are the P1/P2/P3 boundaries; the 15-min 21:15 break sits inside P1.
@@ -154,10 +156,82 @@ function sbEffectiveNights(site,base,now){
     const ov=sbNightsOverride(site,d);
     return ov?ov.sched:base;
 }
-// Apply SITE_SCHEDULES (+ the night override for `now`) to a config object in place.
+// ---- (15.64.0) User schedule overrides (Settings -> Day / Night Shift Schedule) ----
+// Stored per site in localStorage SB_SCHED_OVERRIDE_PREFIX+SITE = {days?, nights?}; only the
+// shift(s) the user changed are present. Effective schedule per shift:
+//   user override (site+shift) -> else SITE_SHIFT_OVERRIDES auto-override (Nights, e.g. AVP8 RT)
+//   -> else SITE_SCHEDULES. A user Nights override WINS over the AVP8 RT auto-override.
+// Built-in SITE_SCHEDULES are never modified. "Reset to site default" deletes the shift's entry.
+const SB_SCHED_OVERRIDE_PREFIX='syncboard_sched_override_';
+const SB_SCHED_PERIODS=['full','p1','p2','p3'];
+// Deep copy of a {full,p1,p2,p3} schedule with integer fields only (drops any extras).
+function sbSchedCopy(s){
+    const o={};
+    SB_SCHED_PERIODS.forEach(k=>{const p=s[k];o[k]={sh:+p.sh,sm:+p.sm,eh:+p.eh,em:+p.em};});
+    return o;
+}
+function sbSchedEqual(a,b){
+    try{return SB_SCHED_PERIODS.every(k=>['sh','sm','eh','em'].every(f=>+a[k][f]===+b[k][f]));}catch(e){return false;}
+}
+// '' when `s` is a valid {full,p1,p2,p3} schedule, else a short error message. Hours 0-23,
+// minutes 0-59 (whole numbers); full start != end; each period starts before it ends and lies
+// inside the full window (offsets from full start, so windows crossing midnight work); periods
+// are in order and do not overlap.
+function sbValidateSched(s,label){
+    const L=label?label+' ':'';
+    if(!s||typeof s!=='object')return L+'schedule is missing';
+    const nm={full:'Full',p1:'P1',p2:'P2',p3:'P3'};
+    for(const k of SB_SCHED_PERIODS){
+        const p=s[k];if(!p)return L+nm[k]+' is missing';
+        for(const f of ['sh','eh']){const v=p[f];if(typeof v!=='number'||!Number.isInteger(v)||v<0||v>23)return L+nm[k]+' '+(f==='sh'?'Start':'End')+' Hr must be a whole number 0-23';}
+        for(const f of ['sm','em']){const v=p[f];if(typeof v!=='number'||!Number.isInteger(v)||v<0||v>59)return L+nm[k]+' '+(f==='sm'?'Start':'End')+' Min must be a whole number 0-59';}
+    }
+    const fs=s.full.sh*60+s.full.sm,fe=s.full.eh*60+s.full.em;
+    if(fs===fe)return L+'Full start and end cannot be the same time';
+    const off=(h,m)=>((h*60+m)-fs+1440)%1440, len=off(s.full.eh,s.full.em);
+    let prevEnd=0;
+    for(const k of ['p1','p2','p3']){
+        const p=s[k],ps=off(p.sh,p.sm);let pe=off(p.eh,p.em);if(pe===0)pe=1440;
+        if(ps>=pe)return L+nm[k]+' must start before it ends';
+        if(pe>len)return L+nm[k]+' must be inside the Full window';
+        if(ps<prevEnd)return L+nm[k]+' overlaps the previous period';
+        prevEnd=pe;
+    }
+    return '';
+}
+function sbLoadSchedOverride(site){
+    try{
+        const v=JSON.parse(localStorage.getItem(SB_SCHED_OVERRIDE_PREFIX+site)||'null');
+        if(!v||typeof v!=='object')return{};
+        const o={};
+        ['days','nights'].forEach(k=>{if(v[k]&&!sbValidateSched(v[k]))o[k]=sbSchedCopy(v[k]);});
+        return o;
+    }catch(e){return{};}
+}
+// shift 'days' | 'nights'; sched null = clear that shift's override.
+function sbSetSchedOverride(site,shift,sched){
+    try{
+        const o=sbLoadSchedOverride(site);
+        if(sched)o[shift]=sbSchedCopy(sched);else delete o[shift];
+        if(o.days||o.nights)localStorage.setItem(SB_SCHED_OVERRIDE_PREFIX+site,JSON.stringify(o));
+        else localStorage.removeItem(SB_SCHED_OVERRIDE_PREFIX+site);
+        return true;
+    }catch(e){console.warn('[SB] schedule override save failed: '+(e&&e.message));return false;}
+}
+// The site's base Days/Nights (user override else SITE_SCHEDULES), WITHOUT the date-based
+// SITE_SHIFT_OVERRIDES. `fallback` ({days,nights}) is used for a site missing from SITE_SCHEDULES.
+function sbSiteSchedules(site,fallback){
+    const s=SITE_SCHEDULES[site]||fallback||null, u=sbLoadSchedOverride(site);
+    return{days:u.days||(s&&s.days)||null,nights:u.nights||(s&&s.nights)||null,
+        custom:{days:!!u.days,nights:!!u.nights}};
+}
+// Apply the effective schedule (user override -> night auto-override for `now` -> SITE_SCHEDULES)
+// to a config object in place. Every Sync / Hourly / EOS Wash / TOT / WWH / reminder consumer
+// reads c.days / c.nights from loadConfig(), so this is the single effective-schedule path.
 function sbApplySiteSchedule(c,now){
-    const s=SITE_SCHEDULES[c.site];
-    if(s){c.days=s.days;c.nights=sbEffectiveNights(c.site,s.nights,now);}
+    const s=SITE_SCHEDULES[c.site], u=sbLoadSchedOverride(c.site);
+    if(u.days)c.days=u.days;else if(s)c.days=s.days;
+    if(u.nights)c.nights=u.nights;else if(s)c.nights=sbEffectiveNights(c.site,s.nights,now);
     return c;
 }
 // (15.60.0) EOS Wash shift-window lock. A shift that already ended stays the EOS Wash's shift for
@@ -255,7 +329,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.63.0';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.64.1';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -591,10 +665,11 @@ function walkCages(hours,inflowKey,outflowKey,seedCages,density,cageProp){
 }
 
 function loadConfig(){try{const s=localStorage.getItem(STORAGE_KEY);if(s){const c={...DEFAULT_CONFIG,...JSON.parse(s)};
-    // Always use SITE_SCHEDULES for the selected site's period times (source of truth);
-    // (15.63.0) nights follow SITE_SHIFT_OVERRIDES for the night being pulled (e.g. AVP8 RT).
+    // Period times come from the effective schedule: (15.64.0) the user's saved Settings override
+    // for this site+shift, else (15.63.0) SITE_SHIFT_OVERRIDES for the night being pulled (e.g.
+    // AVP8 RT), else SITE_SCHEDULES. The days/nights stored in the config blob are not used.
     sbApplySiteSchedule(c,new Date());
-    return c;}return{...DEFAULT_CONFIG};}catch(e){return{...DEFAULT_CONFIG};}}
+    return c;}return sbApplySiteSchedule({...DEFAULT_CONFIG},new Date());}catch(e){return{...DEFAULT_CONFIG};}}
 function saveConfig(c){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(c));}catch(e){}}
 function loadActions(){try{const s=localStorage.getItem(ACTIONS_KEY);return s?JSON.parse(s):[];}catch(e){return[];}}
 function saveActions(a){try{localStorage.setItem(ACTIONS_KEY,JSON.stringify(a));}catch(e){}}
@@ -6608,20 +6683,23 @@ function buildHTML(){return `
 </div></main>
 
 <main id="tab-settings" class="tab-content"><div class="settings-grid">
-<div class="settings-card"><h2>Day Shift Schedule</h2><table class="settings-table"><thead><tr><th>Period</th><th>Start Hr</th><th>Start Min</th><th>End Hr</th><th>End Min</th></tr></thead><tbody>
-<tr><td>Full</td><td><input type="number" class="sched-input" id="ds-full-sh"></td><td><input type="number" class="sched-input" id="ds-full-sm"></td><td><input type="number" class="sched-input" id="ds-full-eh"></td><td><input type="number" class="sched-input" id="ds-full-em"></td></tr>
-<tr><td>P1</td><td><input type="number" class="sched-input" id="ds-p1-sh"></td><td><input type="number" class="sched-input" id="ds-p1-sm"></td><td><input type="number" class="sched-input" id="ds-p1-eh"></td><td><input type="number" class="sched-input" id="ds-p1-em"></td></tr>
-<tr><td>P2</td><td><input type="number" class="sched-input" id="ds-p2-sh"></td><td><input type="number" class="sched-input" id="ds-p2-sm"></td><td><input type="number" class="sched-input" id="ds-p2-eh"></td><td><input type="number" class="sched-input" id="ds-p2-em"></td></tr>
-<tr><td>P3</td><td><input type="number" class="sched-input" id="ds-p3-sh"></td><td><input type="number" class="sched-input" id="ds-p3-sm"></td><td><input type="number" class="sched-input" id="ds-p3-eh"></td><td><input type="number" class="sched-input" id="ds-p3-em"></td></tr>
-</tbody></table></div>
-<div class="settings-card"><h2>Night Shift Schedule</h2><table class="settings-table"><thead><tr><th>Period</th><th>Start Hr</th><th>Start Min</th><th>End Hr</th><th>End Min</th></tr></thead><tbody>
-<tr><td>Full</td><td><input type="number" class="sched-input" id="ns-full-sh"></td><td><input type="number" class="sched-input" id="ns-full-sm"></td><td><input type="number" class="sched-input" id="ns-full-eh"></td><td><input type="number" class="sched-input" id="ns-full-em"></td></tr>
-<tr><td>P1</td><td><input type="number" class="sched-input" id="ns-p1-sh"></td><td><input type="number" class="sched-input" id="ns-p1-sm"></td><td><input type="number" class="sched-input" id="ns-p1-eh"></td><td><input type="number" class="sched-input" id="ns-p1-em"></td></tr>
-<tr><td>P2</td><td><input type="number" class="sched-input" id="ns-p2-sh"></td><td><input type="number" class="sched-input" id="ns-p2-sm"></td><td><input type="number" class="sched-input" id="ns-p2-eh"></td><td><input type="number" class="sched-input" id="ns-p2-em"></td></tr>
-<tr><td>P3</td><td><input type="number" class="sched-input" id="ns-p3-sh"></td><td><input type="number" class="sched-input" id="ns-p3-sm"></td><td><input type="number" class="sched-input" id="ns-p3-eh"></td><td><input type="number" class="sched-input" id="ns-p3-em"></td></tr>
-</tbody></table></div>
+<div class="settings-card"><h2>Day Shift Schedule <span id="ds-custom-badge" class="sched-custom-badge" style="display:none;" title="Custom Day schedule saved for this site in this browser (overrides the built-in site default)">custom</span></h2><table class="settings-table"><thead><tr><th>Period</th><th>Start Hr</th><th>Start Min</th><th>End Hr</th><th>End Min</th></tr></thead><tbody>
+<tr><td>Full</td><td><input type="number" class="sched-input" id="ds-full-sh" min="0" max="23" step="1"></td><td><input type="number" class="sched-input" id="ds-full-sm" min="0" max="59" step="1"></td><td><input type="number" class="sched-input" id="ds-full-eh" min="0" max="23" step="1"></td><td><input type="number" class="sched-input" id="ds-full-em" min="0" max="59" step="1"></td></tr>
+<tr><td>P1</td><td><input type="number" class="sched-input" id="ds-p1-sh" min="0" max="23" step="1"></td><td><input type="number" class="sched-input" id="ds-p1-sm" min="0" max="59" step="1"></td><td><input type="number" class="sched-input" id="ds-p1-eh" min="0" max="23" step="1"></td><td><input type="number" class="sched-input" id="ds-p1-em" min="0" max="59" step="1"></td></tr>
+<tr><td>P2</td><td><input type="number" class="sched-input" id="ds-p2-sh" min="0" max="23" step="1"></td><td><input type="number" class="sched-input" id="ds-p2-sm" min="0" max="59" step="1"></td><td><input type="number" class="sched-input" id="ds-p2-eh" min="0" max="23" step="1"></td><td><input type="number" class="sched-input" id="ds-p2-em" min="0" max="59" step="1"></td></tr>
+<tr><td>P3</td><td><input type="number" class="sched-input" id="ds-p3-sh" min="0" max="23" step="1"></td><td><input type="number" class="sched-input" id="ds-p3-sm" min="0" max="59" step="1"></td><td><input type="number" class="sched-input" id="ds-p3-eh" min="0" max="23" step="1"></td><td><input type="number" class="sched-input" id="ds-p3-em" min="0" max="59" step="1"></td></tr>
+</tbody></table>
+<div class="sched-actions"><button type="button" id="btn-reset-ds" class="btn btn-small" title="Delete the custom Day schedule for this site and use the built-in site default">Reset to site default</button></div></div>
+<div class="settings-card"><h2>Night Shift Schedule <span id="ns-custom-badge" class="sched-custom-badge" style="display:none;" title="Custom Night schedule saved for this site in this browser. It is used for EVERY night and replaces the site default and any automatic night schedule (e.g. AVP8 RT Thu/Fri/Sat).">custom</span></h2><table class="settings-table"><thead><tr><th>Period</th><th>Start Hr</th><th>Start Min</th><th>End Hr</th><th>End Min</th></tr></thead><tbody>
+<tr><td>Full</td><td><input type="number" class="sched-input" id="ns-full-sh" min="0" max="23" step="1"></td><td><input type="number" class="sched-input" id="ns-full-sm" min="0" max="59" step="1"></td><td><input type="number" class="sched-input" id="ns-full-eh" min="0" max="23" step="1"></td><td><input type="number" class="sched-input" id="ns-full-em" min="0" max="59" step="1"></td></tr>
+<tr><td>P1</td><td><input type="number" class="sched-input" id="ns-p1-sh" min="0" max="23" step="1"></td><td><input type="number" class="sched-input" id="ns-p1-sm" min="0" max="59" step="1"></td><td><input type="number" class="sched-input" id="ns-p1-eh" min="0" max="23" step="1"></td><td><input type="number" class="sched-input" id="ns-p1-em" min="0" max="59" step="1"></td></tr>
+<tr><td>P2</td><td><input type="number" class="sched-input" id="ns-p2-sh" min="0" max="23" step="1"></td><td><input type="number" class="sched-input" id="ns-p2-sm" min="0" max="59" step="1"></td><td><input type="number" class="sched-input" id="ns-p2-eh" min="0" max="23" step="1"></td><td><input type="number" class="sched-input" id="ns-p2-em" min="0" max="59" step="1"></td></tr>
+<tr><td>P3</td><td><input type="number" class="sched-input" id="ns-p3-sh" min="0" max="23" step="1"></td><td><input type="number" class="sched-input" id="ns-p3-sm" min="0" max="59" step="1"></td><td><input type="number" class="sched-input" id="ns-p3-eh" min="0" max="23" step="1"></td><td><input type="number" class="sched-input" id="ns-p3-em" min="0" max="59" step="1"></td></tr>
+</tbody></table>
+<div class="sched-actions"><button type="button" id="btn-reset-ns" class="btn btn-small" title="Delete the custom Night schedule for this site and use the built-in site default (and any automatic night schedule, e.g. AVP8 RT)">Reset to site default</button></div>
+<p class="settings-note">A saved Night schedule is used for every night at this site and takes priority over automatic night schedules (e.g. AVP8 RT Thu/Fri/Sat). Night windows may cross midnight (e.g. Full 18:00 &rarr; 06:00).</p></div>
 <div class="settings-card"><h2>Config</h2><div class="setting-row"><label>Schedule Type</label><select id="settings-sched-type" class="select-input"><option value="3P">3P</option><option value="4Q">4Q</option></select></div>
-<button id="btn-save-settings" class="btn btn-primary">\uD83D\uDCBE Save Settings</button><p class="settings-note">Saved to browser localStorage.</p></div>
+<button id="btn-save-settings" class="btn btn-primary">\uD83D\uDCBE Save Settings</button><p id="settings-sched-note" class="settings-note" role="status" aria-live="polite"></p><p class="settings-note">Saved to browser localStorage. Shift schedules are saved per site.</p></div>
 <div class="settings-card"><h2>Slack Webhooks (local only)</h2>
 <p class="settings-note" style="margin-top:0;">Paste the Slack workflow trigger URLs once. Stored ONLY in this browser (never in the script file), so they aren't exposed if the code is shared or pushed to GitHub. Leave blank to disable Slack posts.</p>
 <div class="setting-row"><label>SOS cages</label><input type="text" id="slack-sos-url" class="select-input" placeholder="https://hooks.slack.com/triggers/\u2026" style="flex:1;min-width:280px;"></div>
@@ -6949,6 +7027,11 @@ function buildCSS2(){return `
 #sb-root.dark-mode .settings-card h2{color:#e0e0e0!important;}
 #sb-root.dark-mode .settings-table th,#sb-root.dark-mode .settings-table td{color:#e0e0e0!important;border-color:#444!important;}
 #sb-root.dark-mode .sched-input{background:#1a1a2e!important;color:#ffd740!important;border-color:#555!important;}
+/* (15.64.0) Settings schedule: "custom" badge (user override saved) + Reset row. */
+.sched-custom-badge{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:8px;background:#6a1b9a;color:#fff;font-size:10px;font-weight:700;vertical-align:middle;cursor:help;}
+#sb-root.dark-mode .sched-custom-badge{background:#ce93d8!important;color:#000!important;}
+.sched-actions{margin-top:8px;}
+.sched-input.sched-invalid{border:2px solid #c62828;background:#ffebee;}
 #sb-root.dark-mode .settings-note{color:#aab4c4!important;}
 /* EOS Wash */
 .eoswash-container{padding:4px 0;}
@@ -7646,6 +7729,7 @@ function vretPopulateWeeks(){
 // never change); in-progress shifts are always re-pulled and never cached; future shifts are not
 // fetched at all.
 // Per-site ICQA shift windows. Sites not listed fall back to SITE_SCHEDULES[site].days/nights.full.
+// (15.64.1) A Settings schedule override re-derives the listed windows (see icqaTabWindows).
 const ICQA_WINDOWS={KRB3:{day:{sh:6,sm:15,eh:17,em:45},night:{sh:18,sm:15,eh:5,em:45}}};
 // v2 (15.45.0): entries also carry .rates (SBC/CC/Andon from the ICQA fn-rollup); v1 entries
 // without rates are ignored so each completed shift is refetched once.
@@ -7660,10 +7744,40 @@ const ICQA_TAB_DOW=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 let icqaTabAlpsMemo={key:'',val:0};   // ALPS loaded rate memo (site + week), avoids refetching
 let icqaTabLast=null;                 // last fetched state, re-rendered when the fallback target changes
 
+// (15.64.1) Shift a {sh,sm} or {eh,em} clock time by `delta` minutes, wrapping around midnight.
+function icqaTabShiftHM(h,m,delta){
+    const t=(((h*60+m+delta)%1440)+1440)%1440;
+    return[Math.floor(t/60),t%60];
+}
+// ICQA day/night windows for `site`, plus custom:{day,night} (true = derived from a Settings
+// schedule override). Used by every ICQA tab consumer (slot builder, status, render, Sync tab ICQA
+// week block night end).
+// - Site in ICQA_WINDOWS, no override for that shift -> ICQA_WINDOWS[site] exactly (unchanged).
+// - (15.64.1) Site in ICQA_WINDOWS WITH a Settings override for Days and/or Nights -> the ICQA window
+//   for that shift = override Full window shifted by the same start/end deltas ICQA_WINDOWS has
+//   against the built-in SITE_SCHEDULES Full window (KRB3: start +30 min, end +15 min for both
+//   shifts, e.g. built-in Nights 17:45-05:30 -> ICQA 18:15-05:45). The other shift stays ICQA_WINDOWS.
+// - Other sites: Settings override else SITE_SCHEDULES Full (15.64.0), no date-based night override.
 function icqaTabWindows(site){
-    if(ICQA_WINDOWS[site])return ICQA_WINDOWS[site];
-    const s=SITE_SCHEDULES[site];
-    if(s&&s.days&&s.days.full&&s.nights&&s.nights.full)return{day:s.days.full,night:s.nights.full};
+    const iw=ICQA_WINDOWS[site];
+    if(iw){
+        const u=sbLoadSchedOverride(site), base=SITE_SCHEDULES[site];
+        if(!base||(!u.days&&!u.nights))return iw;   // no override -> ICQA-specific windows as before
+        const out={day:iw.day,night:iw.night,custom:{day:false,night:false}};
+        [['day','days'],['night','nights']].forEach(([k,shift])=>{
+            const ov=u[shift]&&u[shift].full, bf=base[shift]&&base[shift].full, w=iw[k];
+            if(!ov||!bf)return;
+            const dS=(w.sh*60+w.sm)-(bf.sh*60+bf.sm), dE=(w.eh*60+w.em)-(bf.eh*60+bf.em);
+            const s=icqaTabShiftHM(ov.sh,ov.sm,dS), e=icqaTabShiftHM(ov.eh,ov.em,dE);
+            out[k]={sh:s[0],sm:s[1],eh:e[0],em:e[1]};
+            out.custom[k]=true;
+        });
+        return out;
+    }
+    // (15.64.0) Other sites follow the Settings schedule override (else SITE_SCHEDULES), without the
+    // date-based night auto-override (same as before: one window per shift type for every day).
+    const s=sbSiteSchedules(site);
+    if(s&&s.days&&s.days.full&&s.nights&&s.nights.full)return{day:s.days.full,night:s.nights.full,custom:{day:!!s.custom.days,night:!!s.custom.nights}};
     const c=loadConfig();
     return{day:c.days.full,night:c.nights.full};
 }
@@ -7677,11 +7791,15 @@ function icqaTabMD(d){return(d.getMonth()+1)+'/'+d.getDate();}
 function icqaTabHM(h,m){return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0');}
 // Builds the 14 shift slots for the week starting `sunday`, with status relative to `now`:
 // future (start > now), partial (start <= now < end), complete (now >= end).
-function icqaTabBuildShifts(site,sunday,now){
-    const w=icqaTabWindows(site);
+// `w` (optional) = resolved icqaTabWindows(site), so build + render use the same windows.
+function icqaTabBuildShifts(site,sunday,now,w){
+    w=w||icqaTabWindows(site);
     const out=[];
     ['day','night'].forEach(kind=>{
         const win=w[kind];
+        // (15.64.1) Custom (Settings-derived) windows get their own cache key so a completed shift
+        // cached under a different window isn't reused. Built-in windows keep the old key.
+        const keySfx=(w.custom&&w.custom[kind])?'|'+icqaTabHM(win.sh,win.sm)+'-'+icqaTabHM(win.eh,win.em):'';
         for(let i=0;i<7;i++){
             const d=new Date(sunday);d.setDate(sunday.getDate()+i);d.setHours(0,0,0,0);
             const start=new Date(d);start.setHours(win.sh,win.sm,0,0);
@@ -7689,7 +7807,7 @@ function icqaTabBuildShifts(site,sunday,now){
             if(end.getTime()<=start.getTime())end.setDate(end.getDate()+1);   // overnight window
             const t=now.getTime();
             const status=start.getTime()>t?'future':(t<end.getTime()?'partial':'complete');
-            out.push({kind,dow:i,date:d,start,end,status,code:icqaTabShiftCode(i,kind),key:site+'|'+isoDate(d)+'|'+kind,data:null,failed:false});
+            out.push({kind,dow:i,date:d,start,end,status,code:icqaTabShiftCode(i,kind),key:site+'|'+isoDate(d)+'|'+kind+keySfx,data:null,failed:false});
         }
     });
     return out;
@@ -7746,7 +7864,8 @@ async function fetchICQATabData(){
         setEl('sb-icqa-title',site+' ICQA Tracker');
         const now=new Date();
         const sunday=sbIcqaWeekSunday(now);   // (15.60.0) keeps last week (Sat night) until Sunday 08:00
-        const shifts=icqaTabBuildShifts(site,sunday,now);
+        const win=icqaTabWindows(site);       // (15.64.1) follows the Settings schedule override
+        const shifts=icqaTabBuildShifts(site,sunday,now,win);
         const cache=icqaTabLoadCache();
         const toFetch=[];let cachedN=0;
         shifts.forEach(s=>{
@@ -7786,7 +7905,7 @@ async function fetchICQATabData(){
         });
         icqaTabSaveCache(cache);
         const target=await targetP;
-        icqaTabLast={site,sunday,now,shifts,target};
+        icqaTabLast={site,sunday,now,shifts,target,win};
         renderICQATab(icqaTabLast);
         setStatusIcqa('\u2713 Updated '+new Date().toLocaleTimeString()+' \u00b7 '+(toFetch.length-failed)+' fetched, '+cachedN+' cached'+(failed?', '+failed+' failed (see console)':''));
     }catch(err){
@@ -7801,7 +7920,7 @@ function renderICQATab(st){
     if(!content||!st)return;
     const {site,sunday,now,shifts,target}=st;
     const tval=(target&&target.val>0)?target.val:0;
-    const win=icqaTabWindows(site);
+    const win=st.win||icqaTabWindows(site);   // windows the shifts were built with
     const sat=new Date(sunday);sat.setDate(sunday.getDate()+6);
     const dash='<span class="sb-icqa-muted">\u2014</span>';
     const r2=v=>Math.round(v*100)/100;
@@ -7862,7 +7981,8 @@ function renderICQATab(st){
         const tr=rateTotals(list);
         const totRow='<tr class="sb-icqa-total"><td style="text-align:left;">TOTAL</td>'+
             '<td>'+(t.n?fmt(t.vol,0):dash)+'</td><td>'+(t.n?fmt(t.hrs,2):dash)+'</td><td>'+(t.n?fmtRate(t.rate):dash)+'</td><td>'+(t.n?fmtDelta(t.delta):dash)+'</td>'+rateCells(tr)+'</tr>';
-        return'<section class="sb-icqa-section sb-icqa-'+kind+'"><h3>'+icon+' '+name+' \u2014 '+label+' '+icqaTabHM(w.sh,w.sm)+'\u2013'+icqaTabHM(w.eh,w.em)+'</h3>'+
+        return'<section class="sb-icqa-section sb-icqa-'+kind+'"><h3>'+icon+' '+name+' \u2014 '+label+' '+icqaTabHM(w.sh,w.sm)+'\u2013'+icqaTabHM(w.eh,w.em)+
+            ((win.custom&&win.custom[kind])?'<span class="sched-custom-badge" title="Derived from your Settings '+(kind==='day'?'Days':'Nights')+' schedule">custom</span>':'')+'</h3>'+
             '<table class="metrics-table"><thead><tr><th style="text-align:left;">Shift / Day</th><th>Volume</th><th>ICQA Hours</th><th>ICQA Rate</th><th>Hrs Delta</th>'+
             '<th>SBC Rate</th><th title="'+ICQA_CC_RATE_TIP+'">CC Rate</th><th>Andon Rate</th></tr></thead>'+
             '<tbody>'+list.map(rowHTML).join('')+totRow+'</tbody></table></section>';
@@ -9336,12 +9456,12 @@ function updateAtlasThreshold(){
     sbAutoGrowAll();   // (15.60.0) a just-revealed reason box grows to its saved text
 }
 // ---- (15.60.0) ICQA Execution bridge bar ----
-// Shown only when ICQA Actual Rate is MORE than 100 below or above the ICQA Plan Rate (plan 1,900:
-// actual < 1,800 or > 2,000; exactly ±100 hides). Missing / non-numeric values never show it.
+// (15.64.0) Shown only when ICQA Actual Rate is OVER the ICQA Plan Rate (plan 1,900: 1,900.01+
+// shows; 1,900 or below hides). Missing / non-numeric values (blank, em-dash) never show it.
 function sbIcqaBridgeNeeded(plan,actual){
     const num=(x)=>parseFloat(String(x==null?'':x).replace(/,/g,''));
     const p=num(plan),a=num(actual);
-    return Number.isFinite(p)&&Number.isFinite(a)&&p>0&&a>0&&(a<p-100||a>p+100);
+    return Number.isFinite(p)&&Number.isFinite(a)&&p>0&&a>0&&a>p;
 }
 // Re-evaluates the bridge row from the card's current Plan / Actual values. Never throws.
 function sbEosIcqaBridgeUpdate(){
@@ -10076,7 +10196,7 @@ function renderEOSWash(data){
               ${qStat('ICQA Actual Rate','eos-q-icqa-rate')}
               ${qStat('ICQA % to RO','eos-q-icqa-ro')}
             </div>
-            <div id="eos-q-icqa-bridge-row" style="display:none;padding:0 10px 8px;text-align:left;">${pileNote('eos-q-icqa-bridge','Explain why ICQA rate is off plan\u2026','Bridge (ICQA rate off plan by more than 100):')}</div>
+            <div id="eos-q-icqa-bridge-row" style="display:none;padding:0 10px 8px;text-align:left;">${pileNote('eos-q-icqa-bridge','Explain why ICQA rate is over plan\u2026','Bridge (ICQA rate over plan):')}</div>
           </div>
           <div class="eos-q-card eos-q-piles">
             <div class="eos-q-card-head">\uD83D\uDCE6 Piles <span class="eos-q-sub">over threshold = add a reason</span></div>
@@ -11282,10 +11402,8 @@ function initBoard(){
     const t=config.targets||{};
     ['ib-bb-goal','ib-goal-input','ib-lp-plan-vol','ib-rate-target','ib-cplh-target','ib-density-target','ib-fast-sos','ib-fast-eol','ob-bb-goal','ob-goal-input','ob-lp-plan-vol','ob-rate-target','ob-cplh-target','ob-density-target','ob-fast-sos','ob-fast-eol','sort-goal','sort-rate-target','sort-vol-sort20lb','sort-vol-sort5lb','sort-vol-sortEuro','sort-vol-sortManual','sort-rate-sort20lb','sort-rate-sort5lb','sort-rate-sortEuro','sort-rate-sortManual','site-cplh-target'].forEach(id=>{const el=document.getElementById(id);if(el&&t[id])el.value=t[id];});
     syncSortGoalFromPaths();
-    // Load settings
-    const ds=config.days,ns=config.nights;
-    ['ds-full-sh','ds-full-sm','ds-full-eh','ds-full-em','ds-p1-sh','ds-p1-sm','ds-p1-eh','ds-p1-em','ds-p2-sh','ds-p2-sm','ds-p2-eh','ds-p2-em','ds-p3-sh','ds-p3-sm','ds-p3-eh','ds-p3-em'].forEach((id,i)=>{const vals=[ds.full.sh,ds.full.sm,ds.full.eh,ds.full.em,ds.p1.sh,ds.p1.sm,ds.p1.eh,ds.p1.em,ds.p2.sh,ds.p2.sm,ds.p2.eh,ds.p2.em,ds.p3.sh,ds.p3.sm,ds.p3.eh,ds.p3.em];const el=document.getElementById(id);if(el)el.value=vals[i];});
-    ['ns-full-sh','ns-full-sm','ns-full-eh','ns-full-em','ns-p1-sh','ns-p1-sm','ns-p1-eh','ns-p1-em','ns-p2-sh','ns-p2-sm','ns-p2-eh','ns-p2-em','ns-p3-sh','ns-p3-sm','ns-p3-eh','ns-p3-em'].forEach((id,i)=>{const vals=[ns.full.sh,ns.full.sm,ns.full.eh,ns.full.em,ns.p1.sh,ns.p1.sm,ns.p1.eh,ns.p1.em,ns.p2.sh,ns.p2.sm,ns.p2.eh,ns.p2.em,ns.p3.sh,ns.p3.sm,ns.p3.eh,ns.p3.em];const el=document.getElementById(id);if(el)el.value=vals[i];});
+    // Load settings (15.64.0: effective schedule + custom badges)
+    refreshSettingsInputs();
     document.getElementById('settings-sched-type').value=config.schedType||'3P';
     updateTargetRows();
     // Seed the Shift Plan Targets panel's LP rows from cached LP values so they show on load
@@ -11362,6 +11480,8 @@ function initBoard(){
     document.getElementById('btn-add-action')?.addEventListener('click',()=>{const a=loadActions();a.push({item:'',owner:'',status:'Open'});saveActions(a);renderActions();});
     document.getElementById('btn-clear-actions')?.addEventListener('click',()=>{if(confirm('Clear all actions?')){saveActions([]);renderActions();}});
     document.getElementById('btn-save-settings')?.addEventListener('click',saveSettingsUI);
+    document.getElementById('btn-reset-ds')?.addEventListener('click',()=>sbResetSchedShift('days'));
+    document.getElementById('btn-reset-ns')?.addEventListener('click',()=>sbResetSchedShift('nights'));
     // Prefill the Settings Slack fields from localStorage (the only place the URLs live).
     { const sos=document.getElementById('slack-sos-url'),jb=document.getElementById('slack-jobbalance-url'),fs=document.getElementById('slack-faststart-url'),mu=document.getElementById('metrics-url');
       if(sos)sos.value=getSlackSosUrl();if(jb)jb.value=getSlackJobBalanceUrl();if(fs)fs.value=getSlackFastStartUrl();if(mu)mu.value=getMetricsUrl(); }
@@ -11439,10 +11559,62 @@ function initBoard(){
     startPeriodReminders();
 }
 
+// ---- (15.64.0) Settings -> Day / Night Shift Schedule tables ----
+// The tables show the EFFECTIVE schedule (config.days / config.nights). sbSchedShown remembers what
+// was put in each table so Save only touches a shift the user actually changed (an unchanged
+// AVP8 RT night is never turned into a permanent override).
+var SB_SCHED_UI={days:{prefix:'ds',label:'Days'},nights:{prefix:'ns',label:'Nights'}};
+var sbSchedShown=null;   // {site, days, nights}
+function sbFillSchedTable(shift,sched){
+    const pre=SB_SCHED_UI[shift].prefix;
+    SB_SCHED_PERIODS.forEach(k=>['sh','sm','eh','em'].forEach(f=>{
+        const el=document.getElementById(pre+'-'+k+'-'+f);
+        if(el){el.value=(sched&&sched[k])?sched[k][f]:'';el.classList.remove('sched-invalid');}
+    }));
+    if(!sbSchedShown||sbSchedShown.site!==config.site)sbSchedShown={site:config.site,days:null,nights:null};
+    sbSchedShown[shift]=sched?sbSchedCopy(sched):null;
+}
+// Table values; a blank or non-numeric cell reads as NaN (fails validation).
+function sbReadSchedTable(shift){
+    const pre=SB_SCHED_UI[shift].prefix,o={};
+    SB_SCHED_PERIODS.forEach(k=>{o[k]={};['sh','sm','eh','em'].forEach(f=>{
+        const el=document.getElementById(pre+'-'+k+'-'+f);const raw=el?String(el.value).trim():'';
+        o[k][f]=raw===''?NaN:Number(raw);
+    });});
+    return o;
+}
+// Red outline on cells that are blank / not whole numbers / out of range (0-23 hr, 0-59 min).
+function sbMarkSchedTable(shift,sched){
+    const pre=SB_SCHED_UI[shift].prefix;
+    SB_SCHED_PERIODS.forEach(k=>['sh','sm','eh','em'].forEach(f=>{
+        const el=document.getElementById(pre+'-'+k+'-'+f);if(!el)return;
+        const v=sched[k][f],max=(f==='sh'||f==='eh')?23:59;
+        el.classList.toggle('sched-invalid',!(Number.isInteger(v)&&v>=0&&v<=max));
+    }));
+}
+function sbUpdateSchedBadges(){
+    const u=sbLoadSchedOverride(config.site);
+    const d=document.getElementById('ds-custom-badge'),n=document.getElementById('ns-custom-badge');
+    if(d)d.style.display=u.days?'':'none';
+    if(n)n.style.display=u.nights?'':'none';
+}
+function sbSchedNote(msg,isErr){
+    const el=document.getElementById('settings-sched-note');if(!el)return;
+    el.textContent=msg;el.style.color=isErr?'#c62828':'';el.style.fontWeight=isErr?'700':'';
+}
 function refreshSettingsInputs(){
-    const ds=config.days,ns=config.nights;
-    ['ds-full-sh','ds-full-sm','ds-full-eh','ds-full-em','ds-p1-sh','ds-p1-sm','ds-p1-eh','ds-p1-em','ds-p2-sh','ds-p2-sm','ds-p2-eh','ds-p2-em','ds-p3-sh','ds-p3-sm','ds-p3-eh','ds-p3-em'].forEach((id,i)=>{const vals=[ds.full.sh,ds.full.sm,ds.full.eh,ds.full.em,ds.p1.sh,ds.p1.sm,ds.p1.eh,ds.p1.em,ds.p2.sh,ds.p2.sm,ds.p2.eh,ds.p2.em,ds.p3.sh,ds.p3.sm,ds.p3.eh,ds.p3.em];const el=document.getElementById(id);if(el)el.value=vals[i];});
-    ['ns-full-sh','ns-full-sm','ns-full-eh','ns-full-em','ns-p1-sh','ns-p1-sm','ns-p1-eh','ns-p1-em','ns-p2-sh','ns-p2-sm','ns-p2-eh','ns-p2-em','ns-p3-sh','ns-p3-sm','ns-p3-eh','ns-p3-em'].forEach((id,i)=>{const vals=[ns.full.sh,ns.full.sm,ns.full.eh,ns.full.em,ns.p1.sh,ns.p1.sm,ns.p1.eh,ns.p1.em,ns.p2.sh,ns.p2.sm,ns.p2.eh,ns.p2.em,ns.p3.sh,ns.p3.sm,ns.p3.eh,ns.p3.em];const el=document.getElementById(id);if(el)el.value=vals[i];});
+    sbFillSchedTable('days',config.days);
+    sbFillSchedTable('nights',config.nights);
+    sbUpdateSchedBadges();
+}
+// "Reset to site default" for one shift: drop the override, re-apply, refill only that table.
+function sbResetSchedShift(shift){
+    const site=config.site;
+    if(!sbSetSchedOverride(site,shift,null)){sbSchedNote('Could not reset the schedule (browser storage unavailable).',true);return;}
+    sbApplySiteSchedule(config,new Date());saveConfig(config);
+    sbFillSchedTable(shift,config[shift]);sbUpdateSchedBadges();
+    try{updatePeriodDots();}catch(e){}
+    sbSchedNote('\u2713 Schedule reset to site default for '+site+' '+SB_SCHED_UI[shift].label);
 }
 
 // Undo anything doSnip() may have left behind if a capture was aborted or hung.
@@ -11776,11 +11948,38 @@ function saveTargetsUI(){
     if(currentMetrics)renderLPPercents(currentMetrics);
 }
 
+// (15.64.0) Schedule edits are saved as a per-site override (sbSetSchedOverride) instead of into
+// the config blob, which loadConfig() always replaced with SITE_SCHEDULES (edits "went back").
+// Only a changed shift is written; a shift edited back to the built-in default clears its override.
+// Any invalid table blocks the whole save (nothing is written) and is reported in the note.
 function saveSettingsUI(){
-    config.days={full:{sh:+document.getElementById('ds-full-sh').value,sm:+document.getElementById('ds-full-sm').value,eh:+document.getElementById('ds-full-eh').value,em:+document.getElementById('ds-full-em').value},p1:{sh:+document.getElementById('ds-p1-sh').value,sm:+document.getElementById('ds-p1-sm').value,eh:+document.getElementById('ds-p1-eh').value,em:+document.getElementById('ds-p1-em').value},p2:{sh:+document.getElementById('ds-p2-sh').value,sm:+document.getElementById('ds-p2-sm').value,eh:+document.getElementById('ds-p2-eh').value,em:+document.getElementById('ds-p2-em').value},p3:{sh:+document.getElementById('ds-p3-sh').value,sm:+document.getElementById('ds-p3-sm').value,eh:+document.getElementById('ds-p3-eh').value,em:+document.getElementById('ds-p3-em').value}};
-    config.nights={full:{sh:+document.getElementById('ns-full-sh').value,sm:+document.getElementById('ns-full-sm').value,eh:+document.getElementById('ns-full-eh').value,em:+document.getElementById('ns-full-em').value},p1:{sh:+document.getElementById('ns-p1-sh').value,sm:+document.getElementById('ns-p1-sm').value,eh:+document.getElementById('ns-p1-eh').value,em:+document.getElementById('ns-p1-em').value},p2:{sh:+document.getElementById('ns-p2-sh').value,sm:+document.getElementById('ns-p2-sm').value,eh:+document.getElementById('ns-p2-eh').value,em:+document.getElementById('ns-p2-em').value},p3:{sh:+document.getElementById('ns-p3-sh').value,sm:+document.getElementById('ns-p3-sm').value,eh:+document.getElementById('ns-p3-eh').value,em:+document.getElementById('ns-p3-em').value}};
+    const site=config.site;
+    const ui={days:sbReadSchedTable('days'),nights:sbReadSchedTable('nights')};
+    const errs=[];
+    ['days','nights'].forEach(sh=>{
+        const err=sbValidateSched(ui[sh],SB_SCHED_UI[sh].label+':');
+        sbMarkSchedTable(sh,ui[sh]);
+        if(err)errs.push(err);
+    });
+    if(errs.length){sbSchedNote('\u2717 Not saved \u2014 '+errs.join('; '),true);alert('Settings not saved:\n'+errs.join('\n'));return;}
+    const saved=[];let failed=false;
+    ['days','nights'].forEach(sh=>{
+        const shown=(sbSchedShown&&sbSchedShown.site===site)?sbSchedShown[sh]:null;
+        if(shown&&sbSchedEqual(ui[sh],shown))return;   // unchanged -> leave the stored state alone
+        const base=SITE_SCHEDULES[site]&&SITE_SCHEDULES[site][sh];
+        const toDefault=!!(base&&sbSchedEqual(ui[sh],base));
+        if(!sbSetSchedOverride(site,sh,toDefault?null:ui[sh]))failed=true;
+        else saved.push(SB_SCHED_UI[sh].label+(toDefault?' (site default)':''));
+    });
     config.schedType=document.getElementById('settings-sched-type').value;
-    saveTargetsUI();saveConfig(config);alert('Settings saved!');
+    sbApplySiteSchedule(config,new Date());
+    saveTargetsUI();saveConfig(config);
+    refreshSettingsInputs();
+    try{updatePeriodDots();}catch(e){}
+    if(failed){sbSchedNote('\u2717 Schedule could not be saved (browser storage unavailable).',true);alert('Schedule could not be saved (browser storage unavailable).');return;}
+    const msg=saved.length?'Schedule saved for '+site+' '+saved.join(' + '):'Settings saved (schedule unchanged)';
+    sbSchedNote('\u2713 '+msg);
+    alert('Settings saved!\n'+msg);
 }
 
 // === PERIOD REMINDER NOTIFICATIONS ===
@@ -11892,10 +12091,12 @@ function fsResolveOverride(site,d){
 // Pick the schedule for the entered shift start: a matching SITE_SHIFT_OVERRIDES entry first,
 // else the site's Days or Nights schedule whose P1 (SOS) start is nearest (circular, so 18:15
 // matches Nights even if the board config is set to Days).
+// (15.64.0) Days/Nights come from sbSiteSchedules (the user's Settings override, else
+// SITE_SCHEDULES). A user Nights override for the site wins over the (Nights-only) auto-override.
 function fsPickSchedule(site,sosDate){
-    const hit=fsResolveOverride(site,sosDate);
+    const s=sbSiteSchedules(site,SITE_SCHEDULES[site]?null:(()=>{const c=loadConfig();return{days:c.days,nights:c.nights};})());
+    const hit=s.custom.nights?null:fsResolveOverride(site,sosDate);
     if(hit)return{type:hit.ov.label||hit.ov.name,sched:hit.ov.sched,override:hit.ov.name};
-    const s=SITE_SCHEDULES[site]||(()=>{const c=loadConfig();return{days:c.days,nights:c.nights};})();
     const m=sosDate.getHours()*60+sosDate.getMinutes();
     const dist=(p)=>{const d=Math.abs(m-(p.sh*60+p.sm))%1440;return Math.min(d,1440-d);};
     return dist(s.nights.p1)<dist(s.days.p1)?{type:'Nights',sched:s.nights}:{type:'Days',sched:s.days};
