@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.64.1
+// @version      15.64.2
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -329,7 +329,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.64.1';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.64.2';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -10105,19 +10105,27 @@ function renderEOSWash(data){
     const siteActCplh=(syncCplh&&syncCplh.site>0)?syncCplh.site:(parseFloat(document.getElementById('site-cplh-value')?.textContent)||0);
     const accRow=(label,plan,act,dec=0,pctHigh=true)=>{
         const varc=(plan&&act)?((pctHigh?act/plan:plan/act)*100):0;
-        return `<tr><td>${label}</td><td>${plan?fv(plan,dec):'\u2014'}</td><td>${act?fv(act,dec):'\u2014'}</td><td style="${bg(varc)}">${varc>0?varc.toFixed(1)+'%':'\u2014'}</td></tr>`;
+        // (15.64.2) Delta = Actual - Plan (same decimals as the row). + = above plan (green), - = below (red).
+        let deltaCell='\u2014';
+        if(plan&&act){
+            const dv=Math.round((act-plan)*Math.pow(10,dec))/Math.pow(10,dec);
+            const good=pctHigh?dv>0:dv<0;
+            const col=dv===0?'inherit':(good?'#2e7d32':'#c62828');
+            deltaCell=`<span style="color:${col};font-weight:700;">${dv>0?'+':dv<0?'\u2212':''}${fv(Math.abs(dv),dec)}</span>`;
+        }
+        return `<tr><td>${label}</td><td>${plan?fv(plan,dec):'\u2014'}</td><td>${act?fv(act,dec):'\u2014'}</td><td>${deltaCell}</td><td style="${bg(varc)}">${varc>0?varc.toFixed(1)+'%':'\u2014'}</td></tr>`;
     };
     const accuracyHTML=`<section class="eoswash-section">
         <h3>Shift Accuracy</h3>
-        <table class="metrics-table eos-accuracy-table"><thead><tr><th>Metric</th><th>Plan</th><th>Actual</th><th>% to Plan</th></tr></thead><tbody>
+        <table class="metrics-table eos-accuracy-table"><thead><tr><th>Metric</th><th>Plan</th><th>Actual</th><th>Delta</th><th>% to Plan</th></tr></thead><tbody>
         ${accRow('IB Shift LP BB',eosLpTargetIB,ibActVol)}
         ${accRow('IB Shift Plan',ibPlan,ibActVol)}
         ${accRow('IB CPLH',ibCplh,ibActCplhSync,2)}
-        <tr><td colspan="4" style="height:6px;background:#888;"></td></tr>
+        <tr><td colspan="5" style="height:6px;background:#888;"></td></tr>
         ${accRow('OB Shift LP BB',eosLpTargetDA,daLoadedVol)}
         ${accRow('DA Shift Plan',daPlan,daLoadedVol)}
         ${accRow('DA CPLH',daCplh,daActCplh,2)}
-        <tr><td colspan="4" style="height:6px;background:#888;"></td></tr>
+        <tr><td colspan="5" style="height:6px;background:#888;"></td></tr>
         ${accRow('Site CPLH',siteCplhPlan,siteActCplh,2)}
         </tbody></table>
         <div style="font-size:10px;color:#888;margin-top:6px;">Plan values are read from the Sync tab targets.</div>
