@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.64.2
+// @version      15.65.0
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -329,7 +329,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.64.2';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.65.0';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -4910,7 +4910,8 @@ function attemptLPFetch(site,resolve,isRetry){
                         }catch(e){settleTop(0,'error');}
                         if(missed)sbDumpWowLayoutOnce(urAll,ur,'Undiluted Rates by Path');
                     }).catch(()=>{settleCti(0,'error');settleTop(0,'error');});
-                    fetchLPPageAutoRate(planId,'Density',sundayStr,'Case Transfer In',(v)=>{results.ibDensityLP=v;done++;checkDone();});
+                    // (15.64.5) IB LP density = Density page 'Transfer In - Total' row (e.g. 7.35), NOT 'Case Transfer In' (8.12).
+                    fetchLPPageAutoRate(planId,'Density',sundayStr,'Transfer In - Total',(v)=>{results.ibDensityLP=v;done++;checkDone();});
                     fetchLPPageAutoRate(planId,'Density',sundayStr,'DA Bldg to Bldg Transfer TOTAL',(v)=>{results.obDensityLP=v;done++;checkDone();});
                     // BB Goals: Week Capacity (Cartons) for today's day from IB and DA
                     fetchBBGoalFromLP(planId,'IB',sundayStr,(v)=>{results.ibBBGoal=v;done++;checkDone();});
@@ -6857,8 +6858,12 @@ function buildCSS(){return `
 #sb-root.dark-mode .target-table tr.lp-row td{background:#123!important;}
 #sb-root.dark-mode .target-table tr.lp-row td:first-child,#sb-root.dark-mode .lp-val{color:#64b5f6!important;}
 /* Dept Backlog table: manual-entry inputs, one row per direction. Compact to fit the panel. */
-.dept-table th{font-size:8px;padding:2px 3px;text-align:center;}
-.dept-table td{padding:2px 3px;}
+/* (15.64.4) Dept Backlog matches the Current/Prior Day table above it: same sizes, padding and right-aligned numbers. */
+.dept-table{font-size:14px;}
+.dept-table th{font-size:13px;padding:6px 10px;}
+.dept-table td{padding:8px 10px;font-size:14px;}
+.dept-table td:first-child,.dept-table th:first-child{text-align:left;font-weight:700;}
+.dept-table td:not(:first-child),.dept-table th:not(:first-child){text-align:right;}
 .dept-input{width:52px;padding:3px 4px;background:#cfe8ff;border:1px solid #000;color:#000;border-radius:3px;font-size:11px;text-align:right;font-weight:600;}
 #sb-root.dark-mode .dept-input{background:#1e3a5f!important;color:#cfe8ff!important;border-color:#777!important;}
 /* Read-only auto-filled Dept Backlog cells (units/cases/days); same footprint as .dept-input */
@@ -7059,6 +7064,23 @@ function buildCSS2(){return `
 .eoswash-section.eos-dock-section{border:3px solid #455a64;}
 .eoswash-section.eos-dock-section h3{color:#455a64;}
 #sb-root.dark-mode .eoswash-section.eos-dock-section h3{color:#b0bec5!important;}
+/* (15.65.0) Safety PXT = pasted screenshot of the KRB3 Safety PXT tracker (very bottom of EOS Wash). */
+.eoswash-section.eos-pxt-section{border:3px solid #00838f;}
+.eoswash-section.eos-pxt-section h3{color:#00838f;}
+.eos-pxt-controls{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 14px;margin:0 0 8px;font-size:12px;}
+.eos-pxt-controls a{font-weight:700;color:#00695c;}
+.eos-pxt-hint{color:#455a64;}
+.eos-pxt-box{min-height:90px;border:2px dashed #90a4ae;border-radius:6px;padding:8px;background:#f7fafb;display:flex;align-items:center;justify-content:center;cursor:pointer;}
+.eos-pxt-box:focus,.eos-pxt-box:focus-visible{outline:3px solid #00838f;outline-offset:2px;border-color:#00838f;}
+.eos-pxt-box.eos-pxt-drag{border-color:#00838f;background:#e0f2f1;}
+.eos-pxt-box.eos-pxt-has{display:block;padding:4px;background:#fff;}
+.eos-pxt-ph{color:#546e7a;font-size:13px;font-weight:600;text-align:center;}
+.eos-pxt-actions{margin-top:8px;display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-size:12px;}
+#sb-root.dark-mode .eoswash-section.eos-pxt-section h3{color:#80deea!important;}
+#sb-root.dark-mode .eos-pxt-controls a{color:#80cbc4!important;}
+#sb-root.dark-mode .eos-pxt-hint,#sb-root.dark-mode .eos-pxt-ph{color:#b0bec5!important;}
+#sb-root.dark-mode .eos-pxt-box{background:#1e2a30!important;border-color:#607d8b!important;}
+#sb-root.dark-mode .eos-pxt-box.eos-pxt-drag{background:#12393d!important;border-color:#80deea!important;}
 /* --- Quality section: three color-coded mini-cards (Atlas=red, ICQA=teal, Piles=amber) --- */
 .eoswash-section.eos-quality-section{border-left:4px solid #0097a7;}
 .eos-quality-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;}
@@ -9417,6 +9439,267 @@ function sbEosDockApplyCacheToPending(site){
     return done;
 }
 
+// ---- (15.65.0) EOS Wash "Safety PXT" section (very bottom, below Dock & Huddles) ----
+// The KRB3 Safety PXT tracker is a SharePoint Excel workbook with one tab per month; the board can't
+// read it (Midway / SharePoint auth), so the leader pastes a screenshot: Win+Shift+S on the month's
+// tab, click the box, Ctrl+V (or drop / choose an image file). The image is downscaled to a data URL
+// and stored per site + EOS shift (the same "<Type> <start ISO>" shift key the Dock & Huddles cache
+// uses), so it belongs to that shift's wash: localStorage sb_eos_pxt_v1_<SITE>|<shift key> =
+// {d,w,h,ts}; when localStorage is full it goes to GM storage (one map, GM key sb_eos_pxt_v1).
+// Entries older than 7 days are pruned. The email capture shows only the image (link / hint /
+// buttons / placeholder hidden) and drops the whole section when nothing was pasted
+// (sbEosPxtPrepClone). Paste / Clear invalidate the pre-captured Email image.
+const SB_EOS_PXT_URL='https://amazon.sharepoint.com/:x:/r/sites/KRB3SafetyPXT/_layouts/15/doc.aspx?sourcedoc=%7Bf20d9a59-b408-412b-a082-dc96f1711b7c%7D&action=edit';
+const SB_EOS_PXT_LS_PREFIX='sb_eos_pxt_v1_';
+const SB_EOS_PXT_GM_KEY='sb_eos_pxt_v1';
+const SB_EOS_PXT_MAX_W=1600;                       // stored image width cap (px)
+const SB_EOS_PXT_JPEG_Q=0.85;
+const SB_EOS_PXT_MAX_AGE_MS=7*24*60*60*1000;       // prune stored screenshots older than 7 days
+const SB_EOS_PXT_MONTHS=['January','February','March','April','May','June','July','August','September','October','November','December'];
+// In-memory copy for when neither storage worked (still shown + emailed until the page reloads).
+var _sbEosPxtMem={key:'',rec:null};
+// Month name of the EOS shift's START date ("November"), '' if unknown.
+function sbEosPxtMonth(win){
+    try{const w=win||sbEosWindow();return SB_EOS_PXT_MONTHS[new Date(w.startDate).getMonth()]||'';}catch(e){return '';}
+}
+// "KRB3|Nights 2026-11-05" ('' when the site or shift is unknown).
+function sbEosPxtKey(site,win){
+    const S=String(site||'').toUpperCase();
+    let k='';try{k=sbEosDockShiftKey(win||sbEosWindow());}catch(e){k='';}
+    return (S&&k)?S+'|'+k:'';
+}
+function sbEosPxtGmMap(){
+    try{
+        if(typeof GM_getValue!=='function')return {};
+        const m=GM_getValue(SB_EOS_PXT_GM_KEY,null);
+        return (m&&typeof m==='object')?m:{};
+    }catch(e){return {};}
+}
+function sbEosPxtGmPut(m){
+    if(typeof GM_setValue!=='function')throw new Error('GM_setValue unavailable');
+    if(!Object.keys(m).length&&typeof GM_deleteValue==='function')GM_deleteValue(SB_EOS_PXT_GM_KEY);
+    else GM_setValue(SB_EOS_PXT_GM_KEY,m);
+}
+// Stored {d,w,h,ts} for the key (localStorage first, then GM), else null.
+function sbEosPxtLoad(key){
+    if(!key)return null;
+    try{const s=localStorage.getItem(SB_EOS_PXT_LS_PREFIX+key);if(s){const v=JSON.parse(s);if(v&&v.d)return v;}}catch(e){}
+    try{const v=sbEosPxtGmMap()[key];if(v&&v.d)return v;}catch(e){}
+    return null;
+}
+// Stores rec under key. Returns 'local' | 'gm' | '' (neither worked).
+function sbEosPxtSave(key,rec){
+    if(!key||!rec||!rec.d)return '';
+    try{sbEosPxtPrune();}catch(e){}
+    try{
+        localStorage.setItem(SB_EOS_PXT_LS_PREFIX+key,JSON.stringify(rec));
+        try{const m=sbEosPxtGmMap();if(m[key]){delete m[key];sbEosPxtGmPut(m);}}catch(e){}
+        return 'local';
+    }catch(e){console.warn('[SB-EOS] Safety PXT: localStorage save failed ('+(e&&e.name||e)+') \u2014 trying GM storage');}
+    try{
+        const m=sbEosPxtGmMap();m[key]=rec;sbEosPxtGmPut(m);
+        try{localStorage.removeItem(SB_EOS_PXT_LS_PREFIX+key);}catch(e){}
+        return 'gm';
+    }catch(e){console.warn('[SB-EOS] Safety PXT: GM storage save failed ('+(e&&e.message)+')');}
+    return '';
+}
+function sbEosPxtRemove(key){
+    if(!key)return;
+    try{localStorage.removeItem(SB_EOS_PXT_LS_PREFIX+key);}catch(e){}
+    try{const m=sbEosPxtGmMap();if(m[key]){delete m[key];sbEosPxtGmPut(m);}}catch(e){}
+    if(_sbEosPxtMem.key===key)_sbEosPxtMem={key:'',rec:null};
+}
+// Drops stored screenshots older than 7 days (or unreadable). Returns the number removed.
+function sbEosPxtPrune(nowMs){
+    const now=typeof nowMs==='number'?nowMs:Date.now();
+    const old=(v)=>!(v&&v.d&&v.ts>0)||now-v.ts>SB_EOS_PXT_MAX_AGE_MS;
+    let n=0;
+    try{
+        const drop=[];
+        for(let i=0;i<localStorage.length;i++){
+            const k=localStorage.key(i);
+            if(!k||k.indexOf(SB_EOS_PXT_LS_PREFIX)!==0)continue;
+            let v=null;try{v=JSON.parse(localStorage.getItem(k));}catch(e){v=null;}
+            if(old(v))drop.push(k);
+        }
+        drop.forEach(k=>{try{localStorage.removeItem(k);n++;}catch(e){}});
+    }catch(e){}
+    try{
+        const m=sbEosPxtGmMap();let ch=false;
+        Object.keys(m).forEach(k=>{if(old(m[k])){delete m[k];ch=true;n++;}});
+        if(ch)sbEosPxtGmPut(m);
+    }catch(e){}
+    return n;
+}
+// Draws a loaded <img> onto a white canvas at most maxW px wide (aspect kept) and returns the
+// smaller of JPEG (q 0.85) and PNG: {d,w,h,type}.
+function sbEosPxtDownscale(img,maxW){
+    const nw=img.naturalWidth||img.width, nh=img.naturalHeight||img.height;
+    if(!(nw>0&&nh>0))throw new Error('empty image');
+    const M=maxW>0?maxW:SB_EOS_PXT_MAX_W;
+    const sc=nw>M?M/nw:1;
+    const w=Math.max(1,Math.round(nw*sc)), h=Math.max(1,Math.round(nh*sc));
+    const c=document.createElement('canvas');c.width=w;c.height=h;
+    const g=c.getContext('2d');
+    g.fillStyle='#ffffff';g.fillRect(0,0,w,h);
+    g.imageSmoothingEnabled=true;g.imageSmoothingQuality='high';
+    g.drawImage(img,0,0,w,h);
+    const jpg=c.toDataURL('image/jpeg',SB_EOS_PXT_JPEG_Q), png=c.toDataURL('image/png');
+    const usePng=png.length<=jpg.length;
+    return {d:usePng?png:jpg,w:w,h:h,type:usePng?'image/png':'image/jpeg'};
+}
+// File / Blob -> Promise<{d,w,h,type,ts}> (read as a data URL, decoded, downscaled).
+function sbEosPxtFileToRecord(file){
+    return new Promise((resolve,reject)=>{
+        try{
+            const fr=new FileReader();
+            fr.onerror=()=>reject(new Error('could not read the image'));
+            fr.onload=()=>{
+                const img=new Image();
+                img.onload=()=>{try{const r=sbEosPxtDownscale(img);r.ts=Date.now();resolve(r);}catch(e){reject(e);}};
+                img.onerror=()=>reject(new Error('not a readable image'));
+                img.src=String(fr.result||'');
+            };
+            fr.readAsDataURL(file);
+        }catch(e){reject(e);}
+    });
+}
+// The first image File in a DataTransfer. pasteOnly: PNG / JPEG only (the clipboard); else any image/*.
+function sbEosPxtPickFile(dt,pasteOnly){
+    if(!dt)return null;
+    const ok=(t)=>pasteOnly?/^image\/(png|jpeg)$/i.test(t||''):/^image\//i.test(t||'');
+    try{
+        const items=dt.items?Array.from(dt.items):[];
+        for(const it of items){if(it&&it.kind==='file'&&ok(it.type)){const f=it.getAsFile();if(f)return f;}}
+    }catch(e){}
+    try{
+        const files=dt.files?Array.from(dt.files):[];
+        for(const f of files){if(f&&ok(f.type))return f;}
+    }catch(e){}
+    return null;
+}
+function sbEosPxtSectionHTML(win){
+    const m=sbEosPxtMonth(win)||'current month';
+    return `<section class="eoswash-section eos-pxt-section" id="eos-pxt-section">
+        <h3>Safety PXT</h3>
+        <div class="eos-pxt-controls">
+          <a id="eos-pxt-link" href="${SB_EOS_PXT_URL}" target="_blank" rel="noopener">Open Safety PXT tracker</a>
+          <span class="eos-pxt-hint" id="eos-pxt-hint">Open the ${m} tab, press Win+Shift+S, then click the box below and press Ctrl+V.</span>
+        </div>
+        <div id="eos-pxt-box" class="eos-pxt-box" tabindex="0" role="button" aria-label="Paste Safety PXT screenshot" aria-describedby="eos-pxt-hint">
+          <span class="eos-pxt-ph" id="eos-pxt-ph">Click here, then press Ctrl+V to paste the screenshot</span>
+          <img id="eos-pxt-img" alt="Safety PXT screenshot" style="display:none;max-width:100%;height:auto;">
+        </div>
+        <div class="eos-pxt-actions">
+          <button type="button" id="eos-pxt-choose" class="btn btn-small">Choose image\u2026</button>
+          <input type="file" id="eos-pxt-file" accept="image/*" tabindex="-1" aria-hidden="true" style="display:none;">
+          <button type="button" id="eos-pxt-clear" class="btn btn-small" style="background:#c62828;color:#fff;border-color:#c62828;">Clear</button>
+          <span id="eos-pxt-status" role="status" aria-live="polite"></span>
+        </div>
+    </section>`;
+}
+// Shows rec ({d,...}) in the live box, or the empty placeholder when rec is null.
+function sbEosPxtShow(rec){
+    const box=document.getElementById('eos-pxt-box'), img=document.getElementById('eos-pxt-img');
+    const ph=document.getElementById('eos-pxt-ph'), clr=document.getElementById('eos-pxt-clear');
+    if(!box||!img)return;
+    const has=!!(rec&&rec.d);
+    if(has){img.src=rec.d;img.style.display='block';}
+    else{img.removeAttribute('src');img.style.display='none';}
+    if(ph)ph.style.display=has?'none':'';
+    box.classList.toggle('eos-pxt-has',has);
+    box.setAttribute('aria-label',has?'Safety PXT screenshot pasted. Press Ctrl+V to replace it':'Paste Safety PXT screenshot');
+    if(clr)clr.disabled=!has;
+}
+function sbEosPxtStatus(msg){const s=document.getElementById('eos-pxt-status');if(s)s.textContent=msg||'';}
+// Downscale + store + show a pasted / dropped / chosen image for `key`. Resolves 'local'|'gm'|''|'error'.
+function sbEosPxtAccept(file,key){
+    sbEosPxtStatus('Adding screenshot\u2026');
+    return sbEosPxtFileToRecord(file).then(rec=>{
+        const where=sbEosPxtSave(key,rec);
+        _sbEosPxtMem=where?{key:'',rec:null}:{key:key,rec:rec};
+        if(!where)sbEosEmailToast('The Safety PXT screenshot couldn\u2019t be saved (browser storage is full). It is shown and goes in the email, but is lost if the page reloads.','warn');
+        const box=document.getElementById('eos-pxt-box');
+        if(box&&box.getAttribute('data-pxt-key')===key){
+            sbEosPxtShow(rec);
+            sbEosPxtStatus('Screenshot added ('+rec.w+'\u00d7'+rec.h+').');
+        }
+        if(typeof sbEosPrecaptureSchedule==='function')sbEosPrecaptureSchedule();   // the email image changed
+        dbg('[SB-EOS] Safety PXT screenshot stored ('+(where||'memory only')+', '+(rec.d.length/1024).toFixed(0)+' KB) for '+key);
+        return where;
+    }).catch(e=>{
+        console.warn('[SB-EOS] Safety PXT image failed: '+(e&&e.message));
+        sbEosPxtStatus('');
+        sbEosEmailToast('Couldn\u2019t add that image ('+(e&&e.message)+'). Try Win+Shift+S again, or Choose image\u2026','warn');
+        return 'error';
+    });
+}
+// Restores the site + EOS shift's screenshot into the freshly rendered section and wires
+// paste / drag-and-drop / Choose image / Clear. KRB3-only (sbEosEnabled). Never throws.
+function sbEosPxtWire(){
+    try{
+        if(!sbEosEnabled())return;
+        const box=document.getElementById('eos-pxt-box');if(!box)return;
+        const key=sbEosPxtKey((loadConfig()||{}).site,sbEosWindow());
+        box.setAttribute('data-pxt-key',key);
+        try{sbEosPxtPrune();}catch(e){}
+        sbEosPxtShow(sbEosPxtLoad(key)||(_sbEosPxtMem.key===key?_sbEosPxtMem.rec:null));
+        box.addEventListener('paste',(e)=>{
+            e.preventDefault();
+            const f=sbEosPxtPickFile(e.clipboardData,true);
+            if(!f){sbEosPxtStatus('No screenshot on the clipboard \u2014 press Win+Shift+S first, then Ctrl+V here.');return;}
+            sbEosPxtAccept(f,key);
+        });
+        box.addEventListener('keydown',(e)=>{
+            if(e.key==='Enter'||e.key===' '){e.preventDefault();sbEosPxtStatus('Press Ctrl+V to paste the screenshot, or use Choose image\u2026');}
+        });
+        const hasFiles=(e)=>{try{return Array.from((e.dataTransfer&&e.dataTransfer.types)||[]).indexOf('Files')>=0;}catch(_){return false;}};
+        ['dragenter','dragover'].forEach(t=>box.addEventListener(t,(e)=>{if(!hasFiles(e))return;e.preventDefault();box.classList.add('eos-pxt-drag');}));
+        box.addEventListener('dragleave',()=>box.classList.remove('eos-pxt-drag'));
+        box.addEventListener('drop',(e)=>{
+            e.preventDefault();box.classList.remove('eos-pxt-drag');
+            const f=sbEosPxtPickFile(e.dataTransfer,false);
+            if(!f){sbEosPxtStatus('That isn\u2019t an image file.');return;}
+            sbEosPxtAccept(f,key);
+        });
+        const fileIn=document.getElementById('eos-pxt-file'), choose=document.getElementById('eos-pxt-choose');
+        if(choose&&fileIn)choose.addEventListener('click',()=>fileIn.click());
+        if(fileIn)fileIn.addEventListener('change',()=>{
+            const f=fileIn.files&&fileIn.files[0];
+            if(f&&/^image\//i.test(f.type||''))sbEosPxtAccept(f,key);
+            else if(f)sbEosPxtStatus('That isn\u2019t an image file.');
+            fileIn.value='';
+        });
+        const clr=document.getElementById('eos-pxt-clear');
+        if(clr)clr.addEventListener('click',()=>{
+            if(!confirm('Clear the Safety PXT screenshot for this shift?'))return;
+            sbEosPxtRemove(key);
+            sbEosPxtShow(null);
+            sbEosPxtStatus('Screenshot cleared.');
+            if(typeof sbEosPrecaptureSchedule==='function')sbEosPrecaptureSchedule();
+        });
+    }catch(e){console.warn('[SB-EOS] Safety PXT wire failed: '+(e&&e.message));}
+}
+// Capture clone only (EOS email + Snip): no screenshot -> the whole section is removed; otherwise
+// only the image shows (link, hint, buttons, placeholder, file input and the dashed box hidden).
+function sbEosPxtPrepClone(cloneRoot){
+    try{
+        if(!cloneRoot)return;
+        const sec=cloneRoot.querySelector('#eos-pxt-section');if(!sec)return;
+        const img=sec.querySelector('#eos-pxt-img');
+        const src=img?String(img.getAttribute('src')||''):'';
+        if(!img||!src||img.style.display==='none'){if(sec.parentNode)sec.parentNode.removeChild(sec);return;}
+        sec.querySelectorAll('.eos-pxt-controls,#eos-pxt-link,#eos-pxt-hint,.eos-pxt-actions,.eos-pxt-ph,#eos-pxt-file,#eos-pxt-choose,#eos-pxt-clear,#eos-pxt-status')
+            .forEach(el=>el.style.setProperty('display','none','important'));
+        const box=sec.querySelector('#eos-pxt-box');
+        if(box)[['display','block'],['border','0'],['outline','0'],['padding','0'],['min-height','0'],['background','transparent']]
+            .forEach(([p,v])=>box.style.setProperty(p,v,'important'));
+        img.style.setProperty('display','block','important');
+        img.style.setProperty('max-width','100%','important');
+        img.style.setProperty('height','auto','important');
+    }catch(e){console.warn('[SB-EOS] Safety PXT capture prep failed: '+(e&&e.message));}
+}
+
 // (15.47.0) EOS Wash Atlas Breakdown: THRESHOLD and DPMO are READ-ONLY copies of the Sync ICQA
 // ATLAS cells (atlas-*-threshold / atlas-*-value). Both panels share the same #sb-root DOM, so we
 // read those cells directly. Called by renderEOSWash and after every renderAtlasMetrics (Get Data /
@@ -10106,26 +10389,30 @@ function renderEOSWash(data){
     const accRow=(label,plan,act,dec=0,pctHigh=true)=>{
         const varc=(plan&&act)?((pctHigh?act/plan:plan/act)*100):0;
         // (15.64.2) Delta = Actual - Plan (same decimals as the row). + = above plan (green), - = below (red).
-        let deltaCell='\u2014';
+        let deltaCell='\u2014',below=false;
         if(plan&&act){
             const dv=Math.round((act-plan)*Math.pow(10,dec))/Math.pow(10,dec);
             const good=pctHigh?dv>0:dv<0;
             const col=dv===0?'inherit':(good?'#2e7d32':'#c62828');
             deltaCell=`<span style="color:${col};font-weight:700;">${dv>0?'+':dv<0?'\u2212':''}${fv(Math.abs(dv),dec)}</span>`;
+            below=dv<0;
         }
-        return `<tr><td>${label}</td><td>${plan?fv(plan,dec):'\u2014'}</td><td>${act?fv(act,dec):'\u2014'}</td><td>${deltaCell}</td><td style="${bg(varc)}">${varc>0?varc.toFixed(1)+'%':'\u2014'}</td></tr>`;
+        // (15.64.3) Bridge box only when Delta is negative (below plan). Reuses the standard Bridge
+        // textarea (eos-bridge-ta: saved by id, auto-grow, flattened in the email capture).
+        const bridgeCell=below?bridge('acc-'+slug(label)):'<td></td>';
+        return `<tr><td>${label}</td><td>${plan?fv(plan,dec):'\u2014'}</td><td>${act?fv(act,dec):'\u2014'}</td><td>${deltaCell}</td><td style="${bg(varc)}">${varc>0?varc.toFixed(1)+'%':'\u2014'}</td>${bridgeCell}</tr>`;
     };
     const accuracyHTML=`<section class="eoswash-section">
         <h3>Shift Accuracy</h3>
-        <table class="metrics-table eos-accuracy-table"><thead><tr><th>Metric</th><th>Plan</th><th>Actual</th><th>Delta</th><th>% to Plan</th></tr></thead><tbody>
+        <table class="metrics-table eos-accuracy-table"><thead><tr><th>Metric</th><th>Plan</th><th>Actual</th><th>Delta</th><th>% to Plan</th><th style="min-width:220px;">Bridge</th></tr></thead><tbody>
         ${accRow('IB Shift LP BB',eosLpTargetIB,ibActVol)}
         ${accRow('IB Shift Plan',ibPlan,ibActVol)}
         ${accRow('IB CPLH',ibCplh,ibActCplhSync,2)}
-        <tr><td colspan="5" style="height:6px;background:#888;"></td></tr>
+        <tr><td colspan="6" style="height:6px;background:#888;"></td></tr>
         ${accRow('OB Shift LP BB',eosLpTargetDA,daLoadedVol)}
         ${accRow('DA Shift Plan',daPlan,daLoadedVol)}
         ${accRow('DA CPLH',daCplh,daActCplh,2)}
-        <tr><td colspan="5" style="height:6px;background:#888;"></td></tr>
+        <tr><td colspan="6" style="height:6px;background:#888;"></td></tr>
         ${accRow('Site CPLH',siteCplhPlan,siteActCplh,2)}
         </tbody></table>
         <div style="font-size:10px;color:#888;margin-top:6px;">Plan values are read from the Sync tab targets.</div>
@@ -10250,7 +10537,11 @@ function renderEOSWash(data){
         </tbody></table>
     </section>`;
 
-    content.innerHTML=highlightsHTML+accuracyHTML+processHTML+backlogHTML+qualityHTML+safetyHTML+dockHTML;
+    // (15.65.0) Safety PXT (pasted tracker screenshot), the very last section. See sbEosPxtWire.
+    const pxtHTML=sbEosPxtSectionHTML(sbEosWindow());
+
+    content.innerHTML=highlightsHTML+accuracyHTML+processHTML+backlogHTML+qualityHTML+safetyHTML+dockHTML+pxtHTML;
+    sbEosPxtWire();   // restore this site + shift's screenshot, wire paste / drop / file / Clear
 
     // Wire the Safety "+ Add Row" button (adds one more leader row, persists the new count).
     { const addBtn=document.getElementById('eos-safety-add'); if(addBtn)addBtn.addEventListener('click',addEosSafetyRow);
@@ -10540,6 +10831,8 @@ function sbFlattenControlsForCapture(capMap,cloneRoot,opts){
         const sp=it.firstElementChild;
         if(sp&&sp.tagName==='SPAN')sp.style.width='100%';
     });
+    // (15.65.0) Safety PXT: only the pasted image (the Snip goes through here too).
+    if(typeof sbEosPxtPrepClone==='function')sbEosPxtPrepClone(cloneRoot);
 }
 
 // (15.53.3) EOS email image was clipped: the left-column labels lost their first characters and
@@ -11084,6 +11377,8 @@ function sbEosCaptureCanvas(content,opts){
                 catch(e){console.warn('[SB-EOS] capture flatten failed:',e);}
                 try{sbEosLightenClone(cr);}
                 catch(e){console.warn('[SB-EOS] capture light palette failed:',e);}
+                // (15.65.0) Safety PXT: image only, or no section at all when nothing was pasted.
+                sbEosPxtPrepClone(cr);
                 if(opts&&opts.labels){
                     try{
                         [['.eos-ib-section','Inbound EOS'],['.eos-da-section','Outbound EOS']].forEach(([sel,txt])=>{
