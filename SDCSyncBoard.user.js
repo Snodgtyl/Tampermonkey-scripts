@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDC Sync Board
 // @namespace    https://fclm-portal.amazon.com
-// @version      15.65.0
+// @version      15.66.2
 // @description  Full shift sync board dashboard on FCLM - IB/OB/Sort metrics, CPLH, Support Teams
 // @author       snodgtyl
 // @updateURL    https://raw.githubusercontent.com/Snodgtyl/Tampermonkey-scripts/main/SDCSyncBoard.user.js
@@ -329,7 +329,7 @@ const FASTSTART_LOG_KEY='syncboard_fastStartLog_v1';
 // as the SOS / Fast Start posts (no Google, no third-party storage — Amazon-friendly). The URL is
 // baked in as the DEFAULT so tracking runs for every user with no Settings step; a Settings field
 // remains an optional per-browser override. Blank = tracking disabled. ---
-const SB_VERSION='15.65.0';   // keep in sync with the @version header; recorded on each usage ping
+const SB_VERSION='15.66.2';   // keep in sync with the @version header; recorded on each usage ping
 const METRICS_URL_KEY='syncboard_metrics_url';
 // Usage Slack webhook, lightly obfuscated (base64 of the trigger path, reassembled at runtime) so
 // it isn't a plainly-greppable URL in the shared file — NOT security, just out of plain sight.
@@ -4612,6 +4612,174 @@ function ensureDay(off){
         else if(status)status.textContent='\u26A0 Fetch failed \u2014 try Get Data first';
     });
 }
+// ---- (15.66.0) Current Day "Expected" = FOLLOW THE SHIFTS ----
+// Before 15.66.0 Expected was Plan x (fraction of the calendar day elapsed), so at 03:00 IB showed
+// ~13% of the 24hr plan even though the floor only works production periods. Now Expected is the
+// share of each SHIFT's plan whose PRODUCTION time (P1-P3, breaks excluded) has already run, counted
+// only inside the report day (00:00-24:00 local). Shifts overlapping the day: last night (its
+// after-midnight part), today's Days, tonight (its before-midnight part).
+//   expected_s = shiftPlan_s x (production min of shift s elapsed AND inside the day) / (total
+//                production min of shift s); not started -> 0. Expected = sum per dept.
+// shiftPlan_s sources, in order: (1) ALPS daily view "Day/Night Combined Cartons > Volume > Capacity"
+// for that shift's start date (same cartons basis as the GalaxyBI 24hr BB "Week Capacity (Cartons)"
+// plan); (2) the Sync tab's IB/OB LP SHIFT PLAN input, only for the occurrence the Sync tab is set
+// to; (3) fallback = that shift's share of the 24hr plan by production minutes inside the day
+// (24hr Plan x elapsed-in-day min / total in-day production min of all shifts), with a dbg warning.
+// Effective schedule for ONE occurrence of `type` ('Days'|'Nights') starting on `startDay`: Settings
+// override (site+shift) -> AVP8-style SITE_SHIFT_OVERRIDES by the night's START weekday ->
+// SITE_SCHEDULES -> `fallback` ({days,nights}, e.g. loadConfig()) for a site not in SITE_SCHEDULES.
+function sbSchedForOccurrence(site,type,startDay,fallback){
+    const s=SITE_SCHEDULES[site], u=sbLoadSchedOverride(site);
+    if(type==='Days')return u.days||(s&&s.days)||(fallback&&fallback.days)||null;
+    if(u.nights)return u.nights;
+    const ov=sbNightsOverride(site,startDay);
+    if(ov)return ov.sched;
+    return (s&&s.nights)||(fallback&&fallback.nights)||null;
+}
+// Production periods (P1-P3) of an occurrence from sbShiftOccurrence as absolute [s,e) ms. Period
+// times are placed relative to the full-window start (so windows crossing midnight work) and built
+// with setDate/setHours from local noon (DST-safe). An end of 00:00 offset = end of the window day.
+function sbShiftProdIntervals(occ){
+    const sc=occ&&occ.sched;if(!sc||!sc.full)return[];
+    const fs=sc.full.sh*60+sc.full.sm;
+    const base=new Date(occ.start);base.setHours(12,0,0,0);
+    const at=(t)=>{const d=new Date(base);d.setDate(d.getDate()+Math.floor(t/1440));const m=t%1440;d.setHours(Math.floor(m/60),m%60,0,0);return d.getTime();};
+    const off=(h,m)=>((h*60+m)-fs+1440)%1440;
+    const out=[];
+    ['p1','p2','p3'].forEach(k=>{
+        const p=sc[k];if(!p)return;
+        const ps=off(p.sh,p.sm);let pe=off(p.eh,p.em);if(pe===0)pe=1440;
+        if(pe>ps)out.push({name:k.toUpperCase(),s:at(fs+ps),e:at(fs+pe)});
+    });
+    return out;
+}
+// The three shift occurrences overlapping the report day `reportDay` (any time on that local date):
+// [{key:'prevNight'|'day'|'tonight', type, label, startDay(Date noon), dateISO, start, end, sched, intervals}].
+function sbReportDayShifts(site,reportDay,fallback){
+    const d0=new Date(reportDay);d0.setHours(12,0,0,0);
+    const dPrev=new Date(d0);dPrev.setDate(dPrev.getDate()-1);
+    const md=(d)=>(d.getMonth()+1)+'/'+d.getDate();
+    const mk=(key,type,day,label)=>{
+        const sched=sbSchedForOccurrence(site,type,day,fallback);
+        if(!sched||!sched.full)return null;
+        const o=sbShiftOccurrence(sched,type,day);
+        o.key=key;o.label=label+' '+md(day);o.startDay=new Date(day);o.dateISO=isoDate(day);
+        o.intervals=sbShiftProdIntervals(o);
+        return o;
+    };
+    return[mk('prevNight','Nights',dPrev,'Prev night'),mk('day','Days',d0,'Day'),mk('tonight','Nights',d0,'Tonight')].filter(Boolean);
+}
+// Pure Expected calc for ONE dept. opts: {dept, plan24, shifts (sbReportDayShifts), shiftPlans
+// ({prevNight,day,tonight} -> number|null), planSrc ({key:'ALPS'|'LP input'}), reportDay, now}.
+// Returns {expected, parts:[{key,label,plan,src,elapsedMin,inDayMin,totalMin,exp}], fallback, title}.
+function sbExpectedFollowShifts(opts){
+    const o=opts||{}, plan24=Number(o.plan24)||0, sp=o.shiftPlans||{}, src=o.planSrc||{};
+    const ds=new Date(o.reportDay);ds.setHours(0,0,0,0);
+    const de=new Date(ds);de.setDate(de.getDate()+1);de.setHours(0,0,0,0);
+    const nowMs=(o.now instanceof Date?o.now:new Date()).getTime();
+    const dsMs=ds.getTime(), deMs=de.getTime(), cut=Math.min(Math.max(nowMs,dsMs),deMs);
+    const ovl=(a,b,c,e)=>Math.max(0,Math.min(b,e)-Math.max(a,c))/60000;
+    const rows=(o.shifts||[]).map(s=>{
+        let totalMin=0,inDayMin=0,elapsedMin=0;
+        (s.intervals||[]).forEach(iv=>{totalMin+=(iv.e-iv.s)/60000;inDayMin+=ovl(iv.s,iv.e,dsMs,deMs);elapsedMin+=ovl(iv.s,iv.e,dsMs,cut);});
+        return{key:s.key,label:s.label,totalMin,inDayMin,elapsedMin};
+    }).filter(r=>r.inDayMin>0);
+    const sumInDay=rows.reduce((t,r)=>t+r.inDayMin,0);
+    let expected=0,fallback=false;
+    const fmtN=(v)=>Math.round(v).toLocaleString();
+    const parts=rows.map(r=>{
+        const real=Number(sp[r.key])||0;
+        let plan,exp,srcName,pct;
+        if(real>0&&r.totalMin>0){
+            plan=real;srcName=src[r.key]||'ALPS';
+            exp=plan*r.elapsedMin/r.totalMin;pct=r.elapsedMin/r.totalMin;
+        }else{
+            fallback=true;srcName='24hr share';
+            plan=sumInDay>0?plan24*r.inDayMin/sumInDay:0;
+            exp=sumInDay>0?plan24*r.elapsedMin/sumInDay:0;
+            pct=r.inDayMin>0?r.elapsedMin/r.inDayMin:0;
+        }
+        expected+=exp;
+        const txt=r.elapsedMin<=0?r.label+': not started'
+            :r.label+': '+Math.round(pct*100)+'% of '+fmtN(plan)+(srcName==='ALPS'?'':' ('+srcName+')')+' = '+fmtN(exp);
+        dbg('[SB-EXPECTED] dept='+(o.dept||'?')+' shift='+r.key+'('+r.label+') plan='+Math.round(plan)+' src='+srcName+' elapsedMin='+Math.round(r.elapsedMin)+' totalMin='+Math.round(r.totalMin)+' inDayMin='+Math.round(r.inDayMin)+' part='+Math.round(exp));
+        return{key:r.key,label:r.label,plan,src:srcName,elapsedMin:r.elapsedMin,inDayMin:r.inDayMin,totalMin:r.totalMin,exp,txt};
+    });
+    if(fallback)dbg('[SB-EXPECTED] WARNING dept='+(o.dept||'?')+' per-shift plan missing for '+parts.filter(p=>p.src==='24hr share').map(p=>p.key).join(',')+' \u2014 using that shift\'s production-minute share of the 24hr plan ('+Math.round(plan24)+')');
+    const title=parts.map(p=>p.txt).join(' \u00B7 ')+(parts.length?' \u2192 Expected '+fmtN(expected):'');
+    return{expected,parts,fallback,title};
+}
+// Real per-shift plans from ALPS: ONE getPlanSelectionData call per selection spanning prevISO..
+// dayISO; reads "Night Combined Cartons" for prevISO (last night) and "Day"/"Night Combined Cartons"
+// for dayISO. withUserOverrides=false = the request the ALPS Daily View UI issues (same as the Days
+// of Backlog path). Exact Volume>Capacity row first (sbAlpsBacklogCapacityRow), else
+// findAlpsSectionCapacity. Resolves {prevNight,day,tonight} (number|null). Never rejects. One hidden-
+// iframe session refresh + retry on an auth failure.
+function fetchAlpsShiftPlans(site,selection,prevISO,dayISO){
+    const empty=()=>({prevNight:null,day:null,tonight:null});
+    return new Promise(resolve=>{
+        const S=String(site||'').toUpperCase();
+        if(!S||!selection){resolve(empty());return;}
+        const pick=(data,dn,iso)=>{
+            const r=sbAlpsBacklogCapacityRow(data,dn+' Combined Cartons');
+            let v=r.row?sbAlpsCapForDate(r.row,iso):null;
+            if(v==null){try{v=findAlpsSectionCapacity(data,dn,iso);}catch(e){v=null;}}
+            return(v!=null&&v>0)?v:null;
+        };
+        const liveFallback=()=>new Promise(res=>{
+            try{GM_xmlhttpRequest({method:'GET',url:'https://alps-iad.iad.proxy.amazon.com/api/site/'+S+'/latest-completed-plan-by-tag?tagName=Live&siteType=FULFILLMENT_CENTER&polling=true',headers:{'Accept':'application/json'},timeout:30000,
+                onload:function(r){let id=null;try{id=JSON.parse(r.responseText).planId;}catch(e){}res(id||null);},onerror:function(){res(null);},ontimeout:function(){res(null);}});}catch(e){res(null);}
+        });
+        const withTimeout=(p,ms)=>new Promise(res=>{const t=setTimeout(()=>res(null),ms);Promise.resolve(p).then(v=>{clearTimeout(t);res(v);},()=>{clearTimeout(t);res(null);});});
+        const attempt=(isRetry)=>{
+            const fail=(reason)=>{
+                if(!isRetry){console.warn('[SB-EXPECTED] ALPS shift plans '+selection+' '+reason+' \u2014 refreshing ALPS session and retrying once');sbAlpsRefreshSession(S,()=>attempt(true));return;}
+                console.warn('[SB-EXPECTED] ALPS shift plans '+selection+' FINAL FAIL: '+reason);resolve(empty());
+            };
+            withTimeout(resolveAlpsS1PlanId(S),45000).then(s1=>s1||liveFallback()).then(planId=>{
+                if(!planId){fail('planId missing');return;}
+                const url='https://alps-iad.iad.proxy.amazon.com/api/report/FULFILLMENT_CENTER/'+S+'/getPlanSelectionData?view=dailyView&selection='+encodeURIComponent(selection)+'&planId='+encodeURIComponent(planId)+'&withUserOverrides=false&startDate='+prevISO+'&endDate='+dayISO;
+                GM_xmlhttpRequest({method:'GET',url:url,headers:{'Accept':'application/json'},timeout:30000,
+                    onload:function(resp){
+                        const status=(resp&&resp.status)||0, txt=String((resp&&resp.responseText)||'');
+                        if(status===401||status===403||/^\s*</.test(txt)){fail('auth failure (HTTP '+status+')');return;}
+                        let data=null;try{data=JSON.parse(txt);}catch(e){fail('unparseable response (HTTP '+status+')');return;}
+                        const out={prevNight:pick(data,'Night',prevISO),day:pick(data,'Day',dayISO),tonight:pick(data,'Night',dayISO)};
+                        dbg('[SB-EXPECTED] ALPS shift plans '+selection+' planId='+planId+' '+JSON.stringify(out)+' (prev='+prevISO+' day='+dayISO+')');
+                        resolve(out);
+                    },
+                    onerror:function(){fail('fetch error');},ontimeout:function(){fail('fetch timeout');}
+                });
+            }).catch(e=>{console.warn('[SB-EXPECTED] ALPS shift plans '+selection+' error: '+(e&&e.message));resolve(empty());});
+        };
+        attempt(false);
+    });
+}
+// Per-report-day cache of the ALPS shift plans {IB:{...},DA:{...}}. Fetched once per site+day (a
+// result with no values may be retried after 10 min); renderDayView re-renders the Current Day when
+// it lands. Until then (or if ALPS fails) the Expected uses the fallbacks above.
+const sbShiftPlanState={key:null,loading:false,plans:null,at:0};
+function ensureSbShiftPlans(site,reportDay,onReady){
+    const d0=new Date(reportDay);d0.setHours(12,0,0,0);
+    const dPrev=new Date(d0);dPrev.setDate(dPrev.getDate()-1);
+    const key=site+'|'+isoDate(d0);
+    const st=sbShiftPlanState;
+    if(st.key===key){
+        if(st.loading)return null;
+        const any=st.plans&&['IB','DA'].some(k=>['prevNight','day','tonight'].some(s=>st.plans[k]&&st.plans[k][s]!=null));
+        if(st.plans&&(any||Date.now()-st.at<600000))return st.plans;
+    }
+    st.key=key;st.loading=true;st.plans=null;
+    Promise.all([fetchAlpsShiftPlans(site,'inbound-joint',isoDate(dPrev),isoDate(d0)),fetchAlpsShiftPlans(site,'daOBDA-transferOut',isoDate(dPrev),isoDate(d0))]).then(([ib,da])=>{
+        if(st.key!==key)return;
+        st.loading=false;st.plans={IB:ib,DA:da};st.at=Date.now();
+        try{if(onReady)onReady();}catch(e){console.warn('[SB-EXPECTED] re-render error: '+e.message);}
+    });
+    return null;
+}
+// Validates ALPS per-shift plans against the dept's 24hr plan: a single shift's carton plan must be
+// > 0 and not above the whole day's plan (guards the units-vs-cartons gotcha). Bad -> null.
+function sbSaneShiftPlan(v,plan24){const n=Number(v)||0;if(!(n>0))return null;if(plan24>0&&n>plan24*1.05)return null;return n;}
 // Render a Plan/Actual/Variance day view. prefix 'cd' (current) or 'pd' (prior). Plan = cached LP
 // (single daily plan); Actual = the day's produced data; Variance = (Actual-Plan)/Plan %.
 function renderDayView(off,d){
@@ -4644,21 +4812,46 @@ function renderDayView(off,d){
     const obBB=(off===1&&priorBBGoals.ob>0)?priorBBGoals.ob:(parseFloat(lp.obBBGoal)||0);
     // VRET plan is day-of-week keyed like the BB goals: prior day uses yesterday's fetched value.
     const vretGoal=(off===1&&priorBBGoals.vret>0)?priorBBGoals.vret:(parseFloat(lp.vretGoal)||0);
-    // Day-elapsed fraction for the Expected (linear ramp) calc. Current day (off 0) = clock hours
-    // into the calendar day / 24; prior day (off 1) = full day (1.0). Expected = Plan * fraction.
+    // (15.66.0) Expected. Prior day (off 1) = the day is complete, Expected = Plan (unchanged).
+    // Current day (off 0) = FOLLOW THE SHIFTS (sbExpectedFollowShifts): each overlapping shift's
+    // plan x its elapsed production minutes inside the day / its total production minutes.
     const now=new Date();
-    const dayFrac=(off===1)?1:Math.min(1,Math.max(0,(now.getHours()*60+now.getMinutes())/1440));
+    const expInfo={};   // dept -> {expected,title}
+    if(off===0){
+        const cfg=loadConfig(), site=cfg.site;
+        const m=/^(\d{4})\/(\d{2})\/(\d{2})$/.exec(String(d.dateStr||''));
+        const reportDay=m?new Date(+m[1],+m[2]-1,+m[3],12,0,0,0):new Date(now);
+        const shifts=sbReportDayShifts(site,reportDay,cfg);
+        const alps=ensureSbShiftPlans(site,reportDay,()=>{if(dayData[0]&&document.getElementById('spt-current-view')?.style.display!=='none')renderDayView(0,dayData[0]);});
+        // The Sync tab's IB/OB LP SHIFT PLAN inputs belong to the shift the Sync tab is set to.
+        let syncKey=null;
+        try{const sd=getShiftDates(cfg).startDate;const hit=shifts.find(s=>s.type===cfg.shiftType&&s.dateISO===isoDate(sd));syncKey=hit?hit.key:null;}catch(e){}
+        const inputVal=(id)=>parseFloat(document.getElementById(id)?.value)||0;
+        [['IB',ibBB,'ib-lp-plan-vol'],['DA',obBB,'ob-lp-plan-vol']].forEach(([dept,plan24,inId])=>{
+            const sp={},src={};
+            ['prevNight','day','tonight'].forEach(k=>{
+                const a=sbSaneShiftPlan(alps&&alps[dept]&&alps[dept][k],plan24);
+                if(a){sp[k]=a;src[k]='ALPS';return;}
+                if(k===syncKey){const v=sbSaneShiftPlan(inputVal(inId),plan24);if(v){sp[k]=v;src[k]='LP SHIFT PLAN input';}}
+            });
+            expInfo[dept]=plan24>0?sbExpectedFollowShifts({dept,plan24,shifts,shiftPlans:sp,planSrc:src,reportDay,now}):{expected:0,title:''};
+        });
+        if(alps==null)dbg('[SB-EXPECTED] ALPS shift plans not loaded yet \u2014 rendering with fallbacks; will re-render when they land');
+    }
     // BB-row setter: fills Plan | Actual | Expected | Status | % to Goal | Variance for the 3 BB
-    // rows. Expected = plan*dayFrac; Status = RISK if actual<expected else On Track; % to Goal =
-    // actual/expected; Variance = actual-expected (per the user's reference).
-    const setBBRow=(base,plan,act)=>{
+    // rows. Expected = `ex.expected` (current day) or plan (prior day); Status = RISK if
+    // actual<expected else On Track; % to Goal = actual/expected; Variance = actual-expected.
+    const setBBRow=(base,plan,act,ex)=>{
         const g=(s)=>document.getElementById(prefix+'-'+base+'-'+s);
         const planEl=g('plan'),actEl=g('act'),expEl=g('exp'),stEl=g('status'),pctEl=g('pct'),varEl=g('var');
         const p=Number(plan)||0,a=Number(act)||0;
         if(planEl)planEl.textContent=fmtNum(plan,null);
         if(actEl)actEl.textContent=fmtNum(act,null);
-        const exp=p>0?p*dayFrac:0;
-        if(expEl)expEl.textContent=exp>0?Math.round(exp).toLocaleString():'\u2014';
+        const exp=p>0?(off===1?p:Math.max(0,Number(ex&&ex.expected)||0)):0;
+        if(expEl){
+            expEl.textContent=exp>0?Math.round(exp).toLocaleString():(p>0&&off===0?'0':'\u2014');
+            expEl.title=p>0?(off===1?'Prior day complete: Expected = Plan':((ex&&ex.title)||'')):'';
+        }
         if(p<=0){ // no plan -> blank the comparison cells
             if(stEl){stEl.textContent='\u2014';stEl.style.color='';}
             if(pctEl){pctEl.textContent='\u2014';pctEl.style.color='';}
@@ -4670,14 +4863,16 @@ function renderDayView(off,d){
         if(pctEl){const pct=exp>0?(a/exp)*100:0;pctEl.textContent=pct>0?pct.toFixed(1)+'%':'\u2014';pctEl.style.color=atRisk?'#c62828':'#2e7d32';}
         if(varEl){const diff=a-exp;const diffStr=(diff>=0?'+':'')+Math.round(diff).toLocaleString();varEl.textContent=diffStr;varEl.style.color=diff>=0?'#2e7d32':'#c62828';}
     };
-    setBBRow('ib-bb',ibBB,d.ibVol);
+    setBBRow('ib-bb',ibBB,d.ibVol,expInfo.IB);
     setRow('ib-den',parseFloat(lp.ibDensityLP)||0,d.ibDensity,2);
     setRow('ib-cplh',parseFloat(lp.ibCplh)||0,d.ibCplh,2);
-    setBBRow('da-bb',obBB,d.obVol);
+    setBBRow('da-bb',obBB,d.obVol,expInfo.DA);
     setRow('da-den',parseFloat(lp.obDensityLP)||0,d.obDensity,2);
     setRow('da-cplh',parseFloat(lp.obCplh)||0,d.obCplh,2);
-    // Combined 24hr BB = IB + DA (plan + actual summed), same Expected/Status/%/Variance logic.
-    setBBRow('cb-bb',(ibBB||0)+(obBB||0),(d.ibVol||0)+(d.obVol||0));
+    // Combined 24hr BB = IB + DA (plan + actual summed; Expected = IB Expected + DA Expected),
+    // same Status/%/Variance logic.
+    const ibE=(expInfo.IB&&expInfo.IB.expected)||0, daE=(expInfo.DA&&expInfo.DA.expected)||0;
+    setBBRow('cb-bb',(ibBB||0)+(obBB||0),(d.ibVol||0)+(d.obVol||0),{expected:ibE+daE,title:'IB '+Math.round(ibE).toLocaleString()+' + DA '+Math.round(daE).toLocaleString()+' = '+Math.round(ibE+daE).toLocaleString()});
     setRow('tp-cplh',parseFloat(lp.siteCplh)||0,d.siteCplh,2);
     // VRET's: plan = GalaxyBI Vendor Returns Week Capacity (day-of-week); actual = Vendor Return
     // Pack EACH-Total for the day (d.vretVol).
@@ -9885,8 +10080,11 @@ function renderEOSWash(data){
     // BACK to the GalaxyBI LP CPLH (loadLPValues().ibCplh/.obCplh) — the SAME value the Sync tab
     // shows as "IB/DA LP CPLH". This fixes the wash's IB/DA LP CPLH not populating when the manual
     // target was left blank (it is on the Sync tab, so use it here too). Set after lpVals below.
-    let ibCplh=gv('ib-cplh-target');
-    let daCplh=gv('ob-cplh-target');
+    // (15.66.2, owner) CPLH plan on EOS Wash = the LP CPLH (same as the Sync "LP Target" chip),
+    // NOT the Shift Plan Targets manual CPLH box. The manual box is only a last-resort fallback
+    // when no LP value is loaded.
+    let ibCplh=0;
+    let daCplh=0;
     // LP per-path RATE targets (stow/pick), the SAME values the Sync tab uses to color its IB/OB
     // rate cells (ctiRate / topRate). These are the correct basis for the "% to LP" fallback on
     // the two volume paths below — NOT the CPLH targets (ibCplh/daCplh), which are a different
@@ -9894,8 +10092,10 @@ function renderEOSWash(data){
     const lpVals=(typeof loadLPValues==='function'?loadLPValues():null)||{};
     // Fall back to the GalaxyBI LP CPLH when the manual CPLH target input is blank, so the IB/DA
     // TOTAL "% to LP" uses the same LP CPLH the Sync tab shows (e.g. 23.80 / 22.97).
-    if(!(ibCplh>0)){const v=parseFloat(lpVals.ibCplh)||0;if(v>0)ibCplh=v;}
-    if(!(daCplh>0)){const v=parseFloat(lpVals.obCplh)||0;if(v>0)daCplh=v;}
+    ibCplh=parseFloat(lpVals.ibCplh)||0;
+    daCplh=parseFloat(lpVals.obCplh)||0;
+    if(!(ibCplh>0))ibCplh=gv('ib-cplh-target');
+    if(!(daCplh>0))daCplh=gv('ob-cplh-target');
     let ctiLpRate=parseFloat(lpVals.ctiRate)||0;
     let topLpRate=parseFloat(lpVals.topRate)||0;
     // CHANGE 3: cached LP SITE CPLH target (15.54.2: DeratedRates = Diluted Rates by Path,
@@ -10384,7 +10584,7 @@ function renderEOSWash(data){
     // (15.54.5) Site CPLH row. Plan = Sync tab SITE CPLH TARGET input, falling back to the LP site
     // CPLH (diluted "Total Building CPLH Inc Support"). Actual = Sync-consistent site CPLH
     // (throughput vol / throughput hrs), falling back to the Sync tab's rendered value.
-    const siteCplhPlan=gv('site-cplh-target')||siteLpCplh||0;
+    const siteCplhPlan=siteLpCplh||gv('site-cplh-target')||0;   // (15.66.2) LP first, like IB/DA
     const siteActCplh=(syncCplh&&syncCplh.site>0)?syncCplh.site:(parseFloat(document.getElementById('site-cplh-value')?.textContent)||0);
     const accRow=(label,plan,act,dec=0,pctHigh=true)=>{
         const varc=(plan&&act)?((pctHigh?act/plan:plan/act)*100):0;
@@ -11958,9 +12158,9 @@ function doSnip(){
     const isDark=root.classList.contains('dark-mode');
     const style=document.createElement('style');style.id='snip-fix';
     if(isDark){
-        style.textContent='#sb-root,#sb-root *{color:#e0e0e0 !important;}#sb-root .metrics-table td[style*="background"]{color:#fff !important;}#sb-root .metrics-table td[style*="rgba(220,38,38"],#sb-root .metrics-table td[style*="rgba(244,67,54"],#sb-root .metrics-table td[style*="rgba(198,40,40"]{background:#b71c1c !important;}#sb-root .metrics-table td[style*="rgba(52,211,153"],#sb-root .metrics-table td[style*="rgba(46,204,113"]{background:rgba(46,204,113,0.45) !important;}#sb-root span[style*="background"]{color:#000 !important;}#sb-root span[style*="background"] *{color:#000 !important;}#sb-root span[style*="background"] span{color:#000 !important;}#sb-root .pct-good{color:#69f0ae !important;}#sb-root .pct-warn{color:#ffd740 !important;}#sb-root .pct-bad{color:#ff5252 !important;}#sb-root .row-fast td{color:#ffab40 !important;}#sb-root .row-rate td{color:#ffab40 !important;}#sb-root .goal-title{color:#ccc !important;}#sb-root .goal-stats{color:#e0e0e0 !important;}#sb-root .goal-stats strong{color:#fff !important;}#sb-root .fclm-timestamp{color:#aaa !important;}#sb-root .meta-text{color:#aaa !important;}#sb-root .target-input{color:#ffd740 !important;padding:4px 6px !important;font-size:13px !important;line-height:1.3 !important;}#sb-root .table-input{color:#ffd740 !important;}#sb-root .panel-title{color:#e0e0e0 !important;}#sb-root .tg-compact h4{color:#64b5f6 !important;}#sb-root .tg-compact:last-child h4{color:#69f0ae !important;}#sb-root .fixed-target{color:#69f0ae !important;}#sb-root .row-hc td{color:#aaa !important;}#sb-root .section-header h2{color:#e0e0e0 !important;}#sb-root .metrics-table .bold{color:#e0e0e0 !important;}#sb-root .nav-tab{color:#aaa !important;}#sb-root .nav-tab.active{color:#fff !important;}#sb-root .target-table td{padding:4px 6px !important;line-height:1.4 !important;color:#e0e0e0 !important;}#sb-root .topnav{background:#16213e !important;}#sb-root .metrics-section,#sb-root .goal-card,#sb-root .site-cplh-panel,#sb-root .targets-panel,#sb-root .chart-card{background:#0f3460 !important;border-top-color:#444 !important;border-right-color:#444 !important;border-bottom-color:#444 !important;}#sb-root .metrics-section.ib-section{border-left:4px solid #1565c0 !important;}#sb-root .metrics-section.ob-section{border-left:4px solid #e65100 !important;}#sb-root .metrics-section.sort-section{border-left:4px solid #000 !important;}#sb-root .metrics-section.actions-section{border-left:6px solid #146EB4 !important;}#sb-root *{animation:none !important;}#sb-root .metrics-section,#sb-root .sync-right,#sb-root .sync-right>*,#sb-root .sync-right *{opacity:1 !important;transform:none !important;}#sb-root .sync-right{position:static !important;max-height:none !important;overflow:visible !important;top:auto !important;}';
+        style.textContent='#sb-root,#sb-root *{color:#e0e0e0 !important;}#sb-root .metrics-table td[style*="background"]{color:#fff !important;}#sb-root .metrics-table td[style*="rgba(220,38,38"],#sb-root .metrics-table td[style*="rgba(244,67,54"],#sb-root .metrics-table td[style*="rgba(198,40,40"]{background:#b71c1c !important;}#sb-root .metrics-table td[style*="rgba(52,211,153"],#sb-root .metrics-table td[style*="rgba(46,204,113"]{background:rgba(46,204,113,0.45) !important;}#sb-root span[style*="background"]{color:#000 !important;}#sb-root span[style*="background"] *{color:#000 !important;}#sb-root span[style*="background"] span{color:#000 !important;}#sb-root .pct-good{color:#69f0ae !important;}#sb-root .pct-warn{color:#ffd740 !important;}#sb-root .pct-bad{color:#ff5252 !important;}#sb-root .sb-icqa-good{color:#69f0ae !important;}#sb-root .sb-icqa-bad{color:#ff8a80 !important;}#sb-root .row-fast td{color:#ffab40 !important;}#sb-root .row-rate td{color:#ffab40 !important;}#sb-root .goal-title{color:#ccc !important;}#sb-root .goal-stats{color:#e0e0e0 !important;}#sb-root .goal-stats strong{color:#fff !important;}#sb-root .fclm-timestamp{color:#aaa !important;}#sb-root .meta-text{color:#aaa !important;}#sb-root .target-input{color:#ffd740 !important;padding:4px 6px !important;font-size:13px !important;line-height:1.3 !important;}#sb-root .table-input{color:#ffd740 !important;}#sb-root .panel-title{color:#e0e0e0 !important;}#sb-root .tg-compact h4{color:#64b5f6 !important;}#sb-root .tg-compact:last-child h4{color:#69f0ae !important;}#sb-root .fixed-target{color:#69f0ae !important;}#sb-root .row-hc td{color:#aaa !important;}#sb-root .section-header h2{color:#e0e0e0 !important;}#sb-root .metrics-table .bold{color:#e0e0e0 !important;}#sb-root .nav-tab{color:#aaa !important;}#sb-root .nav-tab.active{color:#fff !important;}#sb-root .target-table td{padding:4px 6px !important;line-height:1.4 !important;color:#e0e0e0 !important;}#sb-root .topnav{background:#16213e !important;}#sb-root .metrics-section,#sb-root .goal-card,#sb-root .site-cplh-panel,#sb-root .targets-panel,#sb-root .chart-card{background:#0f3460 !important;border-top-color:#444 !important;border-right-color:#444 !important;border-bottom-color:#444 !important;}#sb-root .metrics-section.ib-section{border-left:4px solid #1565c0 !important;}#sb-root .metrics-section.ob-section{border-left:4px solid #e65100 !important;}#sb-root .metrics-section.sort-section{border-left:4px solid #000 !important;}#sb-root .metrics-section.actions-section{border-left:6px solid #146EB4 !important;}#sb-root *{animation:none !important;}#sb-root .metrics-section,#sb-root .sync-right,#sb-root .sync-right>*,#sb-root .sync-right *{opacity:1 !important;transform:none !important;}#sb-root .sync-right{position:static !important;max-height:none !important;overflow:visible !important;top:auto !important;}';
     } else {
-        style.textContent='#sb-root,#sb-root *{color:#000 !important;}#sb-root .pct-good{color:#2e7d32 !important;}#sb-root .pct-warn{color:#e65100 !important;}#sb-root .pct-bad{color:#c62828 !important;}#sb-root .row-fast td{color:#e65100 !important;}#sb-root .goal-title{color:#333 !important;}#sb-root .goal-stats{color:#333 !important;}#sb-root .goal-stats strong{color:#000 !important;}#sb-root .fclm-timestamp{color:#333 !important;}#sb-root .meta-text{color:#333 !important;}#sb-root .target-input{color:#000 !important;padding:4px 6px !important;font-size:13px !important;line-height:1.3 !important;}#sb-root .table-input{color:#000 !important;}#sb-root .panel-title{color:#333 !important;}#sb-root .tg-compact h4{color:#1565c0 !important;}#sb-root .tg-compact:last-child h4{color:#2e7d32 !important;}#sb-root .fixed-target{color:#2e7d32 !important;}#sb-root .row-hc td{color:#666 !important;}#sb-root .section-header h2{color:#000 !important;}#sb-root .metrics-table .bold{color:#000 !important;}#sb-root .nav-tab{color:#333 !important;}#sb-root .nav-tab.active{color:#fff !important;}#sb-root .target-table td{padding:4px 6px !important;line-height:1.4 !important;}#sb-root *{animation:none !important;}#sb-root .metrics-section,#sb-root .sync-right,#sb-root .sync-right>*,#sb-root .sync-right *{opacity:1 !important;transform:none !important;}#sb-root .sync-right{position:static !important;max-height:none !important;overflow:visible !important;top:auto !important;}';
+        style.textContent='#sb-root,#sb-root *{color:#000 !important;}#sb-root .pct-good{color:#2e7d32 !important;}#sb-root .pct-warn{color:#e65100 !important;}#sb-root .pct-bad{color:#c62828 !important;}#sb-root .sb-icqa-good{color:#2e7d32 !important;}#sb-root .sb-icqa-bad{color:#c62828 !important;}#sb-root .row-fast td{color:#e65100 !important;}#sb-root .goal-title{color:#333 !important;}#sb-root .goal-stats{color:#333 !important;}#sb-root .goal-stats strong{color:#000 !important;}#sb-root .fclm-timestamp{color:#333 !important;}#sb-root .meta-text{color:#333 !important;}#sb-root .target-input{color:#000 !important;padding:4px 6px !important;font-size:13px !important;line-height:1.3 !important;}#sb-root .table-input{color:#000 !important;}#sb-root .panel-title{color:#333 !important;}#sb-root .tg-compact h4{color:#1565c0 !important;}#sb-root .tg-compact:last-child h4{color:#2e7d32 !important;}#sb-root .fixed-target{color:#2e7d32 !important;}#sb-root .row-hc td{color:#666 !important;}#sb-root .section-header h2{color:#000 !important;}#sb-root .metrics-table .bold{color:#000 !important;}#sb-root .nav-tab{color:#333 !important;}#sb-root .nav-tab.active{color:#fff !important;}#sb-root .target-table td{padding:4px 6px !important;line-height:1.4 !important;}#sb-root *{animation:none !important;}#sb-root .metrics-section,#sb-root .sync-right,#sb-root .sync-right>*,#sb-root .sync-right *{opacity:1 !important;transform:none !important;}#sb-root .sync-right{position:static !important;max-height:none !important;overflow:visible !important;top:auto !important;}';
     }
     document.head.appendChild(style);
     // (15.53.1 / 15.53.2) Textareas / inputs / selects are flattened to plain text in the html2canvas CLONE
